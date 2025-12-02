@@ -161,15 +161,18 @@ def rollout(
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
-        if return_observations:
-            all_observations.append(deepcopy(observation))
 
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
         observation = add_envs_task(env, observation)
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
+        # This handles nested dictionaries (e.g., robot_state -> state)
         observation = env_preprocessor(observation)
+        
+        # Save observation AFTER env_preprocessor (nested dicts are flattened)
+        if return_observations:
+            all_observations.append(deepcopy(observation))
 
         observation = preprocessor(observation)
         with torch.inference_mode():
@@ -225,6 +228,8 @@ def rollout(
     # Track the final observation.
     if return_observations:
         observation = preprocess_observation(observation)
+        observation = add_envs_task(env, observation)
+        observation = env_preprocessor(observation)
         all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
@@ -236,8 +241,10 @@ def rollout(
     }
     if return_observations:
         stacked_observations = {}
+        # Only stack keys that start with "observation."
         for key in all_observations[0]:
-            stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
+            if key.startswith(f"{OBS_STR}."):
+                stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
         ret[OBS_STR] = stacked_observations
 
     if hasattr(policy, "use_original_modules"):
@@ -544,8 +551,8 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
-            videos_dir=Path(cfg.output_dir) / "videos",
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
+            videos_dir=Path(cfg.output_dir) / "videos" if cfg.eval.max_episodes_rendered > 0 else None,
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )

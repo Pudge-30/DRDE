@@ -1188,7 +1188,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # are processed separately by storing image path and frame info as meta data
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
-            episode_buffer[key] = np.stack(episode_buffer[key])
+            stacked = np.stack(episode_buffer[key])
+            if key in ("pred_action", "prev_actions"):
+                import logging
+                logging.info(f"[DEBUG save_episode] {key}: Before compute_episode_stats, shape={stacked.shape}, feature_shape={ft.get('shape')}")
+            episode_buffer[key] = stacked
 
         # Wait for image writer to end, so that episode stats over images can be computed
         self._wait_image_writer()

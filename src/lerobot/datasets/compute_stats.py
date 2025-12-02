@@ -507,6 +507,68 @@ def compute_episode_stats(
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
             continue
+        
+        # 跳过 bool 类型字段，统计信息对 bool 没有意义
+        if features[key]["dtype"] == "bool":
+            continue
+
+        # 仅对 action 上下文相关字段做形状规范化，其他保持原样
+        if key in ("pred_action", "prev_actions"):
+            import logging
+            feature_shape = features[key].get("shape")
+            if feature_shape and len(feature_shape) == 2:
+                desired_steps, desired_dim = feature_shape
+                ep_ft_array = np.asarray(data)
+                
+                logging.info(
+                    f"[DEBUG compute_episode_stats] Processing key='{key}': "
+                    f"input shape={ep_ft_array.shape}, desired_shape=({desired_steps}, {desired_dim})"
+                )
+
+                # 统一为 (frames, steps, dim)
+                if ep_ft_array.ndim == 2:
+                    # (frames, dim) -> (frames, 1, dim)
+                    logging.info(f"[DEBUG compute_episode_stats] {key}: Converting 2D to 3D: {ep_ft_array.shape} -> {ep_ft_array[:, None, :].shape}")
+                    ep_ft_array = ep_ft_array[:, None, :]
+                
+                # 现在 ep_ft_array 应该是 3 维的 (frames, steps, dim)
+                if ep_ft_array.ndim == 3:
+                    frames, steps, dim = ep_ft_array.shape
+                    logging.info(f"[DEBUG compute_episode_stats] {key}: After conversion: shape=({frames}, {steps}, {dim})")
+
+                    # 对 steps 维度做截断/填充到期望长度
+                    if steps != desired_steps:
+                        last_step = ep_ft_array[:, -1:, :] if steps > 0 else np.zeros(
+                            (frames, 1, dim), dtype=ep_ft_array.dtype
+                        )
+                        if steps < desired_steps:
+                            pad = np.repeat(last_step, desired_steps - steps, axis=1)
+                            ep_ft_array = np.concatenate([ep_ft_array, pad], axis=1)
+                            logging.info(f"[DEBUG compute_episode_stats] {key}: Padded steps: {steps} -> {desired_steps}, new shape={ep_ft_array.shape}")
+                        else:
+                            ep_ft_array = ep_ft_array[:, :desired_steps, :]
+                            logging.info(f"[DEBUG compute_episode_stats] {key}: Truncated steps: {steps} -> {desired_steps}, new shape={ep_ft_array.shape}")
+                        # 更新 steps 值，因为形状已经改变
+                        steps = desired_steps
+
+                    # 对 dim 维度做截断/填充到期望长度
+                    if dim != desired_dim:
+                        if dim > desired_dim:
+                            ep_ft_array = ep_ft_array[:, :, :desired_dim]
+                            logging.info(f"[DEBUG compute_episode_stats] {key}: Truncated dim: {dim} -> {desired_dim}, new shape={ep_ft_array.shape}")
+                        else:
+                            pad = np.zeros(
+                                (ep_ft_array.shape[0], ep_ft_array.shape[1], desired_dim - dim),
+                                dtype=ep_ft_array.dtype,
+                            )
+                            ep_ft_array = np.concatenate([ep_ft_array, pad], axis=2)
+                            logging.info(f"[DEBUG compute_episode_stats] {key}: Padded dim: {dim} -> {desired_dim}, new shape={ep_ft_array.shape}")
+                else:
+                    logging.warning(f"[DEBUG compute_episode_stats] {key}: Unexpected ndim={ep_ft_array.ndim}, shape={ep_ft_array.shape}")
+
+                # 用规范化后的数据继续统计
+                data = ep_ft_array
+                logging.info(f"[DEBUG compute_episode_stats] {key}: Final normalized shape={data.shape}")
 
         if features[key]["dtype"] in ["image", "video"]:
             ep_ft_array = sample_images(data)
@@ -520,6 +582,12 @@ def compute_episode_stats(
         ep_stats[key] = get_feature_stats(
             ep_ft_array, axis=axes_to_reduce, keepdims=keepdims, quantile_list=quantile_list
         )
+        
+        # 对 prev_actions 和 pred_action 添加统计结果形状的日志
+        if key in ("pred_action", "prev_actions"):
+            import logging
+            mean_shape = ep_stats[key]["mean"].shape if "mean" in ep_stats[key] else "N/A"
+            logging.info(f"[DEBUG compute_episode_stats] {key}: Final stats mean.shape={mean_shape}")
 
         if features[key]["dtype"] in ["image", "video"]:
             ep_stats[key] = {
@@ -621,6 +689,24 @@ def aggregate_stats(stats_list: list[dict[str, dict]]) -> dict[str, dict[str, np
 
     for key in data_keys:
         stats_with_key = [stats[key] for stats in stats_list if key in stats]
-        aggregated_stats[key] = aggregate_feature_stats(stats_with_key)
+        try:
+            aggregated_stats[key] = aggregate_feature_stats(stats_with_key)
+        except ValueError as e:
+            import logging
+
+            # 对所有字段都输出诊断信息，准确定位问题
+            logging.error(f"[DEBUG] aggregate_stats failed for key='{key}', error: {e}")
+            logging.error(f"[DEBUG] Number of stats to aggregate: {len(stats_with_key)}")
+            for i, s in enumerate(stats_with_key):
+                mean_shape = s.get("mean").shape if "mean" in s and hasattr(s.get("mean"), "shape") else "N/A"
+                min_shape = s.get("min").shape if "min" in s and hasattr(s.get("min"), "shape") else "N/A"
+                max_shape = s.get("max").shape if "max" in s and hasattr(s.get("max"), "shape") else "N/A"
+                std_shape = s.get("std").shape if "std" in s and hasattr(s.get("std"), "shape") else "N/A"
+                count_shape = s.get("count").shape if "count" in s and hasattr(s.get("count"), "shape") else "N/A"
+                logging.error(
+                    f"[DEBUG]   stats[{i}] shapes: mean={mean_shape}, std={std_shape}, "
+                    f"min={min_shape}, max={max_shape}, count={count_shape}"
+                )
+            raise
 
     return aggregated_stats

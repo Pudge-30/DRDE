@@ -193,3 +193,35 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     # NOTE: In RL, we don't need an offline dataset
     # TODO: Make `TrainPipelineConfig.dataset` optional
     dataset: DatasetConfig | None = None  # type: ignore[assignment] # because the parent class has made it's type non-optional
+
+
+@dataclass
+class OnlineConfig:
+    """Configuration for online training parameters."""
+    # Number of episodes to collect before each training phase
+    collect_episodes_per_iteration: int = 10
+    # Number of training steps to perform after each data collection phase
+    train_steps_per_iteration: int = 1000
+    # Number of iterations (collect -> train cycles) to run
+    n_iterations: int = 100
+    # Whether to start with an existing offline dataset or create a new one
+    start_with_offline_dataset: bool = True
+    # Minimum number of episodes in dataset before starting training
+    min_episodes_for_training: int = 10
+    # Repo ID for the online dataset (where new episodes will be collected)
+    # If None, will use the same repo_id as the offline dataset
+    online_dataset_repo_id: str | None = None
+    # Root directory for the online dataset
+    online_dataset_root: Path | None = None
+    # If online dataset has fewer frames, only offline training (cmp=False) will be performed
+    min_frames_for_online_training: int = 500000
+
+
+@dataclass(kw_only=True)
+class OnlineTrainPipelineConfig(TrainPipelineConfig):
+    """Configuration for online training with data collection.
+
+    This config extends TrainPipelineConfig with online training specific parameters.
+    The dataset will be created/updated during training as new episodes are collected.
+    """
+    online: OnlineConfig = field(default_factory=OnlineConfig)

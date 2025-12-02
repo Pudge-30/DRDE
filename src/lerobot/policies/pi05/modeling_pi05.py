@@ -226,7 +226,25 @@ def compute_layer_complete(
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        input_norm = layer.input_layernorm
+        # Check if this is an adaRMS version (has cond_dim but no weight)
+        # For adaRMS versions, when cond=None, we need to provide a zero cond tensor
+        # because the forward method will try to use self.weight which doesn't exist
+        cond_dim = getattr(input_norm, 'cond_dim', None)
+        has_weight = hasattr(input_norm, 'weight')
+        is_adarms = cond_dim is not None and not has_weight
+        
+        if is_adarms and adarms_cond[i] is None:
+            # For adaRMS version with None cond, provide a zero cond tensor
+            batch_size = hidden_states.shape[0]
+            zero_cond = torch.zeros(batch_size, cond_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+            hidden_states, gate = layer.input_layernorm(hidden_states, cond=zero_cond)  # noqa: PLW2901
+        elif adarms_cond[i] is not None:
+            # Pass cond parameter
+            hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        else:
+            # Standard version without cond
+            hidden_states, gate = layer.input_layernorm(hidden_states)  # noqa: PLW2901
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -277,7 +295,21 @@ def compute_layer_complete(
         # first residual
         out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
         after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        post_norm = layer.post_attention_layernorm
+        # Check if this is an adaRMS version (has cond_dim but no weight)
+        cond_dim = getattr(post_norm, 'cond_dim', None)
+        has_weight = hasattr(post_norm, 'weight')
+        is_adarms = cond_dim is not None and not has_weight
+        
+        if is_adarms and adarms_cond[i] is None:
+            # For adaRMS version with None cond, provide a zero cond tensor
+            batch_size = out_emb.shape[0]
+            zero_cond = torch.zeros(batch_size, cond_dim, device=out_emb.device, dtype=out_emb.dtype)
+            out_emb, gate = layer.post_attention_layernorm(out_emb, cond=zero_cond)
+        elif adarms_cond[i] is not None:
+            out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        else:
+            out_emb, gate = layer.post_attention_layernorm(out_emb)
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
@@ -288,6 +320,105 @@ def compute_layer_complete(
         start_pos = end_pos
     return outputs_embeds
 
+def vicreg_loss(
+    z1: Tensor,
+    z2: Tensor,
+    lambda_param: float = 25.0,
+    mu_param: float = 25.0,
+    nu_param: float = 1.0,
+    gamma: float = 1.0,
+    eps: float = 1e-4,
+) -> Tensor:
+    """VICReg loss with Variance-Invariance-Covariance Regularization (PyTorch version).
+
+    Args:
+        z1: First representation [batch, num_tokens, dim] or [batch, dim]
+        z2: Second representation [batch, num_tokens, dim] or [batch, dim]
+        lambda_param: Weight for invariance loss (default: 25.0)
+        mu_param: Weight for variance loss (default: 25.0)
+        nu_param: Weight for covariance loss (default: 1.0)
+        gamma: Target standard deviation (default: 1.0)
+        eps: Small constant for numerical stability
+
+    Returns:
+        VICReg loss value (scalar tensor)
+    """
+    # Handle both 2D and 3D inputs
+    if z1.dim() == 2:
+        z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+    if z2.dim() == 2:
+        z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+
+    batch_size, num_tokens, dim = z1.shape
+
+    # Reshape to (batch*num_tokens, dim)
+    z1_flat = z1.reshape(-1, dim)  # [batch*num_tokens, dim]
+    z2_flat = z2.reshape(-1, dim)  # [batch*num_tokens, dim]
+    n_samples = z1_flat.shape[0]
+
+    # Invariance loss: L2 distance between corresponding representations
+    invariance_loss = torch.mean(torch.square(z1_flat - z2_flat), dim=-1)  # [batch*num_tokens]
+    invariance_loss = torch.mean(invariance_loss)  # scalar
+
+    # Variance loss: encourage standard deviation to be close to gamma
+    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
+    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
+    variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
+
+    # Covariance loss: encourage decorrelation of features
+    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
+    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
+
+    cov_z1 = (z1_centered.T @ z1_centered) / (n_samples - 1)  # [dim, dim]
+    cov_z2 = (z2_centered.T @ z2_centered) / (n_samples - 1)  # [dim, dim]
+
+    # Off-diagonal mask
+    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)
+    offdiag_z1 = cov_z1 * off_diagonal_mask
+    offdiag_z2 = cov_z2 * off_diagonal_mask
+
+    # Covariance loss (normalize by dim, not number of elements)
+    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / dim
+    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / dim
+    covariance_loss = cov_loss_z1 + cov_loss_z2
+
+    # Total loss
+    total_loss = lambda_param * invariance_loss + mu_param * variance_loss + nu_param * covariance_loss
+
+    return total_loss
+
+def compute_vicreg_similarity(
+    z1: Tensor,
+    z2: Tensor,
+    eps: float = 1e-4,
+) -> Tensor:
+    """Compute similarity based on VICReg invariance loss (L2 distance).
+
+    Args:
+        z1: First representation [batch, num_tokens, dim] or [batch, dim]
+        z2: Second representation [batch, num_tokens, dim] or [batch, dim]
+        eps: Small constant for numerical stability
+
+    Returns:
+        Similarity value (scalar tensor), lower means more similar
+        This is the mean squared L2 distance between representations
+    """
+    # Handle both 2D and 3D inputs
+    if z1.dim() == 2:
+        z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+    if z2.dim() == 2:
+        z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+
+    batch_size, num_tokens, dim = z1.shape
+
+    # Reshape to (batch*num_tokens, dim)
+    z1_flat = z1.reshape(batch_size, -1)  # [batch*num_tokens, dim]
+    z2_flat = z2.reshape(batch_size, -1)  # [batch*num_tokens, dim]
+
+    # Compute mean squared L2 distance (invariance loss component)
+    similarity = torch.mean(torch.square(z1_flat - z2_flat), dim=-1)  # [batch]
+
+    return similarity
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
     """Configuration for Gemma model variants."""
@@ -484,7 +615,21 @@ class PaliGemmaWithExpertModel(
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    norm = models[i].norm
+                    # Check if this is an adaRMS version (has cond_dim but no weight)
+                    cond_dim = getattr(norm, 'cond_dim', None)
+                    has_weight = hasattr(norm, 'weight')
+                    is_adarms = cond_dim is not None and not has_weight
+                    
+                    if is_adarms and adarms_cond[i] is None:
+                        # For adaRMS version with None cond, provide a zero cond tensor
+                        batch_size = hidden_states.shape[0]
+                        zero_cond = torch.zeros(batch_size, cond_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+                        out_emb, _ = models[i].norm(hidden_states, cond=zero_cond)
+                    elif adarms_cond[i] is not None:
+                        out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    else:
+                        out_emb, _ = models[i].norm(hidden_states)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
@@ -506,6 +651,274 @@ class PaliGemmaWithExpertModel(
 
         return [prefix_output, suffix_output], prefix_past_key_values
 
+    def forward_partial(
+        self,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: list[torch.FloatTensor] | None = None,
+        use_cache: bool | None = None,
+        adarms_cond: list[torch.Tensor] | None = None,
+        part_layer_num: int | None = None,
+    ):
+        """只处理前 part_layer_num 层，返回中间输出和状态。
+
+        Args:
+            attention_mask: 注意力掩码
+            position_ids: 位置 ID
+            past_key_values: 过去的 key-value cache
+            inputs_embeds: 输入嵌入列表 [prefix_embeds, suffix_embeds]
+            use_cache: 是否使用 cache
+            adarms_cond: adaRMS 条件
+            part_layer_num: 要处理的层数（从前开始）
+
+        Returns:
+            tuple: ([prefix_output, suffix_output], intermediate_state)
+                   intermediate_state 包含继续处理所需的信息
+        """
+        if adarms_cond is None:
+            adarms_cond = [None, None]
+
+        if inputs_embeds[0] is None or inputs_embeds[1] is None:
+            raise ValueError(
+                "forward_partial requires both prefix and suffix inputs. "
+                "Use regular forward() for single-path processing."
+            )
+
+        if part_layer_num is None:
+            raise ValueError("part_layer_num must be specified for forward_partial")
+
+        models = [self.paligemma.language_model, self.gemma_expert.model]
+        num_layers = self.paligemma.config.text_config.num_hidden_layers
+
+        if part_layer_num > num_layers:
+            raise ValueError(f"part_layer_num ({part_layer_num}) cannot exceed total layers ({num_layers})")
+
+        # Check if gradient checkpointing is enabled
+        use_gradient_checkpointing = (
+            hasattr(self.gemma_expert.model, "gradient_checkpointing")
+            and self.gemma_expert.model.gradient_checkpointing
+            and self.training
+        ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+
+        # Process only the first part_layer_num layers
+        current_inputs_embeds = inputs_embeds
+        for layer_idx in range(part_layer_num):
+            if use_gradient_checkpointing:
+                current_inputs_embeds = torch.utils.checkpoint.checkpoint(
+                    compute_layer_complete,
+                    layer_idx,
+                    current_inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    paligemma=self.paligemma,
+                    gemma_expert=self.gemma_expert,
+                )
+            else:
+                current_inputs_embeds = compute_layer_complete(
+                    layer_idx,
+                    current_inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond,
+                    paligemma=self.paligemma,
+                    gemma_expert=self.gemma_expert,
+                )
+
+        # Return intermediate outputs and state for continuation
+        intermediate_state = {
+            "inputs_embeds": current_inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "adarms_cond": adarms_cond,
+            "processed_layers": part_layer_num,
+            "total_layers": num_layers,
+        }
+
+        return current_inputs_embeds, intermediate_state
+
+    def forward_remaining(
+        self,
+        intermediate_state: dict,
+        use_cache: bool | None = None,
+    ):
+        """从中间状态继续处理剩余的层。
+
+        Args:
+            intermediate_state: 由 forward_partial 返回的中间状态字典
+            use_cache: 是否使用 cache（保留用于接口一致性）
+
+        Returns:
+            tuple: ([prefix_output, suffix_output], None)
+        """
+        inputs_embeds = intermediate_state["inputs_embeds"]
+        attention_mask = intermediate_state["attention_mask"]
+        position_ids = intermediate_state["position_ids"]
+        adarms_cond = intermediate_state["adarms_cond"]
+        processed_layers = intermediate_state["processed_layers"]
+        total_layers = intermediate_state["total_layers"]
+
+        remaining_layers = total_layers - processed_layers
+        if remaining_layers <= 0:
+            raise ValueError(
+                f"No remaining layers to process. Already processed {processed_layers} out of {total_layers}"
+            )
+
+        models = [self.paligemma.language_model, self.gemma_expert.model]
+
+        # Check if gradient checkpointing is enabled
+        use_gradient_checkpointing = (
+            hasattr(self.gemma_expert.model, "gradient_checkpointing")
+            and self.gemma_expert.model.gradient_checkpointing
+            and self.training
+        ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+
+        # Process remaining layers
+        for layer_idx in range(processed_layers, total_layers):
+            if use_gradient_checkpointing:
+                inputs_embeds = torch.utils.checkpoint.checkpoint(
+                    compute_layer_complete,
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    paligemma=self.paligemma,
+                    gemma_expert=self.gemma_expert,
+                )
+            else:
+                inputs_embeds = compute_layer_complete(
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond,
+                    paligemma=self.paligemma,
+                    gemma_expert=self.gemma_expert,
+                )
+
+        # Apply final norm
+        def compute_final_norms(inputs_embeds, adarms_cond):
+            outputs_embeds = []
+            for i, hidden_states in enumerate(inputs_embeds):
+                norm = models[i].norm
+                # Check if this is an adaRMS version (has cond_dim but no weight)
+                cond_dim = getattr(norm, 'cond_dim', None)
+                has_weight = hasattr(norm, 'weight')
+                is_adarms = cond_dim is not None and not has_weight
+                
+                if is_adarms and adarms_cond[i] is None:
+                    # For adaRMS version with None cond, provide a zero cond tensor
+                    batch_size = hidden_states.shape[0]
+                    zero_cond = torch.zeros(batch_size, cond_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+                    out_emb, _ = models[i].norm(hidden_states, cond=zero_cond)
+                elif adarms_cond[i] is not None:
+                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                else:
+                    out_emb, _ = models[i].norm(hidden_states)
+                outputs_embeds.append(out_emb)
+            return outputs_embeds
+
+        # Apply gradient checkpointing to final norm if enabled
+        if use_gradient_checkpointing:
+            outputs_embeds = torch.utils.checkpoint.checkpoint(
+                compute_final_norms,
+                inputs_embeds,
+                adarms_cond,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
+
+        prefix_output = outputs_embeds[0]
+        suffix_output = outputs_embeds[1]
+
+        return [prefix_output, suffix_output], None
+
+class SingleHeadContentAttention(nn.Module):
+    """单头内容注意力网络。
+
+    输入: suffix_outs [batch_size, attn_act_len, hidden_dim] + 可学习的分类头
+    输出: 分类头对应的输出 [batch_size, hidden_dim]
+    """
+
+    def __init__(self, hidden_dim: int, input_dim: int, attn_act_len: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+        self.attn_act_len = attn_act_len
+
+        # 可学习的分类头（query）
+        self.class_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        self.in_proj = nn.Linear(input_dim, hidden_dim)
+        # 单头注意力层（简单设计，层数不多）
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # 输出层归一化和投影
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, suffix_outs: Tensor) -> Tensor:
+        """前向传播。
+
+        Args:
+            suffix_outs: Tensor with shape [batch_size, attn_act_len, input_dim]
+
+        Returns:
+            output: [batch_size, hidden_dim] - 分类头对应的输出
+        """
+        batch_size = suffix_outs.shape[0]
+
+        # 验证输入维度
+        if suffix_outs.shape[1] != self.attn_act_len:
+            raise ValueError(
+                f"Expected suffix_outs to have {self.attn_act_len} tokens in dim 1, "
+                f"but got {suffix_outs.shape[1]}"
+            )
+        if suffix_outs.shape[2] != self.input_dim:
+            raise ValueError(
+                f"Expected suffix_outs to have input_dim={self.input_dim} in dim 2, "
+                f"but got {suffix_outs.shape[2]}"
+            )
+
+        # 使用 suffix_outs 作为 keys 和 values: [batch_size, attn_act_len, hidden_dim]
+        keys_values = self.in_proj(suffix_outs)
+
+
+        # 准备 query（分类头）
+        query = self.class_token.expand(batch_size, -1, -1)  # [batch_size, 1, hidden_dim]
+
+        # 计算 Q, K, V
+        q = self.q_proj(query)  # [batch_size, 1, hidden_dim]
+        k = self.k_proj(keys_values)  # [batch_size, attn_act_len, hidden_dim]
+        v = self.v_proj(keys_values)  # [batch_size, attn_act_len, hidden_dim]
+
+        # 单头注意力计算
+        # 缩放点积注意力
+        scale = math.sqrt(self.hidden_dim)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / scale  # [batch_size, 1, attn_act_len]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [batch_size, 1, attn_act_len]
+
+        # 应用注意力权重
+        attended = torch.matmul(attn_weights, v)  # [batch_size, 1, hidden_dim]
+        attended = attended.squeeze(1)  # [batch_size, hidden_dim]
+
+        # 残差连接和层归一化
+        output = self.layer_norm(attended)
+
+        # 输出投影
+        output = self.out_proj(output)  # [batch_size, hidden_dim]
+
+        return output
 
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
@@ -530,6 +943,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        # 单头内容注意力网络（可选）
+        attn_act_len = getattr(config, "attn_act_len", None)
+        if attn_act_len is not None and attn_act_len > 0:
+            self.content_attention = SingleHeadContentAttention(
+                hidden_dim=action_expert_config.width,
+                input_dim=config.max_action_dim,
+                attn_act_len=attn_act_len,
+            )
+        else:
+            self.content_attention = None
+
+        # 可学习的分类头参数（用于对比学习）
+        part_layer_num = getattr(config, "part_layer_num", None)
+        if part_layer_num is not None and part_layer_num > 0:
+            self.cls_head_prefix = nn.Parameter(
+                torch.randn(1, 1, paligemma_config.width)
+            )
+            self.part_layer_num = part_layer_num
+        else:
+            self.cls_head_prefix = None
+            self.part_layer_num = None
+
+        # 投影头：将 paligemma 的 hidden_dim (2048) 投影到 action_expert 的 hidden_dim (1024)
+        # 用于对比学习中的维度匹配
+        self.cmp_projection = nn.Sequential(
+            nn.Linear(paligemma_config.width, paligemma_config.width),
+            nn.LayerNorm(paligemma_config.width),
+            nn.GELU(),
+            nn.Linear(paligemma_config.width, action_expert_config.width),
+        )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -640,11 +1084,31 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, noisy_actions, timestep, condition_token=None):
+        """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
+        
+        Args:
+            noisy_actions: [batch, chunk_size, action_dim] 噪声动作
+            timestep: [batch] 时间步
+            condition_token: [batch, hidden_dim] 可选的条件 token（来自 prev_actions 的特征）
+                            如果提供，会作为第一个 token 添加到 suffix embeddings 中
+        """
         embs = []
         pad_masks = []
         att_masks = []
+
+        bsize = noisy_actions.shape[0]
+        
+        # 如果有 condition token，先添加它作为第一个 token
+        if condition_token is not None:
+            # condition_token: [batch, hidden_dim] -> [batch, 1, hidden_dim]
+            condition_emb = condition_token.unsqueeze(1)
+            embs.append(condition_emb)
+            condition_mask = torch.ones(bsize, 1, dtype=torch.bool, device=timestep.device)
+            pad_masks.append(condition_mask)
+            # condition token 使用 att_mask=1，prefix 不会 attend 到它
+            # 但后续的 action tokens 可以 attend 到它
+            att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
@@ -673,7 +1137,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         adarms_cond = time_emb
 
         embs.append(action_time_emb)
-        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_dim = action_time_emb.shape[1]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
         pad_masks.append(action_time_mask)
 
@@ -687,8 +1151,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, condition_token=None) -> Tensor:
+        """Do a full training forward pass and compute the loss.
+        
+        Args:
+            images: 图像列表
+            img_masks: 图像掩码列表
+            tokens: 语言 tokens
+            masks: 语言 token 掩码
+            actions: ground truth 动作 [batch, chunk_size, action_dim]
+            noise: 可选的噪声
+            time: 可选的时间步
+            condition_token: [batch, hidden_dim] 可选的条件 token（来自 prev_actions 的特征）
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -700,7 +1175,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time, condition_token)
 
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -741,6 +1216,162 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
+
+    def forward_cmp(
+            self,
+            images,
+            img_masks,
+            tokens,
+            masks,
+            lambda_param: float = 25.0,
+            mu_param: float = 25.0,
+            nu_param: float = 1.0,
+            gamma: float = 1.0,
+    ) -> Tensor:
+        """对比学习前向传播，使用 VICReg loss。
+
+        Args:
+            images: 图像列表
+            img_masks: 图像掩码列表
+            tokens: 语言 tokens
+            masks: 语言 token 掩码
+            actions: 动作张量 [batch_size, chunk_size, action_dim]
+            lambda_param: VICReg invariance loss 权重
+            mu_param: VICReg variance loss 权重
+            nu_param: VICReg covariance loss 权重
+            gamma: VICReg 目标标准差
+
+        Returns:
+            VICReg loss (scalar tensor)
+        """
+        if self.cls_head_prefix is None:
+            raise ValueError(
+                "cls_head_prefix is not initialized. Please set part_layer_num in config."
+            )
+        if self.content_attention is None:
+            raise ValueError(
+                "content_attention is not initialized. Please set attn_act_len in config."
+            )
+        if self.part_layer_num is None:
+            raise ValueError(
+                "part_layer_num is not set in config."
+            )
+
+        batch_size = tokens.shape[0]
+        device = tokens.device
+
+        # 第一步：准备 prefix embeddings，并将 cls_head_prefix 添加到前面
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+
+        # 将 cls_head_prefix 添加到 prefix_embs 的前面
+        # 确保数据类型匹配
+        cls_head = self.cls_head_prefix.expand(batch_size, -1, -1)  # [batch_size, 1, hidden_dim]
+        cls_head = cls_head.to(dtype=prefix_embs.dtype)  # 确保数据类型匹配
+        prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1)  # [batch_size, 1 + seq_len, hidden_dim]
+
+        # 更新 pad_masks 和 att_masks，为 cls_head 添加对应的掩码
+        cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        prefix_pad_masks_with_cls = torch.cat([cls_pad_mask, prefix_pad_masks], dim=1)
+
+        cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)  # cls_head 可以 attend 到所有之前的内容
+        prefix_att_masks_with_cls = torch.cat([cls_att_mask.unsqueeze(0).expand(batch_size, -1), prefix_att_masks],
+                                              dim=1)
+
+        # 准备一个 dummy suffix_embs（forward_partial 需要两个输入）
+        action_expert_config = get_gemma_config(self.config.action_expert_variant)
+        dummy_suffix_embs = torch.zeros(
+            batch_size, 1, action_expert_config.width, dtype=prefix_embs_with_cls.dtype, device=device
+        )
+        dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
+
+        # 合并 masks
+        pad_masks = torch.cat([prefix_pad_masks_with_cls, dummy_suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks_with_cls, dummy_suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        # 执行 forward_partial，只处理前 part_layer_num 层
+        inputs_embeds = [prefix_embs_with_cls, dummy_suffix_embs]
+
+        def forward_partial_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids):
+            intermediate_embeds, intermediate_state = self.paligemma_with_expert.forward_partial(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, None],
+                part_layer_num=self.part_layer_num,
+            )
+            return intermediate_embeds, intermediate_state
+
+        intermediate_embeds, intermediate_state = self._apply_checkpoint(
+            forward_partial_func, prefix_embs_with_cls, dummy_suffix_embs, att_2d_masks_4d, position_ids
+        )
+
+        # 从中间输出中提取分类头对应的输出（第一个 token）
+        cmp_vec_0 = intermediate_embeds[0][:, 0, :]  # [batch_size, paligemma_hidden_dim]
+        # 通过投影头将 cmp_vec_0 从 paligemma 的维度投影到 action_expert 的维度
+        cmp_vec_0 = self.cmp_projection(cmp_vec_0)  # [batch_size, action_expert_hidden_dim]
+        cmp_vec_0 = cmp_vec_0.to(dtype=torch.float32)  # 转换为 float32 用于损失计算
+
+        # 确保维度正确
+        if cmp_vec_0.dim() != 2:
+            raise ValueError(f"Expected cmp_vec_0 to be 2D [batch_size, hidden_dim], got shape {cmp_vec_0.shape}")
+
+        # 第二步：将 actions 输入到 SingleHeadContentAttention 中
+        # 首先需要将 actions 投影到 hidden_dim，然后组织成 [batch_size, attn_act_len, hidden_dim] 的格式
+        attn_act_len = self.content_attention.attn_act_len
+
+        actions = self.sample_actions(images, img_masks, tokens, masks)
+
+        # 处理 actions：如果 actions 是 [batch_size, chunk_size, action_dim]，需要 pad 到 max_action_dim
+        if actions.shape[-1] < self.config.max_action_dim:
+            # Pad actions to max_action_dim if needed
+            actions_padded = pad_vector(actions, self.config.max_action_dim)
+        else:
+            actions_padded = actions
+
+        # 如果 actions 的 chunk_size 不够，需要处理
+        if actions_padded.shape[1] < attn_act_len:
+            raise ValueError(
+                f"actions chunk_size ({actions_padded.shape[1]}) must be >= attn_act_len ({attn_act_len})"
+            )
+
+        # 选择前 attn_act_len 个 action steps
+        selected_actions = actions_padded[:, :attn_act_len, :]  # [batch_size, attn_act_len, max_action_dim]
+
+        # 通过 SingleHeadContentAttention 得到 cmp_vec_1
+        cmp_vec_1 = self.content_attention(selected_actions)  # [batch_size, hidden_dim]
+        cmp_vec_1 = cmp_vec_1.to(dtype=torch.float32)  # 转换为 float32 用于损失计算
+
+        # 确保维度匹配
+        if cmp_vec_0.shape != cmp_vec_1.shape:
+            raise ValueError(
+                f"Dimension mismatch: cmp_vec_0 shape {cmp_vec_0.shape} != cmp_vec_1 shape {cmp_vec_1.shape}"
+            )
+
+        # 第三步：使用 VICReg loss 计算对比学习损失
+        loss_scalar = vicreg_loss(
+            cmp_vec_0,
+            cmp_vec_1,
+            lambda_param=lambda_param,
+            mu_param=mu_param,
+            nu_param=nu_param,
+            gamma=gamma,
+        )
+
+        # 将标量损失扩展为 [batch_size, 1, action_dim] 以匹配 forward 的返回格式
+        # vicreg_loss 返回的是标量（0维），没有 batch 维度，需要扩展
+        batch_size = cmp_vec_0.shape[0]
+        action_dim = self.config.max_action_dim
+        
+        # 将标量损失扩展为 [batch_size, 1, action_dim]
+        losses = loss_scalar.view(1, 1, 1).expand(batch_size, 1, action_dim)
+
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -835,9 +1466,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        condition_token=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+        
+        Args:
+            prefix_pad_masks: prefix 的 padding mask
+            past_key_values: 缓存的 key-value
+            x_t: 当前噪声状态 [batch, chunk_size, action_dim]
+            timestep: 当前时间步 [batch]
+            condition_token: [batch, hidden_dim] 可选的条件 token
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep, condition_token)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -866,6 +1506,105 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    def sample_actions_differentiable(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        condition_token=None,
+        noise=None,
+        num_steps=None,
+    ) -> Tensor:
+        """可微分的动作采样方法，用于 online 训练。
+        
+        与 sample_actions 类似，但不使用 @torch.no_grad()，允许梯度回传。
+        
+        Args:
+            images: 图像列表
+            img_masks: 图像掩码列表
+            tokens: 语言 tokens
+            masks: 语言 token 掩码
+            condition_token: [batch, hidden_dim] 可选的条件 token
+            noise: 可选的初始噪声
+            num_steps: 采样步数
+            
+        Returns:
+            生成的动作 [batch, chunk_size, action_dim]
+        """
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        bsize = tokens.shape[0]
+        device = tokens.device
+
+        if noise is None:
+            actions_shape = (
+                bsize,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+            )
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        # 注意：这里不使用 past_key_values 缓存，因为需要保持梯度流
+        # 每一步都重新计算 prefix，但这是必要的代价
+
+        dt = -1.0 / num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            
+            # 完整的 forward pass（不使用 KV cache）
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                x_t, expanded_time, condition_token
+            )
+            
+            if (
+                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+                == torch.bfloat16
+            ):
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+                prefix_embs_bf16 = prefix_embs.to(dtype=torch.bfloat16)
+            else:
+                prefix_embs_bf16 = prefix_embs
+            
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+            
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs_bf16, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            
+            suffix_out = suffix_out[:, -self.config.chunk_size :]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            v_t = self.action_out_proj(suffix_out)
+            
+            # Euler step
+            x_t = x_t + dt * v_t
+            time = time + dt
+
+        return x_t
 
 
 class PI05Policy(PreTrainedPolicy):
@@ -897,6 +1636,8 @@ class PI05Policy(PreTrainedPolicy):
         self.model.to(config.device)
 
         self.reset()
+
+        self.train_addition_only: bool = False
 
     @classmethod
     def from_pretrained(
@@ -1077,12 +1818,87 @@ class PI05Policy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def _apply_param_freezing(self) -> None:
+        """根据 train_addition_only 冻结或解冻参数。"""
+        # 如果不只训练新增参数，则全部参与训练
+        if not self.train_addition_only:
+            for p in self.parameters():
+                p.requires_grad = True
+            return
+
+        # 只训练 addition_params，其它参数 requires_grad=False
+        params = []
+
+        # content_attention 的参数
+        if self.model.content_attention is not None:
+            params.extend(self.model.content_attention.parameters())
+
+        if self.model.cmp_projection is not None:
+            params.extend(self.model.cmp_projection.parameters())
+
+        # cls_head_prefix 参数
+        if self.model.cls_head_prefix is not None:
+            params.append(self.model.cls_head_prefix)
+
+        addition_ids = {id(p) for p in params}
+        for p in self.parameters():
+            p.requires_grad = id(p) in addition_ids
+
+    def _apply_online_params(self) -> None:
+        """为 online 训练设置参数：只训练 action_expert (gemma_expert) 的参数。
+        
+        在 online 训练时，我们只希望更新 action_expert 的参数，
+        而保持 paligemma（视觉-语言模型）的参数冻结。
+        """
+        # 收集 action_expert 的所有参数
+        online_params = []
+        
+        # gemma_expert 的参数
+        if hasattr(self.model, 'paligemma_with_expert'):
+            online_params.extend(
+                self.model.paligemma_with_expert.gemma_expert.parameters()
+            )
+        
+        # action_in_proj 和 action_out_proj 的参数
+        if hasattr(self.model, 'action_in_proj'):
+            online_params.extend(self.model.action_in_proj.parameters())
+        if hasattr(self.model, 'action_out_proj'):
+            online_params.extend(self.model.action_out_proj.parameters())
+        
+        # time_mlp 的参数
+        if hasattr(self.model, 'time_mlp_in'):
+            online_params.extend(self.model.time_mlp_in.parameters())
+        if hasattr(self.model, 'time_mlp_out'):
+            online_params.extend(self.model.time_mlp_out.parameters())
+
+        # if self.model.content_attention is not None:
+        #     online_params.extend(self.model.content_attention.parameters())
+
+        # 设置所有参数的 requires_grad
+        online_param_ids = {id(p) for p in online_params}
+        for p in self.parameters():
+            p.requires_grad = id(p) in online_param_ids
+
+    def freeze_params(self) -> None:
+        """设置是否只训练新增参数，并立即应用到 requires_grad。"""
+        self.train_addition_only = True
+        self._apply_param_freezing()
+
+    def unfreeze_params(self) -> None:
+        """显式解冻所有参数，恢复联合训练。"""
+        self.train_addition_only = False
+        self._apply_param_freezing()
+
     def reset(self):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        
+        # 动作上下文追踪：每个样本在当前 chunk 中已执行的步数
+        self._steps_in_chunk: Tensor | None = None
+        self._predicted_actions_buffer: Tensor | None = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1182,51 +1998,350 @@ class PI05Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(batch)
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
 
+    def _should_replan(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        predict_actions: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Check if replanning is needed based on VICReg similarity comparison.
+
+        Args:
+            images: Current images (list of tensors)
+            img_masks: Current image masks (list of tensors)
+            tokens: Current language tokens [batch_size, seq_len]
+            masks: Current language token masks [batch_size, seq_len]
+            predict_actions: Previously predicted actions [batch_size, delta_replan, action_dim]
+
+        Returns:
+            tuple: (should_replan: Tensor [batch_size], similarity: Tensor [batch_size])
+        """
+        delta_replan = getattr(self.config, "delta_replan", 0)
+        device = tokens.device
+        batch_size = tokens.shape[0]
+        if delta_replan <= 0:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        if self.model.cls_head_prefix is None or self.model.part_layer_num is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        if self.model.content_attention is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        device = tokens.device
+        batch_size = tokens.shape[0]
+
+        # Step 1: Get cmp_vec_0 from current visual-language information
+        # Prepare prefix embeddings with cls_head_prefix
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
+            images, img_masks, tokens, masks
+        )
+
+        cls_head = self.model.cls_head_prefix.expand(batch_size, -1, -1).to(
+            dtype=prefix_embs.dtype
+        )
+        prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1)
+
+        # Update masks
+        cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        prefix_pad_masks_with_cls = torch.cat([cls_pad_mask, prefix_pad_masks], dim=1)
+
+        cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)
+        prefix_att_masks_with_cls = torch.cat(
+            [cls_att_mask.unsqueeze(0).expand(batch_size, -1), prefix_att_masks], dim=1
+        )
+
+        # Prepare dummy suffix
+        action_expert_config = get_gemma_config(self.config.action_expert_variant)
+        dummy_suffix_embs = torch.zeros(
+            batch_size,
+            1,
+            action_expert_config.width,
+            dtype=prefix_embs_with_cls.dtype,
+            device=device,
+        )
+        dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
+
+        # Merge masks
+        pad_masks = torch.cat([prefix_pad_masks_with_cls, dummy_suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks_with_cls, dummy_suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self.model._prepare_attention_masks_4d(att_2d_masks)
+
+        # Execute forward_partial
+        intermediate_embeds, _ = self.model.paligemma_with_expert.forward_partial(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            inputs_embeds=[prefix_embs_with_cls, dummy_suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, None],
+            part_layer_num=self.model.part_layer_num,
+        )
+
+        # Extract cls head output
+        cmp_vec_0 = intermediate_embeds[0][:, 0, :]  # [batch_size, paligemma_hidden_dim]
+        cmp_vec_0 = self.model.cmp_projection(cmp_vec_0)  # [batch_size, action_expert_hidden_dim]
+        cmp_vec_0 = cmp_vec_0.to(dtype=torch.float32)
+
+        # Step 2: Get cmp_vec_1 from predicted actions
+        attn_act_len = self.model.content_attention.attn_act_len
+
+
+        # Select first attn_act_len actions
+        predict_actions = predict_actions[:, :attn_act_len, :]
+
+
+        # Get cmp_vec_1
+        cmp_vec_1 = self.model.content_attention(predict_actions).to(dtype=torch.float32)
+
+        # Step 3: Compute similarity
+        similarity = compute_vicreg_similarity(cmp_vec_0, cmp_vec_1)  # [batch_size]
+
+        # Decide if replanning is needed (higher similarity = more different = need replan)
+        should_replan = similarity > self._replan_threshold  # [batch_size] bool tensor
+        return should_replan, similarity
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+        """Predict a chunk of actions given environment observations with replanning support.
+
+        Replanning logic:
+        - Initially: directly predict actions
+        - After that: every delta_replan steps, compare current observation with predicted actions
+        - If similarity > threshold (0.1): replan (generate new actions)
+        - If similarity <= threshold: continue using previous predictions
+        """
         self.eval()
 
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        delta_replan = getattr(self.config, "delta_replan", 0)
 
-        # Unpad actions to actual action dimension
+        # Initialize replanning state if not exists
+        if delta_replan > 0:
+            if not hasattr(self, "_replan_step_counter"):
+                self._replan_step_counter = 0
+            if not hasattr(self, "_predicted_actions_buffer"):
+                self._predicted_actions_buffer = None
+            if not hasattr(self, "_replan_threshold"):
+                self._replan_threshold = 0.1
+
+        batch_size = tokens.shape[0]
+        device = tokens.device
+        
+        # Initialize _steps_in_chunk if not exists
+        if self._steps_in_chunk is None:
+            self._steps_in_chunk = torch.zeros(batch_size, dtype=torch.long, device=device)
+        
+        # Initialize should_replan as all True (default: always plan initially or when buffer is empty)
+        should_replan = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        # Check if we need to replan based on similarity comparison
+        if delta_replan > 0 and self._predicted_actions_buffer is not None:
+            # Check every delta_replan steps
+            should_replan, similarity = self._should_replan(
+                images, img_masks, tokens, masks, self._predicted_actions_buffer[:,:delta_replan,:],
+            )
+
+
+        # If replanning is needed, generate new actions
+        # Handle list indexing for images and img_masks
+        if should_replan.all():
+            # All samples need replanning, use all inputs
+            filtered_images = images
+            filtered_img_masks = img_masks
+            filtered_tokens = tokens
+            filtered_masks = masks
+        elif should_replan.any():
+            # Some samples need replanning
+            # Filter images and img_masks (they are lists)
+            filtered_images = [img[should_replan] for img in images]
+            filtered_img_masks = [mask[should_replan] for mask in img_masks]
+            filtered_tokens = tokens[should_replan]
+            filtered_masks = masks[should_replan]
+
+
+        # Generate actions only for samples that need replanning
+        if should_replan.any():
+            actions = self.model.sample_actions(filtered_images, filtered_img_masks, filtered_tokens, filtered_masks, **kwargs)
+            
+            # Update buffer for samples that were replanned
+            if self._predicted_actions_buffer is not None:
+                if should_replan.all():
+                    # All samples replanned
+                    self._predicted_actions_buffer = actions
+                    # Reset steps for all samples
+                    self._steps_in_chunk = torch.zeros(batch_size, dtype=torch.long, device=device)
+                else:
+                    # Partial replanning: only update replanned samples
+                    self._predicted_actions_buffer[should_replan] = actions
+                    # Reset steps only for replanned samples
+                    self._steps_in_chunk[should_replan] = 0
+            else:
+                self._predicted_actions_buffer = actions
+                self._steps_in_chunk = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        # Update steps in chunk (advance by delta_replan for all samples)
+        self._steps_in_chunk += delta_replan
+
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        actions = actions[:, :, :original_action_dim]
+        return self._predicted_actions_buffer[:, :delta_replan, :original_action_dim]
 
-        return actions
+    def forward(self, batch: dict[str, Tensor], cmp=False, online=False) -> tuple[Tensor, dict]:
+        """Run the batch through the model and compute the loss for training.
+        
+        Args:
+            batch: 输入数据批次
+            cmp: 是否为对比学习模式
+            online: 是否为在线训练模式
+                    如果为 True，使用 prev_actions 作为条件，生成动作并计算与 pred_action 的特征距离
+        """
+        if online:
+            self._apply_online_params()
+            prev_actions = batch.get('prev_actions')      # [batch, 10, action_dim]
+            pred_action = batch.get('pred_action')        # [batch, 10, action_dim]
+            actions_seq_valid = batch.get('actions_seq_valid')  # [batch]
+            
+            # 准备输入
+            images, img_masks = self._preprocess_images(batch)
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            
+            # 检查 content_attention 是否可用
+            if self.model.content_attention is None:
+                raise ValueError(
+                    "content_attention is not initialized. "
+                    "Please set attn_act_len in config to enable online training."
+                )
+            
+            # 1. prev_actions 过 content_attention 提取条件特征
+            prev_actions_padded = pad_vector(prev_actions, self.config.max_action_dim)
+            condition_token = self.model.content_attention(prev_actions_padded)  # [batch, hidden_dim]
+            
+            # 2. 使用 condition_token 生成动作（可微分）
+            generated_actions = self.model.sample_actions_differentiable(
+                images, img_masks, tokens, masks,
+                condition_token=condition_token,
+                num_steps=self.config.num_inference_steps,
+            )
+            
+            # 3. 生成动作的前10步过 content_attention
+            attn_act_len = self.model.content_attention.attn_act_len
+            gen_actions_slice = generated_actions[:, :attn_act_len, :]  # [batch, 10, max_action_dim]
+            gen_feature = self.model.content_attention(gen_actions_slice)  # [batch, hidden_dim]
+            
+            # 4. pred_action 过 content_attention
+            pred_actions_padded = pad_vector(pred_action, self.config.max_action_dim)
+            pred_feature = self.model.content_attention(pred_actions_padded)  # [batch, hidden_dim]
+            
+            # 5. 计算特征距离 loss
+            #feature_loss = F.mse_loss(gen_feature, pred_feature)
+            feature_loss = torch.mean(F.relu(torch.square(gen_feature - pred_feature)-0.1))
+            loss_dict = {
+                "loss": feature_loss.item(),
+                "feature_loss": feature_loss.item(),
+            }
+            
+            return feature_loss, loss_dict
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training."""
+        else:
+            if cmp:
+                self.freeze_params()
+            if not cmp:
+                self.unfreeze_params()
 
-        # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
-        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            # Prepare inputs
+            images, img_masks = self._preprocess_images(batch)
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions = self.prepare_action(batch)
+            actions = self.prepare_action(batch)
+            if not cmp:
+                # Compute loss (no separate state needed for PI05)
+                losses = self.model.forward(images, img_masks, tokens, masks, actions)
+            else:
+                losses = self.model.forward_cmp(images, img_masks, tokens, masks)
+            # Truncate losses to actual action dimensions
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            losses = losses[:, :, :original_action_dim]
 
-        # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+            loss = losses.mean()
 
-        # Truncate losses to actual action dimensions
+            loss_dict = {
+                "loss": loss.item(),
+                "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            }
+
+            return loss, loss_dict
+
+    def get_action_context(self, prev_steps: int = 10, pred_steps: int = 10) -> dict:
+        """获取当前步骤的动作上下文信息。
+        
+        用于在线数据收集时记录每帧的动作上下文：
+        - prev_actions: 前 prev_steps 步已执行的动作
+        - pred_action: 后 pred_steps 步预测的动作
+        - actions_seq_valid: 仅当前后动作都来自同一次预测时为 True
+        
+        Args:
+            prev_steps: 需要的前序动作步数（默认10）
+            pred_steps: 需要的预测动作步数（默认10）
+        
+        Returns:
+            dict: {
+                'prev_actions': Tensor [batch, prev_steps, action_dim],
+                'pred_action': Tensor [batch, pred_steps, action_dim],
+                'actions_seq_valid': Tensor [batch] bool,
+            }
+            注意：始终返回正确形状的数据，无效时用零填充且 valid=False
+        """
+        # 获取 action_dim 和 device
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
-
-        loss = losses.mean()
-
-        loss_dict = {
-            "loss": loss.item(),
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+        device = next(self.parameters()).device
+        
+        # 默认 batch_size = 1，如果有 buffer 则从 buffer 获取
+        batch_size = 1
+        if self._predicted_actions_buffer is not None:
+            batch_size = self._predicted_actions_buffer.shape[0]
+        
+        # 初始化为零填充的数据（始终返回正确形状，不返回 None）
+        prev_actions = torch.zeros(batch_size, prev_steps, original_action_dim, device=device, dtype=torch.float32)
+        pred_action = torch.zeros(batch_size, pred_steps, original_action_dim, device=device, dtype=torch.float32)
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # 如果有预测 buffer，填充真实数据
+        if self._predicted_actions_buffer is not None and self._steps_in_chunk is not None:
+            chunk_size = self._predicted_actions_buffer.shape[1]
+            
+            # 判断每个样本是否有效
+            valid_mask = (self._steps_in_chunk >= prev_steps) & (self._steps_in_chunk + pred_steps <= chunk_size)
+            
+            # 为有效的样本填充真实数据
+            for i in range(batch_size):
+                if valid_mask[i]:
+                    step = self._steps_in_chunk[i].item()
+                    prev_actions[i] = self._predicted_actions_buffer[i, step - prev_steps:step, :original_action_dim]
+                    pred_action[i] = self._predicted_actions_buffer[i, step:step + pred_steps, :original_action_dim]
+        
+        result = {
+            'prev_actions': prev_actions,
+            'pred_action': pred_action,
+            'actions_seq_valid': valid_mask,
         }
-
-        return loss, loss_dict
+        
+        # # 诊断日志
+        # import logging
+        # logging.info(f"[DEBUG get_action_context] pred_action.shape={pred_action.shape}, prev_actions.shape={prev_actions.shape}")
+        
+        return result
