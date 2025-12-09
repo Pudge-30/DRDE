@@ -198,6 +198,9 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
 @dataclass
 class OnlineConfig:
     """Configuration for online training parameters."""
+    # Whether to collect new episodes and add them to the dataset (default: True)
+    # If False, only load existing online dataset and train on it without collecting new data
+    online_collect: bool = True
     # Number of episodes to collect before each training phase
     collect_episodes_per_iteration: int = 10
     # Number of training steps to perform after each data collection phase

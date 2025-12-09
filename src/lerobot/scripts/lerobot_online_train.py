@@ -152,32 +152,18 @@ class FillMissingActionContextProcessor:
 
 
 class ValidActionContextSampler(torch.utils.data.Sampler):
-    """只采样 actions_seq_valid=True 的帧的 Sampler。
-    
-    用于在线数据集训练时，仅使用动作上下文有效的帧，
-    即 prev_actions 和 pred_action 来自同一次预测的帧。
-    """
-    
+    """只采样 actions_seq_valid=True 的帧的 Sampler。"""
+
     def __init__(self, dataset: LeRobotDataset, shuffle: bool = True):
-        """初始化 Sampler。
-        
-        Args:
-            dataset: LeRobotDataset 实例
-            shuffle: 是否打乱采样顺序（默认 True）
-        """
+        super().__init__()
         self.dataset = dataset
         self.shuffle = shuffle
         self._valid_indices = None
         self._cached_num_frames = 0
-    
+
     def _find_valid_indices(self) -> list[int]:
-        """查找所有 actions_seq_valid=True 的帧索引。
-        
-        Returns:
-            有效帧的索引列表
-        """
-        valid_indices = []
-        
+        """高效地查找所有 actions_seq_valid=True 的帧索引。"""
+
         # 检查数据集是否有 actions_seq_valid 字段
         if 'actions_seq_valid' not in self.dataset.features:
             logging.warning(
@@ -185,70 +171,153 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
                 "Falling back to all indices."
             )
             return list(range(len(self.dataset)))
-        
-        logging.info(f"Scanning dataset for valid action context frames (total: {len(self.dataset)} frames)...")
-        
-        for idx in range(len(self.dataset)):
-            try:
-                item = self.dataset[idx]
-                if 'actions_seq_valid' in item:
-                    valid_value = item['actions_seq_valid']
-                    # 处理不同格式：可能是 [1] 形状的张量或标量
-                    if isinstance(valid_value, torch.Tensor):
-                        if valid_value.numel() == 1:
-                            is_valid = valid_value.item()
-                        else:
-                            is_valid = valid_value.any().item()
-                    else:
-                        is_valid = bool(valid_value)
-                    
-                    if is_valid:
-                        valid_indices.append(idx)
-            except Exception as e:
-                logging.warning(f"Error reading frame {idx}: {e}")
-                continue
-        
+
+        logging.info(f"Finding valid action context frames (total: {len(self.dataset)} frames)...")
+
+        # 直接从 hf_dataset 批量读取 actions_seq_valid 列（非常快）
+        hf_dataset = self.dataset.hf_dataset
+        if 'actions_seq_valid' in hf_dataset.column_names:
+            # 批量获取整列数据
+            actions_seq_valid = np.array(hf_dataset['actions_seq_valid'])
+            if len(actions_seq_valid) == 0:
+                return []
+            # 转换为 numpy 数组进行快速过滤
+            if isinstance(actions_seq_valid, list):
+                actions_seq_valid = np.array(actions_seq_valid)
+
+            # 处理形状：可能是 (N,) 或 (N, 1)
+            if actions_seq_valid.ndim == 2:
+                actions_seq_valid = actions_seq_valid.squeeze(-1)
+
+            # 找到所有 True 的索引
+            valid_indices = np.where(actions_seq_valid)[0].tolist()
+        else:
+            # 如果 hf_dataset 中没有这个列，回退到全部索引
+            logging.warning("'actions_seq_valid' not in hf_dataset columns, using all indices")
+            valid_indices = list(range(len(self.dataset)))
+
         logging.info(
             f"Found {len(valid_indices)} valid frames out of {len(self.dataset)} "
             f"({100 * len(valid_indices) / max(1, len(self.dataset)):.1f}%)"
         )
-        
+
         return valid_indices
-    
+
     @property
     def valid_indices(self) -> list[int]:
         """获取有效帧索引（带缓存）。"""
-        # 如果数据集大小变化了，需要重新扫描
         current_num_frames = len(self.dataset)
         if self._valid_indices is None or self._cached_num_frames != current_num_frames:
             self._valid_indices = self._find_valid_indices()
             self._cached_num_frames = current_num_frames
         return self._valid_indices
-    
-    def refresh(self) -> None:
-        """强制刷新有效帧索引缓存。"""
-        self._valid_indices = None
-        self._cached_num_frames = 0
-    
+
     def __iter__(self):
         indices = self.valid_indices
         if len(indices) == 0:
             logging.warning("No valid frames found! Returning empty iterator.")
             return iter([])
-        
+
         if self.shuffle:
-            # 使用 torch.randperm 生成随机排列
             perm = torch.randperm(len(indices)).tolist()
             return iter([indices[i] for i in perm])
         return iter(indices)
-    
+
     def __len__(self) -> int:
         return len(self.valid_indices)
 
+# class ValidActionContextSampler(torch.utils.data.Sampler):
+#      """只采样 actions_seq_valid=True 的帧的 Sampler。
+#
+#      用于在线数据集训练时，仅使用动作上下文有效的帧，
+#      即 prev_actions 和 pred_action 来自同一次预测的帧。
+#      """
+#
+#      def __init__(self, dataset: LeRobotDataset, shuffle: bool = True):
+#          """初始化 Sampler。
+#
+#          Args:
+#              dataset: LeRobotDataset 实例
+#              shuffle: 是否打乱采样顺序（默认 True）
+#          """
+#          self.dataset = dataset
+#          self.shuffle = shuffle
+#          self._valid_indices = None
+#          self._cached_num_frames = 0
+#
+#      def _find_valid_indices(self) -> list[int]:
+#          """查找所有 actions_seq_valid=True 的帧索引。
+#
+#          Returns:
+#              有效帧的索引列表
+#          """
+#          valid_indices = []
+#
+#          # 检查数据集是否有 actions_seq_valid 字段
+#          if 'actions_seq_valid' not in self.dataset.features:
+#              logging.warning(
+#                  "Dataset does not have 'actions_seq_valid' feature. "
+#                  "Falling back to all indices."
+#              )
+#              return list(range(len(self.dataset)))
+#          logging.info(f"Scanning dataset for valid action context frames (total: {len(self.dataset)} frames)...")
+#
+#          for idx in range(len(self.dataset)):
+#              try:
+#                  item = self.dataset[idx]
+#                  if 'actions_seq_valid' in item:
+#                      valid_value = item['actions_seq_valid']
+#                      # 处理不同格式：可能是 [1] 形状的张量或标量
+#                      if isinstance(valid_value, torch.Tensor):
+#                          if valid_value.numel() == 1:
+#                              is_valid = valid_value.item()
+#                          else:
+#                              is_valid = valid_value.any().item()
+#                      else:
+#                          is_valid = bool(valid_value)
+#
+#                      if is_valid:
+#                          valid_indices.append(idx)
+#              except Exception as e:
+#                  logging.warning(f"Error reading frame {idx}: {e}")
+#                  continue
+#          logging.info(
+#              f"Found {len(valid_indices)} valid frames out of {len(self.dataset)} "
+#              f"({100 * len(valid_indices) / max(1, len(self.dataset)):.1f}%)"
+#          )
+#
+#          return valid_indices
+#
+#      @property
+#      def valid_indices(self) -> list[int]:
+#          """获取有效帧索引（带缓存）。"""
+#          # 如果数据集大小变化了，需要重新扫描
+#          current_num_frames = len(self.dataset)
+#          if self._valid_indices is None or self._cached_num_frames != current_num_frames:
+#              self._valid_indices = self._find_valid_indices()
+#              self._cached_num_frames = current_num_frames
+#          return self._valid_indices
+#
+#
+#      def __iter__(self):
+#          indices = self.valid_indices
+#          if len(indices) == 0:
+#              logging.warning("No valid frames found! Returning empty iterator.")
+#              return iter([])
+#
+#          if self.shuffle:
+#              # 使用 torch.randperm 生成随机排列
+#              perm = torch.randperm(len(indices)).tolist()
+#              return iter([indices[i] for i in perm])
+#          return iter(indices)
+#
+#      def __len__(self) -> int:
+#          return len(self.valid_indices)
 
 def rollout(
         env: gym.vector.VectorEnv,
         policy: PreTrainedPolicy,
+        batch_size: int,
         env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
         env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
         preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -341,16 +410,17 @@ def rollout(
             all_observations.append(deepcopy(observation))
 
         observation = preprocessor(observation)
-        with torch.inference_mode():
-            action = policy.select_action(observation)
-        
+
         # Collect action context after select_action (before postprocessor)
         if return_action_context and hasattr(policy, 'get_action_context'):
-            ctx = policy.get_action_context(prev_steps=10, pred_steps=10)
+            ctx = policy.get_action_context(batch_size=batch_size, prev_steps=10, pred_steps=10)
             all_prev_actions.append(ctx['prev_actions'])
             all_pred_actions.append(ctx['pred_action'])
             all_actions_seq_valid.append(ctx['actions_seq_valid'])
-        
+
+        with torch.inference_mode():
+            action = policy.select_action(observation)
+
         action = postprocessor(action)
 
         action_transition = {"action": action}
@@ -435,8 +505,6 @@ def rollout(
             ret["prev_actions"] = torch.stack(valid_prev_actions, dim=1)
         if len(valid_pred_actions) > 0:
             ret["pred_action"] = torch.stack(valid_pred_actions, dim=1)
-            # # 诊断日志
-            # logging.info(f"[DEBUG rollout] ret['pred_action'].shape={ret['pred_action'].shape}")
         if len(valid_flags) > 0:
             # Stack along sequence dimension: [batch, sequence]
             ret["actions_seq_valid"] = torch.stack(valid_flags, dim=1)
@@ -522,6 +590,7 @@ def update_policy(
 
 def collect_episodes(
     env,
+    batch_size,
     policy: PreTrainedPolicy,
     env_preprocessor,
     env_postprocessor,
@@ -572,6 +641,7 @@ def collect_episodes(
         rollout_data = rollout(
             env=env,
             policy=policy,
+            batch_size=batch_size,
             env_preprocessor=env_preprocessor,
             env_postprocessor=env_postprocessor,
             preprocessor=preprocessor,
@@ -640,7 +710,6 @@ def collect_episodes(
         # Update data index for next batch
         if len(batch_episode_data.get("index", [])) > 0:
             current_data_index = batch_episode_data["index"][-1].item() + 1
-
     # Concatenate all episode data
     if len(all_episode_data) > 1:
         combined_data = {}
@@ -657,6 +726,7 @@ def add_episodes_to_dataset(
     online_dataset: LeRobotDataset,
     episode_data: dict,
 ) -> None:
+
     """Add collected episodes to the dataset.
 
     This function converts episode_data from batch format to individual frames
@@ -751,7 +821,6 @@ def add_episodes_to_dataset(
                             )
                 
                 frame_dict[key] = value
-
         # Don't add next.success as complementary_info if it's not in dataset features
         # Only add complementary_info keys if they exist in dataset features
         # if "next.success" in episode_data:
@@ -815,7 +884,9 @@ def add_episodes_to_dataset(
             #     logging.info(f"[DEBUG] actions_seq_valid after processing: shape={actions_seq_valid.shape}, dtype={actions_seq_valid.dtype}")
             
             frame_dict["actions_seq_valid"] = actions_seq_valid
-
+            
+            # 不跳过帧，让所有帧都被保存到数据集
+            # 训练时可以通过采样器（如 ValidActionContextSampler）来过滤无效帧
         # Log frame_dict keys and dataset features for first frame
         if frame_idx == 0:
             logging.info(f"Frame dict keys: {sorted(frame_dict.keys())}")
@@ -835,28 +906,26 @@ def add_episodes_to_dataset(
         # Add frame to dataset
         online_dataset.add_frame(frame_dict)
 
-        # Save episode if done flag is True (episode ended)
-        # 只在 episode 的最后一帧保存，避免填充帧导致重复保存
+        # Save episode if this is the last frame of the episode
+        # 检测是否是 episode 的最后一帧（下一个帧属于不同的 episode，或者这是所有帧的最后一帧）
         is_last_frame_of_episode = (
             frame_idx == total_frames - 1 or
             episode_data["episode_index"][frame_idx + 1].item() != episode_index
         )
         
+        # 如果是最后一帧，无论 done 标志如何都应该保存 episode
+        # 因为 episode 已经结束了（可能是正常结束或被截断）
         if is_last_frame_of_episode:
-            if isinstance(done, torch.Tensor):
-                if done.item():
-                    online_dataset.save_episode()
-            elif done:
+            if online_dataset.episode_buffer is not None and online_dataset.episode_buffer["size"] > 0:
                 online_dataset.save_episode()
 
         # Update current episode index
         current_episode_index = episode_index
-
     # Save the last episode if there are any remaining frames
+    # 这个检查是额外的安全措施，但通常上面的逻辑已经处理了所有情况
     if total_frames > 0:
         if online_dataset.episode_buffer is not None and online_dataset.episode_buffer["size"] > 0:
             online_dataset.save_episode()
-
     logging.info(f"Added {total_frames} frames to dataset")
 
 
@@ -935,9 +1004,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         online_dataset_root = cfg.online.online_dataset_root or cfg.dataset.root
         
         # Check if online dataset already exists by checking for info.json
-        online_dataset_path = Path(online_dataset_root) / online_dataset_repo_id
+        online_dataset_path = Path(online_dataset_root)
         online_meta_path = online_dataset_path / "meta" / "info.json"
         
+        need_to_create = False
         if online_meta_path.exists():
             # Dataset exists, load it
             logging.info(f"Loading existing online dataset: {online_dataset_repo_id}")
@@ -951,96 +1021,128 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 f"{online_dataset.num_frames} frames"
             )
         else:
-            # Dataset doesn't exist, create new one
-            logging.info(f"Creating new online dataset: {online_dataset_repo_id}")
-            
-            # Get configuration from offline dataset if available, otherwise from environment
-            if offline_dataset is not None:
-                # Copy configuration from offline dataset
-                fps = offline_dataset.meta.fps
-                features = offline_dataset.meta.features.copy()
-                robot_type = offline_dataset.meta.robot_type
-                logging.info(
-                    f"Using configuration from offline dataset: fps={fps}, "
+            # Dataset doesn't exist or is incomplete
+            # If directory exists but info.json doesn't, try to load first (will fail gracefully)
+            # If load fails, we'll remove the directory and create a new one
+            if online_dataset_path.exists():
+                logging.warning(
+                    f"Directory {online_dataset_path} exists but info.json is missing. "
+                    f"Attempting to load dataset first..."
                 )
+                try:
+                    online_dataset = LeRobotDataset(
+                        online_dataset_repo_id,
+                        root=online_dataset_root,
+                        video_backend=cfg.dataset.video_backend,
+                    )
+                    logging.info(
+                        f"Online dataset loaded: {online_dataset.num_episodes} episodes, "
+                        f"{online_dataset.num_frames} frames"
+                    )
+                    # Successfully loaded, don't need to create
+                    need_to_create = False
+                except (FileNotFoundError, NotADirectoryError, AssertionError) as e:
+                    logging.warning(
+                        f"Failed to load dataset from existing directory: {e}. "
+                        f"Removing incomplete directory and creating new dataset."
+                    )
+                    import shutil
+                    shutil.rmtree(online_dataset_path)
+                    need_to_create = True
             else:
-                # Get configuration from environment
-                fps = cfg.env.fps
-                # Convert environment features to dataset features format
-                from lerobot.envs.utils import env_to_policy_features
+                # Directory doesn't exist, need to create new one
+                need_to_create = True
+            
+            if need_to_create:
+                logging.info(f"Creating new online dataset: {online_dataset_repo_id}")
                 
-                # Get policy features from env config
-                policy_features = env_to_policy_features(cfg.env)
+                # Get configuration from offline dataset if available, otherwise from environment
+                if offline_dataset is not None:
+                    # Copy configuration from offline dataset
+                    fps = offline_dataset.meta.fps
+                    features = offline_dataset.meta.features.copy()
+                    robot_type = offline_dataset.meta.robot_type
+                    logging.info(
+                        f"Using configuration from offline dataset: fps={fps}, "
+                    )
+                else:
+                    # Get configuration from environment
+                    fps = cfg.env.fps
+                    # Convert environment features to dataset features format
+                    from lerobot.envs.utils import env_to_policy_features
+                    
+                    # Get policy features from env config
+                    policy_features = env_to_policy_features(cfg.env)
+                    
+                    # Convert to dataset features format
+                    features = {}
+                    for key, feat in policy_features.items():
+                        if feat.type.name == "VISUAL":
+                            # For visual features, use video dtype and keep channel-last shape
+                            # Note: env features are already in channel-last format (h, w, c)
+                            features[key] = {
+                                "dtype": "video",
+                                "shape": feat.shape,  # (h, w, c)
+                                "names": ["height", "width", "channels"],
+                            }
+                        elif feat.type.name == "STATE" or feat.type.name == "ACTION":
+                            features[key] = {
+                                "dtype": "float32",
+                                "shape": feat.shape,
+                                "names": None,
+                            }
+                        else:
+                            features[key] = {
+                                "dtype": "float32",
+                                "shape": feat.shape,
+                                "names": None,
+                            }
+                    
+                    # Add default features (reward, done)
+                    features[REWARD] = {"dtype": "float32", "shape": (1,), "names": None}
+                    features[DONE] = {"dtype": "bool", "shape": (1,), "names": None}
+                    
+                    robot_type = None
+                    logging.info(
+                        f"Using configuration from environment: fps={fps}, "
+                    )
                 
-                # Convert to dataset features format
-                features = {}
-                for key, feat in policy_features.items():
-                    if feat.type.name == "VISUAL":
-                        # For visual features, use video dtype and keep channel-last shape
-                        # Note: env features are already in channel-last format (h, w, c)
-                        features[key] = {
-                            "dtype": "video",
-                            "shape": feat.shape,  # (h, w, c)
-                            "names": ["height", "width", "channels"],
-                        }
-                    elif feat.type.name == "STATE" or feat.type.name == "ACTION":
-                        features[key] = {
-                            "dtype": "float32",
-                            "shape": feat.shape,
-                            "names": None,
-                        }
-                    else:
-                        features[key] = {
-                            "dtype": "float32",
-                            "shape": feat.shape,
-                            "names": None,
-                        }
+                # Add action context features for online training
+                # Get action dimension from features
+                action_dim = features[ACTION]["shape"][-1] if ACTION in features else 7  # default to 7
+                prev_steps = 10
+                pred_steps = 10
                 
-                # Add default features (reward, done)
-                features[REWARD] = {"dtype": "float32", "shape": (1,), "names": None}
-                features[DONE] = {"dtype": "bool", "shape": (1,), "names": None}
-                
-                robot_type = None
+                features["prev_actions"] = {
+                    "dtype": "float32",
+                    "shape": (prev_steps, action_dim),
+                    "names": ["prev_step", "action_dim"],
+                }
+                features["pred_action"] = {
+                    "dtype": "float32",
+                    "shape": (pred_steps, action_dim),
+                    "names": ["pred_step", "action_dim"],
+                }
+                features["actions_seq_valid"] = {
+                    "dtype": "bool",
+                    "shape": (1,),
+                    "names": None,
+                }
                 logging.info(
-                    f"Using configuration from environment: fps={fps}, "
+                    f"Added action context features: prev_actions shape={(prev_steps, action_dim)}, "
+                    f"pred_action shape={(pred_steps, action_dim)}"
                 )
-            
-            # Add action context features for online training
-            # Get action dimension from features
-            action_dim = features[ACTION]["shape"][-1] if ACTION in features else 7  # default to 7
-            prev_steps = 10
-            pred_steps = 10
-            
-            features["prev_actions"] = {
-                "dtype": "float32",
-                "shape": (prev_steps, action_dim),
-                "names": ["prev_step", "action_dim"],
-            }
-            features["pred_action"] = {
-                "dtype": "float32",
-                "shape": (pred_steps, action_dim),
-                "names": ["pred_step", "action_dim"],
-            }
-            features["actions_seq_valid"] = {
-                "dtype": "bool",
-                "shape": (1,),
-                "names": None,
-            }
-            logging.info(
-                f"Added action context features: prev_actions shape={(prev_steps, action_dim)}, "
-                f"pred_action shape={(pred_steps, action_dim)}"
-            )
-            
-            # Create empty online dataset
-            online_dataset = LeRobotDataset.create(
-                online_dataset_repo_id,
-                fps=fps,
-                features=features,
-                root=online_dataset_root,
-                robot_type=robot_type,
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size if hasattr(cfg.dataset, "video_encoding_batch_size") else 1,
-            )
-            logging.info("Empty online dataset created successfully")
+                
+                # Create empty online dataset
+                online_dataset = LeRobotDataset.create(
+                    online_dataset_repo_id,
+                    fps=fps,
+                    features=features,
+                    root=online_dataset_root,
+                    robot_type=robot_type,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size if hasattr(cfg.dataset, "video_encoding_batch_size") else 1,
+                )
+                logging.info("Empty online dataset created successfully")
 
     accelerator.wait_for_everyone()
 
@@ -1194,7 +1296,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # Create dataloaders for offline and online datasets
-    def create_dataloader(dataset, use_valid_action_sampler: bool = False):
+    def create_dataloader(dataset, online=False):
         """创建 DataLoader。
         
         Args:
@@ -1202,10 +1304,13 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             use_valid_action_sampler: 是否使用 ValidActionContextSampler
                 仅采样 actions_seq_valid=True 的帧（用于在线数据集）
         """
-        if use_valid_action_sampler:
-            # 使用 ValidActionContextSampler，仅采样 valid 的帧
+
+        if online:
             shuffle = False
-            sampler = ValidActionContextSampler(dataset, shuffle=True)
+            sampler = ValidActionContextSampler(
+                dataset,
+                shuffle=True,
+            )
         elif hasattr(cfg.policy, "drop_n_last_frames"):
             shuffle = False
             sampler = EpisodeAwareSampler(
@@ -1234,7 +1339,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     offline_dataloader = None
     offline_dl_iter = None
     if offline_dataset is not None:
-        offline_dataloader = create_dataloader(offline_dataset, use_valid_action_sampler=False)
+        offline_dataloader = create_dataloader(offline_dataset)
         if is_main_process:
             logging.info("Created dataloader for offline dataset")
 
@@ -1244,7 +1349,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     online_dl_iter = None
     online_sampler = None  # 保存 sampler 引用以便后续刷新
     if online_dataset.num_frames > 0:
-        online_dataloader = create_dataloader(online_dataset, use_valid_action_sampler=True)
+        online_dataloader = create_dataloader(online_dataset, online=True)
         # 保存 sampler 引用
         online_sampler = online_dataloader.sampler if hasattr(online_dataloader, 'sampler') else None
         if is_main_process:
@@ -1300,7 +1405,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     )
 
     if is_main_process:
-        logging.info("Start online training: alternating between data collection and training")
+        if cfg.online.online_collect:
+            logging.info("Start online training: alternating between data collection and training")
+        else:
+            logging.info("Start training on existing online dataset (no new data collection)")
 
     # Main online training loop
     for iteration in range(cfg.online.n_iterations):
@@ -1309,116 +1417,118 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             logging.info(f"Iteration {iteration + 1}/{cfg.online.n_iterations}")
             logging.info(f"{'='*60}")
 
-        # Phase 1: Collect episodes from all tasks
-        if is_main_process:
-            logging.info(
-                f"Collecting {cfg.online.collect_episodes_per_iteration} episodes from environment"
-            )
-        policy.eval()
-        with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-            # Get current episode count from online dataset to set correct episode indices
-            current_episode_count = online_dataset.num_episodes if hasattr(online_dataset, "num_episodes") else 0
-            
-            # Collect episodes from all tasks
-            all_episode_data = []
-            total_tasks = sum(len(tasks) for tasks in collect_env_dict.values())
-            episodes_per_task = cfg.online.collect_episodes_per_iteration // total_tasks
-            remaining_episodes = cfg.online.collect_episodes_per_iteration % total_tasks
-            
-            current_ep_idx = current_episode_count
-            task_idx = 0
-            
-            for suite_name, task_dict in collect_env_dict.items():
-                for task_id, env in task_dict.items():
-                    # Distribute remaining episodes to first few tasks
-                    n_episodes_this_task = episodes_per_task + (1 if task_idx < remaining_episodes else 0)
-                    
-                    if n_episodes_this_task > 0:
-                        if is_main_process:
-                            logging.info(
-                                f"Collecting {n_episodes_this_task} episodes from {suite_name} task {task_id}"
-                            )
-                        
-                        task_episode_data = collect_episodes(
-                            env=env,
-                            policy=accelerator.unwrap_model(policy),
-                            env_preprocessor=env_preprocessor,
-                            env_postprocessor=env_postprocessor,
-                            preprocessor=collect_preprocessor,  # Use collect_preprocessor (without normalizer)
-                            postprocessor=collect_postprocessor,  # Use collect_postprocessor (without unnormalizer)
-                            n_episodes=n_episodes_this_task,
-                            start_seed=cfg.seed if cfg.seed is not None else None,
-                            start_episode_index=current_ep_idx,
-                            return_action_context=True,  # Collect action context for online training
-                        )
-                        
-                        if task_episode_data:
-                            all_episode_data.append(task_episode_data)
-                            # Update episode index for next task
-                            # Count unique episode indices to get the number of episodes collected
-                            if "episode_index" in task_episode_data and len(task_episode_data["episode_index"]) > 0:
-                                unique_episodes = torch.unique(task_episode_data["episode_index"])
-                                current_ep_idx = unique_episodes[-1].item() + 1
-                            else:
-                                # Fallback: increment by number of episodes collected
-                                current_ep_idx += n_episodes_this_task
-                    
-                    task_idx += 1
-            
-            # Combine all episode data
-            if len(all_episode_data) > 1:
-                episode_data = {}
-                for key in all_episode_data[0]:
-                    episode_data[key] = torch.cat([ep[key] for ep in all_episode_data])
-            elif len(all_episode_data) == 1:
-                episode_data = all_episode_data[0]
-            else:
-                episode_data = {}
-
-        # Phase 2: Add episodes to online dataset
-        if is_main_process:
-            logging.info("Adding collected episodes to online dataset")
-            add_episodes_to_dataset(online_dataset, episode_data)
-
-        # Close all writers to ensure parquet files are properly finalized before reading
-        if is_main_process:
-            online_dataset._close_writer()
-            if hasattr(online_dataset.meta, "_close_writer"):
-                online_dataset.meta._close_writer()
-
-        # Wait for dataset update to complete
-        accelerator.wait_for_everyone()
-
-        # Reload online dataset to include new episodes
-        # Note: The online_dataset should be updated in-place by add_episodes_to_dataset
-        # If the dataset implementation requires reloading, do it here
-        # Force reload dataset metadata if needed
-        if hasattr(online_dataset.meta, "reload"):
-            online_dataset.meta.reload()
-        
-        # Recreate dataloaders with updated datasets
-        if offline_dataset is not None:
-            offline_dataloader = create_dataloader(offline_dataset, use_valid_action_sampler=False)
-            offline_dataloader = accelerator.prepare(offline_dataloader)
-            offline_dl_iter = cycle(offline_dataloader)
-        
-        # Only create online dataloader if dataset has data
-        # Use ValidActionContextSampler to only sample valid frames
-        if online_dataset.num_frames > 0:
-            online_dataloader = create_dataloader(online_dataset, use_valid_action_sampler=True)
-            # 保存 sampler 引用
-            online_sampler = online_dataloader.sampler if hasattr(online_dataloader, 'sampler') else None
-            online_dataloader = accelerator.prepare(online_dataloader)
-            online_dl_iter = cycle(online_dataloader)
+        # Phase 1: Collect episodes from all tasks (only if online=True)
+        if cfg.online.online_collect:
             if is_main_process:
-                valid_count = len(online_sampler) if online_sampler else online_dataset.num_frames
                 logging.info(
-                    f"Recreated online dataloader with ValidActionContextSampler "
-                    f"({valid_count} valid frames out of {online_dataset.num_frames})"
+                    f"Collecting {cfg.online.collect_episodes_per_iteration} episodes from environment"
                 )
-        else:
+            policy.eval()
+            with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+                # Get current episode count from online dataset to set correct episode indices
+                current_episode_count = online_dataset.num_episodes if hasattr(online_dataset, "num_episodes") else 0
+                
+                # Collect episodes from all tasks
+                all_episode_data = []
+                total_tasks = sum(len(tasks) for tasks in collect_env_dict.values())
+                episodes_per_task = cfg.online.collect_episodes_per_iteration // total_tasks
+                remaining_episodes = cfg.online.collect_episodes_per_iteration % total_tasks
+                
+                current_ep_idx = current_episode_count
+                task_idx = 0
+                
+                for suite_name, task_dict in collect_env_dict.items():
+                    for task_id, env in task_dict.items():
+                        # Distribute remaining episodes to first few tasks
+                        n_episodes_this_task = episodes_per_task + (1 if task_idx < remaining_episodes else 0)
+                        
+                        if n_episodes_this_task > 0:
+                            if is_main_process:
+                                logging.info(
+                                    f"Collecting {n_episodes_this_task} episodes from {suite_name} task {task_id}"
+                                )
+                            
+                            task_episode_data = collect_episodes(
+                                env=env,
+                                batch_size=cfg.eval.batch_size,
+                                policy=accelerator.unwrap_model(policy),
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=collect_preprocessor,  # Use collect_preprocessor (without normalizer)
+                                postprocessor=collect_postprocessor,  # Use collect_postprocessor (without unnormalizer)
+                                n_episodes=n_episodes_this_task,
+                                start_seed=cfg.seed if cfg.seed is not None else None,
+                                start_episode_index=current_ep_idx,
+                                return_action_context=True,  # Collect action context for online training
+                            )
+                            
+                            if task_episode_data:
+                                all_episode_data.append(task_episode_data)
+                                # Update episode index for next task
+                                # Count unique episode indices to get the number of episodes collected
+                                if "episode_index" in task_episode_data and len(task_episode_data["episode_index"]) > 0:
+                                    unique_episodes = torch.unique(task_episode_data["episode_index"])
+                                    current_ep_idx = unique_episodes[-1].item() + 1
+                                else:
+                                    # Fallback: increment by number of episodes collected
+                                    current_ep_idx += n_episodes_this_task
+                        
+                        task_idx += 1
+                
+                # Combine all episode data
+                if len(all_episode_data) > 1:
+                    episode_data = {}
+                    for key in all_episode_data[0]:
+                        episode_data[key] = torch.cat([ep[key] for ep in all_episode_data])
+                elif len(all_episode_data) == 1:
+                    episode_data = all_episode_data[0]
+                else:
+                    episode_data = {}
+
+            # Phase 2: Add episodes to online dataset
             if is_main_process:
-                logging.warning("Online dataset is still empty, skipping dataloader creation")
+                logging.info("Adding collected episodes to online dataset")
+                add_episodes_to_dataset(online_dataset, episode_data)
+
+            # Close all writers to ensure parquet files are properly finalized before reading
+            if is_main_process:
+                #online_dataset._close_writer()
+                if hasattr(online_dataset.meta, "_close_writer"):
+                    online_dataset.meta._close_writer()
+
+            # Wait for dataset update to complete
+            accelerator.wait_for_everyone()
+
+            # Reload online dataset to include new episodes
+            # Note: The online_dataset should be updated in-place by add_episodes_to_dataset
+            # If the dataset implementation requires reloading, do it here
+            # Force reload dataset metadata if needed
+            if hasattr(online_dataset.meta, "reload"):
+                online_dataset.meta.reload()
+            
+            # Recreate dataloaders with updated datasets
+            if offline_dataset is not None:
+                offline_dataloader = create_dataloader(offline_dataset)
+                offline_dataloader = accelerator.prepare(offline_dataloader)
+                offline_dl_iter = cycle(offline_dataloader)
+            
+            # Only create online dataloader if dataset has data
+            # Use ValidActionContextSampler to only sample valid frames
+            if online_dataset.num_frames > 0:
+                online_dataloader = create_dataloader(online_dataset, online=True)
+                # 保存 sampler 引用
+                online_sampler = online_dataloader.sampler if hasattr(online_dataloader, 'sampler') else None
+                online_dataloader = accelerator.prepare(online_dataloader)
+                online_dl_iter = cycle(online_dataloader)
+                if is_main_process:
+                    valid_count = len(online_sampler) if online_sampler else online_dataset.num_frames
+                    logging.info(
+                        f"Recreated online dataloader with ValidActionContextSampler "
+                        f"({valid_count} valid frames out of {online_dataset.num_frames})"
+                    )
+            else:
+                if is_main_process:
+                    logging.warning("Online dataset is still empty, skipping dataloader creation")
 
         # Check if we have enough episodes to start training
         # Count total episodes: offline + online
@@ -1455,88 +1565,50 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         policy.train()
         iteration_start_step = step
         for train_step in range(cfg.online.train_steps_per_iteration):
-            # Step 1: Train on offline dataset with cmp=False (if available)
             if offline_dataset is not None and offline_dataset.num_episodes > 0:
-                try:
-                    start_time = time.perf_counter()
-                    offline_batch = next(offline_dl_iter)
-                    offline_batch = preprocessor(offline_batch)
-                    # Fill missing action context fields for offline dataset
-                    offline_batch = fill_action_context_processor(offline_batch)
-                    train_tracker.dataloading_s = time.perf_counter() - start_time
+                start_time = time.perf_counter()
+                offline_batch = next(offline_dl_iter)
+                offline_batch = preprocessor(offline_batch)
+                # Fill missing action context fields for offline dataset
+                offline_batch = fill_action_context_processor(offline_batch)
+                train_tracker.dataloading_s = time.perf_counter() - start_time
 
-                    train_tracker, output_dict = update_policy(
-                        train_tracker,
-                        policy,
-                        offline_batch,
-                        optimizer,
-                        cfg.optimizer.grad_clip_norm,
-                        accelerator=accelerator,
-                        lr_scheduler=lr_scheduler,
-                        cmp=(train_step%4==0),
-                    )
+                train_tracker, output_dict = update_policy(
+                    train_tracker,
+                    policy,
+                    offline_batch,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=lr_scheduler,
+                    cmp=(train_step%4==0),
+                )
 
-                    step += 1
-                    train_tracker.step()
-                except StopIteration:
-                    # Reset iterator if exhausted
-                    offline_dl_iter = cycle(offline_dataloader)
-                    offline_batch = next(offline_dl_iter)
-                    offline_batch = preprocessor(offline_batch)
-                    # Fill missing action context fields for offline dataset
-                    offline_batch = fill_action_context_processor(offline_batch)
-                    train_tracker, output_dict = update_policy(
-                        train_tracker,
-                        policy,
-                        offline_batch,
-                        optimizer,
-                        cfg.optimizer.grad_clip_norm,
-                        accelerator=accelerator,
-                        lr_scheduler=lr_scheduler,
-                        cmp=(train_step % 4 == 0),
-                    )
-                    step += 1
-                    train_tracker.step()
+                step += 1
+                train_tracker.step()
 
-            # Step 2: Train on online dataset with cmp=True (if available)
+
             if (online_dataset.num_episodes > 0 and online_dataloader is not None
                     and online_dataset.num_frames >= cfg.online.min_frames_for_online_training):
-                try:
-                    start_time = time.perf_counter()
-                    online_batch = next(online_dl_iter)
-                    online_batch = preprocessor(online_batch)
-                    train_tracker.dataloading_s = time.perf_counter() - start_time
+                start_time = time.perf_counter()
+                online_batch = next(online_dl_iter)
+                online_batch = preprocessor(online_batch)
+                train_tracker.dataloading_s = time.perf_counter() - start_time
 
-                    train_tracker, output_dict = update_policy(
-                        train_tracker,
-                        policy,
-                        online_batch,
-                        optimizer,
-                        cfg.optimizer.grad_clip_norm,
-                        accelerator=accelerator,
-                        lr_scheduler=lr_scheduler,
-                        online=True,  # Train online data with cmp=True
-                    )
+                train_tracker, output_dict = update_policy(
+                    train_tracker,
+                    policy,
+                    online_batch,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=lr_scheduler,
+                    online=True,  # Train online data with cmp=True
+                )
 
-                    step += 1
-                    train_tracker.step()
-                except StopIteration:
-                    # Reset iterator if exhausted
-                    online_dl_iter = cycle(online_dataloader)
-                    online_batch = next(online_dl_iter)
-                    online_batch = preprocessor(online_batch)
-                    train_tracker, output_dict = update_policy(
-                        train_tracker,
-                        policy,
-                        online_batch,
-                        optimizer,
-                        cfg.optimizer.grad_clip_norm,
-                        accelerator=accelerator,
-                        lr_scheduler=lr_scheduler,
-                        online=True,
-                    )
-                    step += 1
-                    train_tracker.step()
+                step += 1
+                train_tracker.step()
+
 
             # Log and save checkpoints after each training iteration
             # (which includes both offline and online training steps)
@@ -1582,13 +1654,21 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 (offline_dataset.num_frames if offline_dataset is not None else 0)
                 + online_dataset.num_frames
             )
-            logging.info(
-                f"Iteration {iteration + 1} complete: "
-                f"collected {cfg.online.collect_episodes_per_iteration} episodes, "
-                f"trained {step - iteration_start_step} steps. "
-                f"Total: {total_episodes} episodes ({offline_dataset.num_episodes if offline_dataset is not None else 0} offline + {online_dataset.num_episodes} online), "
-                f"{total_frames} frames"
-            )
+            if cfg.online.online_collect:
+                logging.info(
+                    f"Iteration {iteration + 1} complete: "
+                    f"collected {cfg.online.collect_episodes_per_iteration} episodes, "
+                    f"trained {step - iteration_start_step} steps. "
+                    f"Total: {total_episodes} episodes ({offline_dataset.num_episodes if offline_dataset is not None else 0} offline + {online_dataset.num_episodes} online), "
+                    f"{total_frames} frames"
+                )
+            else:
+                logging.info(
+                    f"Iteration {iteration + 1} complete: "
+                    f"trained {step - iteration_start_step} steps (no new data collected). "
+                    f"Total: {total_episodes} episodes ({offline_dataset.num_episodes if offline_dataset is not None else 0} offline + {online_dataset.num_episodes} online), "
+                    f"{total_frames} frames"
+                )
 
     # Final checkpoint
     if cfg.save_checkpoint and is_main_process:

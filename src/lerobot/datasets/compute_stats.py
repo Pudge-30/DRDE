@@ -519,22 +519,15 @@ def compute_episode_stats(
             if feature_shape and len(feature_shape) == 2:
                 desired_steps, desired_dim = feature_shape
                 ep_ft_array = np.asarray(data)
-                
-                logging.info(
-                    f"[DEBUG compute_episode_stats] Processing key='{key}': "
-                    f"input shape={ep_ft_array.shape}, desired_shape=({desired_steps}, {desired_dim})"
-                )
 
                 # 统一为 (frames, steps, dim)
                 if ep_ft_array.ndim == 2:
                     # (frames, dim) -> (frames, 1, dim)
-                    logging.info(f"[DEBUG compute_episode_stats] {key}: Converting 2D to 3D: {ep_ft_array.shape} -> {ep_ft_array[:, None, :].shape}")
                     ep_ft_array = ep_ft_array[:, None, :]
                 
                 # 现在 ep_ft_array 应该是 3 维的 (frames, steps, dim)
                 if ep_ft_array.ndim == 3:
                     frames, steps, dim = ep_ft_array.shape
-                    logging.info(f"[DEBUG compute_episode_stats] {key}: After conversion: shape=({frames}, {steps}, {dim})")
 
                     # 对 steps 维度做截断/填充到期望长度
                     if steps != desired_steps:
@@ -544,10 +537,8 @@ def compute_episode_stats(
                         if steps < desired_steps:
                             pad = np.repeat(last_step, desired_steps - steps, axis=1)
                             ep_ft_array = np.concatenate([ep_ft_array, pad], axis=1)
-                            logging.info(f"[DEBUG compute_episode_stats] {key}: Padded steps: {steps} -> {desired_steps}, new shape={ep_ft_array.shape}")
                         else:
                             ep_ft_array = ep_ft_array[:, :desired_steps, :]
-                            logging.info(f"[DEBUG compute_episode_stats] {key}: Truncated steps: {steps} -> {desired_steps}, new shape={ep_ft_array.shape}")
                         # 更新 steps 值，因为形状已经改变
                         steps = desired_steps
 
@@ -555,20 +546,17 @@ def compute_episode_stats(
                     if dim != desired_dim:
                         if dim > desired_dim:
                             ep_ft_array = ep_ft_array[:, :, :desired_dim]
-                            logging.info(f"[DEBUG compute_episode_stats] {key}: Truncated dim: {dim} -> {desired_dim}, new shape={ep_ft_array.shape}")
                         else:
                             pad = np.zeros(
                                 (ep_ft_array.shape[0], ep_ft_array.shape[1], desired_dim - dim),
                                 dtype=ep_ft_array.dtype,
                             )
                             ep_ft_array = np.concatenate([ep_ft_array, pad], axis=2)
-                            logging.info(f"[DEBUG compute_episode_stats] {key}: Padded dim: {dim} -> {desired_dim}, new shape={ep_ft_array.shape}")
                 else:
                     logging.warning(f"[DEBUG compute_episode_stats] {key}: Unexpected ndim={ep_ft_array.ndim}, shape={ep_ft_array.shape}")
 
                 # 用规范化后的数据继续统计
                 data = ep_ft_array
-                logging.info(f"[DEBUG compute_episode_stats] {key}: Final normalized shape={data.shape}")
 
         if features[key]["dtype"] in ["image", "video"]:
             ep_ft_array = sample_images(data)
@@ -587,7 +575,6 @@ def compute_episode_stats(
         if key in ("pred_action", "prev_actions"):
             import logging
             mean_shape = ep_stats[key]["mean"].shape if "mean" in ep_stats[key] else "N/A"
-            logging.info(f"[DEBUG compute_episode_stats] {key}: Final stats mean.shape={mean_shape}")
 
         if features[key]["dtype"] in ["image", "video"]:
             ep_stats[key] = {

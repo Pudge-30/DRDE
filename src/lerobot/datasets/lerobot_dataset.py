@@ -872,6 +872,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Check if all requested episodes are available in cached data
         if not requested_episodes.issubset(available_episodes):
+            print(requested_episodes)
+            print(available_episodes)
+            print("2222222222222")
             return False
 
         # Check if all required video files exist
@@ -880,6 +883,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 for vid_key in self.meta.video_keys:
                     video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
                     if not video_path.exists():
+                        print("3333333333333")
                         return False
 
         return True
@@ -1189,9 +1193,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
             stacked = np.stack(episode_buffer[key])
-            if key in ("pred_action", "prev_actions"):
-                import logging
-                logging.info(f"[DEBUG save_episode] {key}: Before compute_episode_stats, shape={stacked.shape}, feature_shape={ft.get('shape')}")
             episode_buffer[key] = stacked
 
         # Wait for image writer to end, so that episode stats over images can be computed
