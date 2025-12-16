@@ -1,0 +1,10 @@
+1. 离线的在modeling_pi05.py，流程：有一个cls_head_prefix，和prifix_embs接在一起：
+prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1
+然后动作部分直接过content_attention模块。整体流程在forward_cmp函数
+
+
+2. 在线的在modeling_pi05.py，第2229行。
+3. 数据收集的在lerobot_online_train.py里，主要看1420行-1497行，关键函数是add_episodes_to_dataset，单改这个不好改的话可以考虑和collect_episodes函数结合
+
+在线收集+训练：
+CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py --policy.path=/home/kemove/lhm/lerobot/outputs/pi05_libero_try_2/checkpoints/last/pretrained_model --env.type=libero --num_workers=32 --dataset.repo_id=HuggingFaceVLA/libero --dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero --online.online_dataset_repo_id=lhm_online_dataset --online.online_collect=True --online.online_dataset_root=$HOME/.cache/huggingface/smolvla_datasets/online_libero_1 --online.start_with_offline_dataset=true --online.train_steps_per_iteration=4 --online.n_iterations=2 --online.collect_episodes_per_iteration=10 --eval.batch_size=1 --env.task=libero_spatial

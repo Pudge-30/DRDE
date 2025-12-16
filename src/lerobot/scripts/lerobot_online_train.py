@@ -412,8 +412,9 @@ def rollout(
         observation = preprocessor(observation)
 
         # Collect action context after select_action (before postprocessor)
+        # prev_steps and pred_steps default to policy.config.attn_act_len
         if return_action_context and hasattr(policy, 'get_action_context'):
-            ctx = policy.get_action_context(batch_size=batch_size, prev_steps=10, pred_steps=10)
+            ctx = policy.get_action_context(batch_size=batch_size)
             all_prev_actions.append(ctx['prev_actions'])
             all_pred_actions.append(ctx['pred_action'])
             all_actions_seq_valid.append(ctx['actions_seq_valid'])
@@ -1150,8 +1151,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 # Add action context features for online training
                 # Get action dimension from features
                 action_dim = features[ACTION]["shape"][-1] if ACTION in features else 7  # default to 7
-                prev_steps = 10
-                pred_steps = 10
+                # Get attn_act_len from policy config (defaults to 10 for backward compatibility)
+                attn_act_len = getattr(cfg.policy, 'attn_act_len', 10)
+                prev_steps = attn_act_len
+                pred_steps = attn_act_len
                 
                 features["prev_actions"] = {
                     "dtype": "float32",
@@ -1287,13 +1290,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # Create FillMissingActionContextProcessor for offline dataset training
     # Get action dimension from training dataset
     action_dim = training_dataset.meta.features[ACTION]["shape"][-1]
+    # Get attn_act_len from policy config (defaults to 10 for backward compatibility)
+    attn_act_len = getattr(cfg.policy, 'attn_act_len', 10)
     fill_action_context_processor = FillMissingActionContextProcessor(
         action_dim=action_dim,
-        prev_steps=10,
-        pred_steps=10,
+        prev_steps=attn_act_len,
+        pred_steps=attn_act_len,
     )
     if is_main_process:
-        logging.info(f"Created FillMissingActionContextProcessor with action_dim={action_dim}")
+        logging.info(f"Created FillMissingActionContextProcessor with action_dim={action_dim}, attn_act_len={attn_act_len}")
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
