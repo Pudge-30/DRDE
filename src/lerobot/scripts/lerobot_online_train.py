@@ -1075,7 +1075,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                         video_backend=cfg.dataset.video_backend,
                     )
                     # Enable async image writing for better performance (more threads = faster)
-                    online_dataset.start_image_writer(num_threads=8)
+                    online_dataset.start_image_writer(num_threads=cfg.num_workers)
                     logging.info(
                         f"Online dataset loaded: {online_dataset.num_episodes} episodes, "
                         f"{online_dataset.num_frames} frames"
