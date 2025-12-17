@@ -90,7 +90,6 @@ class PI05Config(PreTrainedConfig):
     # CMP (Contrastive Model Prediction) parameters
     part_layer_num: int = 6      # PaliGemma 前 N 层用于 CMP
     attn_act_len: int = 10       # SingleHeadContentAttention 的输入长度
-    delta_replan: int = 10       # 推理时重规划间隔
     cmp_log: bool = False        # 是否记录 CMP 日志
 
     def __post_init__(self):

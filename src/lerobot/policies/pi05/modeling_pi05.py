@@ -2148,7 +2148,7 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        delta_replan = getattr(self.config, "delta_replan", 0)
+        delta_replan = self.config.attn_act_len
 
         # Initialize replanning state if not exists
         if delta_replan > 0:
