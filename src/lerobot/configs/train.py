@@ -217,7 +217,7 @@ class OnlineConfig:
     # Root directory for the online dataset
     online_dataset_root: Path | None = None
     # If online dataset has fewer frames, only offline training (cmp=False) will be performed
-    min_frames_for_online_training: int = 500000
+    min_frames_for_online_training: int = 50000
 
 
 @dataclass(kw_only=True)
