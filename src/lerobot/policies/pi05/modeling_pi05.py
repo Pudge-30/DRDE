@@ -2244,19 +2244,27 @@ class PI05Policy(PreTrainedPolicy):
                 num_steps=self.config.num_inference_steps,
             )
             
-            # 3. 生成动作的前10步过 content_attention
+            # 3. 生成动作的前 attn_act_len 步过 content_attention
             attn_act_len = self.model.content_attention.attn_act_len
-            gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]  # [batch, 10, max_action_dim]
+            gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]  # [batch, attn_act_len, action_dim]
             gen_feature = self.model.content_attention(gen_actions_slice)  # [batch, hidden_dim]
             
             # 4. pred_action 过 content_attention
             pred_feature = self.model.content_attention(pred_action)  # [batch, hidden_dim]
             
             # 5. 计算特征距离 loss
-            feature_loss = torch.mean(F.relu(torch.square(gen_feature - pred_feature)-0.1))
+            feature_loss = torch.mean(F.relu(torch.square(gen_feature - pred_feature) - 0.1))
+
+            # 6. 计算 generated_actions 与 pred_action 在前 attn_act_len 步的 L2 距离
+            # 对齐形状到 [batch, attn_act_len, original_action_dim]
+            pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
+            # 每一步在 action 维度上的 L2 范数，然后对 batch 和时间步求平均
+            l2_per_step = torch.linalg.vector_norm(gen_actions_slice - pred_actions_slice, dim=-1)  # [batch, attn_act_len]
+            l2_actions = l2_per_step.mean()
+
             loss_dict = {
-                "loss": feature_loss.item(),
                 "feature_loss": feature_loss.item(),
+                "l2_actions": l2_actions.item(),
             }
             
             return feature_loss, loss_dict
@@ -2276,15 +2284,18 @@ class PI05Policy(PreTrainedPolicy):
                 # Compute loss (no separate state needed for PI05)
                 losses = self.model.forward(images, img_masks, tokens, masks, actions)
                 losses = losses[:, :, :original_action_dim]
+                loss = losses.mean()
+                loss_dict = {
+                    "loss": loss.item(),
+                }
             else:
                 losses = self.model.forward_cmp(images, img_masks, tokens, masks)
+                loss = losses.mean()
+                loss_dict = {
+                    "cmp_loss": loss.item(),
+                }
 
-            loss = losses.mean()
 
-            loss_dict = {
-                "loss": loss.item(),
-                "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-            }
 
             return loss, loss_dict
 
