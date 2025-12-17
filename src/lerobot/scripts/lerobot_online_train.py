@@ -1550,9 +1550,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
             # Close all writers to ensure parquet files are properly finalized before reading
             if is_main_process:
-                #online_dataset._close_writer()
+                online_dataset._close_writer()
                 if hasattr(online_dataset.meta, "_close_writer"):
                     online_dataset.meta._close_writer()
+                online_dataset._ensure_hf_dataset_loaded()
 
             # Wait for dataset update to complete
             accelerator.wait_for_everyone()
