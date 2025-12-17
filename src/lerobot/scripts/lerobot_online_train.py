@@ -131,19 +131,22 @@ class FillMissingActionContextProcessor:
         batch_size = sample_tensor.shape[0]
         device = sample_tensor.device
         
-        if 'prev_actions' not in batch:
+        # 检查 prev_actions 是否存在或为 None
+        if 'prev_actions' not in batch or batch.get('prev_actions') is None:
             batch['prev_actions'] = torch.zeros(
                 batch_size, self.prev_steps, self.action_dim,
                 device=device, dtype=torch.float32
             )
         
-        if 'pred_action' not in batch:
+        # 检查 pred_action 是否存在或为 None
+        if 'pred_action' not in batch or batch.get('pred_action') is None:
             batch['pred_action'] = torch.zeros(
                 batch_size, self.pred_steps, self.action_dim,
                 device=device, dtype=torch.float32
             )
         
-        if 'actions_seq_valid' not in batch:
+        # 检查 actions_seq_valid 是否存在或为 None
+        if 'actions_seq_valid' not in batch or batch.get('actions_seq_valid') is None:
             batch['actions_seq_valid'] = torch.zeros(
                 batch_size, 1, device=device, dtype=torch.bool
             )

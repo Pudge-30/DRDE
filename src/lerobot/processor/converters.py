@@ -158,7 +158,7 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     """
     Extract complementary data from a batch dictionary.
 
-    This includes padding flags, task description, and indices.
+    This includes padding flags, task description, indices, and action context fields.
 
     Args:
         batch: The batch dictionary.
@@ -171,7 +171,13 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     index_key = {"index": batch["index"]} if "index" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
 
-    return {**pad_keys, **task_key, **index_key, **task_index_key}
+    # Extract action context fields for online training
+    action_context_keys = {}
+    for key in ["prev_actions", "pred_action", "actions_seq_valid"]:
+        if key in batch:
+            action_context_keys[key] = batch[key]
+
+    return {**pad_keys, **task_key, **index_key, **task_index_key, **action_context_keys}
 
 
 def create_transition(
