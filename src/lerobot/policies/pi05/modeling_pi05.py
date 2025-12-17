@@ -2148,7 +2148,7 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        delta_replan = getattr(self.config, "delta_replan", 0)
+        delta_replan = self.config.attn_act_len
 
         # Initialize replanning state if not exists
         if delta_replan > 0:
@@ -2288,18 +2288,19 @@ class PI05Policy(PreTrainedPolicy):
 
             return loss, loss_dict
 
-    def get_action_context(self,  batch_size: int = 1, prev_steps: int = 10, pred_steps: int = 10) -> dict:
+    def get_action_context(self, batch_size: int = 1, prev_steps: int | None = None, pred_steps: int | None = None) -> dict:
         """获取当前步骤的动作上下文信息。
-        
+
         用于在线数据收集时记录每帧的动作上下文：
         - prev_actions: 前 prev_steps 步已执行的动作
         - pred_action: 后 pred_steps 步预测的动作
         - actions_seq_valid: 仅当前后动作都来自同一次预测时为 True
-        
+
         Args:
-            prev_steps: 需要的前序动作步数（默认10）
-            pred_steps: 需要的预测动作步数（默认10）
-        
+            batch_size: batch 大小（默认1）
+            prev_steps: 需要的前序动作步数（默认从 config.attn_act_len 读取）
+            pred_steps: 需要的预测动作步数（默认从 config.attn_act_len 读取）
+
         Returns:
             dict: {
                 'prev_actions': Tensor [batch, prev_steps, action_dim],
@@ -2308,6 +2309,12 @@ class PI05Policy(PreTrainedPolicy):
             }
             注意：始终返回正确形状的数据，无效时用零填充且 valid=False
         """
+        # 从 config 读取默认值
+        if prev_steps is None:
+            prev_steps = self.config.attn_act_len
+        if pred_steps is None:
+            pred_steps = self.config.attn_act_len
+
         # 获取 action_dim 和 device
         original_action_dim = self.config.output_features[ACTION].shape[0]
         device = next(self.parameters()).device

@@ -205,6 +205,20 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             config = json.load(f)
 
         config.pop("type")
+
+        # Add missing fields from dataclass defaults to config
+        # This ensures CLI overrides work for fields not present in old config.json files
+        config_class = orig_config.__class__
+        if hasattr(config_class, "__dataclass_fields__"):
+            import dataclasses
+            for field_name, field_info in config_class.__dataclass_fields__.items():
+                if field_name not in config:
+                    # Get default value
+                    if field_info.default is not dataclasses.MISSING:
+                        config[field_name] = field_info.default
+                    elif field_info.default_factory is not dataclasses.MISSING:
+                        config[field_name] = field_info.default_factory()
+
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name

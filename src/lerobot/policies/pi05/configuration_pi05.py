@@ -87,10 +87,10 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
-    part_layer_num: int = 6
-    attn_act_len: int = 10
-    delta_replan = 10
-    cmp_log = False
+    # CMP (Contrastive Model Prediction) parameters
+    part_layer_num: int = 6      # PaliGemma 前 N 层用于 CMP
+    attn_act_len: int = 10       # SingleHeadContentAttention 的输入长度
+    cmp_log: bool = False        # 是否记录 CMP 日志
 
     def __post_init__(self):
         super().__post_init__()

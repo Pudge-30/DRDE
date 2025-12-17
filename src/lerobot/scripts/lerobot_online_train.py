@@ -412,8 +412,9 @@ def rollout(
         observation = preprocessor(observation)
 
         # Collect action context after select_action (before postprocessor)
+        # prev_steps and pred_steps default to policy.config.attn_act_len
         if return_action_context and hasattr(policy, 'get_action_context'):
-            ctx = policy.get_action_context(batch_size=batch_size, prev_steps=10, pred_steps=10)
+            ctx = policy.get_action_context(batch_size=batch_size)
             all_prev_actions.append(ctx['prev_actions'])
             all_pred_actions.append(ctx['pred_action'])
             all_actions_seq_valid.append(ctx['actions_seq_valid'])
@@ -747,6 +748,15 @@ def add_episodes_to_dataset(
             - next.success: success flags (total_frames,) [optional]
             - task: task names (total_frames,) [optional, if not in observation]
     """
+    import time
+
+    # ===== Performance timing =====
+    func_start_time = time.time()
+    preprocess_time = 0.0
+    add_frame_time = 0.0
+    save_episode_time = 0.0
+    image_convert_time = 0.0
+
     if not episode_data:
         logging.warning("episode_data is empty, nothing to add to dataset")
         return
@@ -771,6 +781,8 @@ def add_episodes_to_dataset(
 
     # Iterate through all frames
     for frame_idx in range(total_frames):
+        frame_start_time = time.time()
+
         # Create frame dictionary
         frame_dict = {}
 
@@ -799,12 +811,13 @@ def add_episodes_to_dataset(
         for key in episode_data:
             if key.startswith(f"{OBS_STR}."):
                 value = episode_data[key][frame_idx]
-                
+
                 # Convert images from channel-first (C, H, W) to channel-last (H, W, C) if needed
                 # Dataset features expect channel-last format (H, W, C) based on names=["height", "width", "channel"]
                 if key in online_dataset.features:
                     feat = online_dataset.features[key]
                     if feat.get("dtype") in ["image", "video"]:
+                        img_convert_start = time.time()
                         if isinstance(value, torch.Tensor):
                             value = value.cpu().numpy()
                         if isinstance(value, np.ndarray) and value.ndim == 3:
@@ -812,14 +825,15 @@ def add_episodes_to_dataset(
                             if value.shape[0] == 3 and value.shape[0] < value.shape[1] and value.shape[0] < value.shape[2]:
                                 # Convert from (C, H, W) to (H, W, C)
                                 value = np.transpose(value, (1, 2, 0))
-                        
+                        image_convert_time += time.time() - img_convert_start
+
                         # Log image shape for debugging (first frame only)
                         if frame_idx == 0:
                             logging.info(
                                 f"Image feature '{key}': actual_shape={value.shape if isinstance(value, np.ndarray) else type(value)}, "
                                 f"expected_shape={feat.get('shape')}, names={feat.get('names')}, dtype={feat.get('dtype')}"
                             )
-                
+
                 frame_dict[key] = value
         # Don't add next.success as complementary_info if it's not in dataset features
         # Only add complementary_info keys if they exist in dataset features
@@ -893,6 +907,9 @@ def add_episodes_to_dataset(
             logging.info(f"Dataset expected features (excluding DEFAULT_FEATURES): {sorted(set(online_dataset.features.keys()) - {'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'})}")
             logging.info(f"Extra keys in frame_dict (not in dataset features): {sorted(set(frame_dict.keys()) - {'task'} - set(online_dataset.features.keys()))}")
 
+        # Record preprocessing time for this frame
+        preprocess_time += time.time() - frame_start_time
+
         # Check if we need to save episode before adding frame (episode boundary)
         episode_index = episode_data["episode_index"][frame_idx].item()
         # Get done flag from episode_data (not from frame_dict, as it's not in dataset features)
@@ -901,10 +918,16 @@ def add_episodes_to_dataset(
         # Save previous episode if episode index changed (new episode started)
         if current_episode_index is not None and episode_index != current_episode_index:
             if online_dataset.episode_buffer is not None and online_dataset.episode_buffer["size"] > 0:
+                save_ep_start = time.time()
                 online_dataset.save_episode()
+                save_episode_time += time.time() - save_ep_start
+                if frame_idx < 100:  # Log first few save_episode times
+                    logging.info(f"[PERF] save_episode #{current_episode_index}: {time.time() - save_ep_start:.3f}s")
 
         # Add frame to dataset
+        add_frame_start = time.time()
         online_dataset.add_frame(frame_dict)
+        add_frame_time += time.time() - add_frame_start
 
         # Save episode if this is the last frame of the episode
         # 检测是否是 episode 的最后一帧（下一个帧属于不同的 episode，或者这是所有帧的最后一帧）
@@ -912,12 +935,14 @@ def add_episodes_to_dataset(
             frame_idx == total_frames - 1 or
             episode_data["episode_index"][frame_idx + 1].item() != episode_index
         )
-        
+
         # 如果是最后一帧，无论 done 标志如何都应该保存 episode
         # 因为 episode 已经结束了（可能是正常结束或被截断）
         if is_last_frame_of_episode:
             if online_dataset.episode_buffer is not None and online_dataset.episode_buffer["size"] > 0:
+                save_ep_start = time.time()
                 online_dataset.save_episode()
+                save_episode_time += time.time() - save_ep_start
 
         # Update current episode index
         current_episode_index = episode_index
@@ -925,7 +950,19 @@ def add_episodes_to_dataset(
     # 这个检查是额外的安全措施，但通常上面的逻辑已经处理了所有情况
     if total_frames > 0:
         if online_dataset.episode_buffer is not None and online_dataset.episode_buffer["size"] > 0:
+            save_ep_start = time.time()
             online_dataset.save_episode()
+            save_episode_time += time.time() - save_ep_start
+
+    # ===== Performance timing output =====
+    total_time = time.time() - func_start_time
+    logging.info(f"[PERF] add_episodes_to_dataset timing breakdown:")
+    logging.info(f"[PERF]   Total time: {total_time:.3f}s for {total_frames} frames")
+    logging.info(f"[PERF]   Preprocess time: {preprocess_time:.3f}s ({100*preprocess_time/total_time:.1f}%)")
+    logging.info(f"[PERF]     - Image convert time: {image_convert_time:.3f}s ({100*image_convert_time/total_time:.1f}%)")
+    logging.info(f"[PERF]   add_frame time: {add_frame_time:.3f}s ({100*add_frame_time/total_time:.1f}%)")
+    logging.info(f"[PERF]   save_episode time: {save_episode_time:.3f}s ({100*save_episode_time/total_time:.1f}%)")
+    logging.info(f"[PERF]   Avg time per frame: {1000*total_time/total_frames:.2f}ms")
     logging.info(f"Added {total_frames} frames to dataset")
 
 
@@ -1016,6 +1053,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 root=online_dataset_root,
                 video_backend=cfg.dataset.video_backend,
             )
+            # Enable async image writing for better performance (more threads = faster)
+            online_dataset.start_image_writer(num_threads=8)
             logging.info(
                 f"Online dataset loaded: {online_dataset.num_episodes} episodes, "
                 f"{online_dataset.num_frames} frames"
@@ -1035,6 +1074,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                         root=online_dataset_root,
                         video_backend=cfg.dataset.video_backend,
                     )
+                    # Enable async image writing for better performance (more threads = faster)
+                    online_dataset.start_image_writer(num_threads=8)
                     logging.info(
                         f"Online dataset loaded: {online_dataset.num_episodes} episodes, "
                         f"{online_dataset.num_frames} frames"
@@ -1110,8 +1151,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 # Add action context features for online training
                 # Get action dimension from features
                 action_dim = features[ACTION]["shape"][-1] if ACTION in features else 7  # default to 7
-                prev_steps = 10
-                pred_steps = 10
+                # Get attn_act_len from policy config (defaults to 10 for backward compatibility)
+                attn_act_len = getattr(cfg.policy, 'attn_act_len', 10)
+                prev_steps = attn_act_len
+                pred_steps = attn_act_len
                 
                 features["prev_actions"] = {
                     "dtype": "float32",
@@ -1141,6 +1184,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     root=online_dataset_root,
                     robot_type=robot_type,
                     batch_encoding_size=cfg.dataset.video_encoding_batch_size if hasattr(cfg.dataset, "video_encoding_batch_size") else 1,
+                    image_writer_threads=16,  # Enable async image writing for better performance
                 )
                 logging.info("Empty online dataset created successfully")
 
@@ -1246,13 +1290,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # Create FillMissingActionContextProcessor for offline dataset training
     # Get action dimension from training dataset
     action_dim = training_dataset.meta.features[ACTION]["shape"][-1]
+    # Get attn_act_len from policy config (defaults to 10 for backward compatibility)
+    attn_act_len = getattr(cfg.policy, 'attn_act_len', 10)
     fill_action_context_processor = FillMissingActionContextProcessor(
         action_dim=action_dim,
-        prev_steps=10,
-        pred_steps=10,
+        prev_steps=attn_act_len,
+        pred_steps=attn_act_len,
     )
     if is_main_process:
-        logging.info(f"Created FillMissingActionContextProcessor with action_dim={action_dim}")
+        logging.info(f"Created FillMissingActionContextProcessor with action_dim={action_dim}, attn_act_len={attn_act_len}")
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -1419,6 +1465,9 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
         # Phase 1: Collect episodes from all tasks (only if online=True)
         if cfg.online.online_collect:
+            import time as _time
+            phase1_start = _time.time()
+
             if is_main_process:
                 logging.info(
                     f"Collecting {cfg.online.collect_episodes_per_iteration} episodes from environment"
@@ -1485,10 +1534,19 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 else:
                     episode_data = {}
 
+            phase1_time = _time.time() - phase1_start
+            if is_main_process:
+                logging.info(f"[PERF] Phase 1 (collect_episodes): {phase1_time:.3f}s")
+
             # Phase 2: Add episodes to online dataset
+            phase2_start = _time.time()
             if is_main_process:
                 logging.info("Adding collected episodes to online dataset")
                 add_episodes_to_dataset(online_dataset, episode_data)
+            phase2_time = _time.time() - phase2_start
+            if is_main_process:
+                logging.info(f"[PERF] Phase 2 (add_episodes_to_dataset): {phase2_time:.3f}s")
+                logging.info(f"[PERF] Total data collection + dataset update: {phase1_time + phase2_time:.3f}s")
 
             # Close all writers to ensure parquet files are properly finalized before reading
             if is_main_process:
