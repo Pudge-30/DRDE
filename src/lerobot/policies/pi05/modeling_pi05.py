@@ -382,6 +382,9 @@ def vicreg_loss(
     std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
     variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
 
+    print(std_z1)
+    print(std_z2)
+    print("++++++++++")
     # Covariance loss: encourage decorrelation of features
     z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
     z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
@@ -898,7 +901,7 @@ class SingleHeadContentAttention(nn.Module):
         #self.layer_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
@@ -1378,17 +1381,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"Dimension mismatch: cmp_vec_0 shape {cmp_vec_0.shape} != cmp_vec_1 shape {cmp_vec_1.shape}"
             )
 
-        if self.cmp_step < 200:
-            lambda_param = 0
-            nu_param = 0
-
         # 第三步：使用 VICReg loss 计算对比学习损失
         loss_scalar = vicreg_loss(
             cmp_vec_0,
             cmp_vec_1,
-            lambda_param=lambda_param,
+            lambda_param=0 if self.cmp_step < 5 else lambda_param,
             mu_param=mu_param,
-            nu_param=nu_param,
+            nu_param=0 if self.cmp_step < 5 else nu_param,
             gamma=gamma,
         )
 
