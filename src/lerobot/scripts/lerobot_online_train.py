@@ -585,7 +585,16 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    # Record loss based on training mode
+    if online:
+        train_metrics.feature_loss = output_dict["feature_loss"]
+        train_metrics.l2_actions = output_dict["l2_actions"]
+    elif cmp:
+        train_metrics.cmp_loss = output_dict["cmp_loss"]
+    else:
+        # For regular training, record loss
+        train_metrics.loss = output_dict["loss"]
+    
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -1437,6 +1446,9 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
+        "cmp_loss": AverageMeter("cmp_loss", ":.3f"),
+        "feature_loss": AverageMeter("feature_loss", ":.3f"),
+        "l2_actions": AverageMeter("l2_actions", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
