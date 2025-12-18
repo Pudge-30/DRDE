@@ -402,6 +402,11 @@ def vicreg_loss(
     # Total loss
     total_loss = lambda_param * invariance_loss + mu_param * variance_loss + nu_param * covariance_loss
 
+    print("----------------")
+    print(lambda_param * invariance_loss)
+    print(mu_param * variance_loss)
+    print(nu_param * covariance_loss)
+
     return total_loss
 
 def compute_vicreg_similarity(
@@ -890,7 +895,7 @@ class SingleHeadContentAttention(nn.Module):
 
         # 输出层归一化和投影
         # 注意：LayerNorm 将在 forward 中应用在拼接后的序列上（包含 cls token）
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        #self.layer_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -929,8 +934,8 @@ class SingleHeadContentAttention(nn.Module):
         # Pre-LN: 在注意力之前应用 LayerNorm
         # 拼接 cls token 和 content tokens，然后对整个序列做 LayerNorm
         x_concat = torch.cat([cls, x], dim=1)  # [batch_size, 1 + attn_act_len, hidden_dim]
-        x_normed = self.layer_norm(x_concat)
-
+        #x_normed = self.layer_norm(x_concat)
+        x_normed = x_concat
         # 分离 cls token 和 content tokens
         cls_normed = x_normed[:, :1]  # [batch_size, 1, hidden_dim]
         content_normed = x_normed[:, 1:]  # [batch_size, attn_act_len, hidden_dim]
@@ -1000,12 +1005,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             self.cls_head_prefix = None
             self.part_layer_num = None
+        self.cmp_step=0
 
         # 投影头：将 paligemma 的 hidden_dim (2048) 投影到 action_expert 的 hidden_dim (1024)
         # 用于对比学习中的维度匹配
         self.cmp_projection = nn.Sequential(
             nn.Linear(paligemma_config.width, paligemma_config.width),
-            nn.LayerNorm(paligemma_config.width),
+            #nn.LayerNorm(paligemma_config.width),
             nn.GELU(),
             nn.Linear(paligemma_config.width, action_expert_config.width),
         )
@@ -1328,9 +1334,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # 执行 forward_partial，只处理前 part_layer_num 层
-        inputs_embeds = [prefix_embs_with_cls, dummy_suffix_embs]
-
         def forward_partial_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids):
             intermediate_embeds, intermediate_state = self.paligemma_with_expert.forward_partial(
                 attention_mask=att_2d_masks_4d,
@@ -1375,6 +1378,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"Dimension mismatch: cmp_vec_0 shape {cmp_vec_0.shape} != cmp_vec_1 shape {cmp_vec_1.shape}"
             )
 
+        if self.cmp_step < 200:
+            lambda_param = 0
+            nu_param = 0
+
         # 第三步：使用 VICReg loss 计算对比学习损失
         loss_scalar = vicreg_loss(
             cmp_vec_0,
@@ -1389,10 +1396,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # vicreg_loss 返回的是标量（0维），没有 batch 维度，需要扩展
         batch_size = cmp_vec_0.shape[0]
         action_dim = self.config.max_action_dim
-        
+
         # 将标量损失扩展为 [batch_size, 1, action_dim]
         losses = loss_scalar.view(1, 1, 1).expand(batch_size, 1, action_dim)
 
+        self.cmp_step += 1
         return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
