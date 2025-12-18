@@ -872,9 +872,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Check if all requested episodes are available in cached data
         if not requested_episodes.issubset(available_episodes):
-            print(requested_episodes)
-            print(available_episodes)
-            print("2222222222222")
             return False
 
         # Check if all required video files exist
@@ -883,7 +880,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 for vid_key in self.meta.video_keys:
                     video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
                     if not video_path.exists():
-                        print("3333333333333")
                         return False
 
         return True
