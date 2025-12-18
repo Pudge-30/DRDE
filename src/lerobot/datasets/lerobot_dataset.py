@@ -714,8 +714,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 raise FileNotFoundError
             self.hf_dataset = self.load_hf_dataset()
             # Check if cached dataset contains all requested episodes
-            if not self._check_cached_episodes_sufficient():
-                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+            #if not self._check_cached_episodes_sufficient():
+            #    raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
