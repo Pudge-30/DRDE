@@ -117,7 +117,15 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    # Record loss based on training mode
+    if cmp:
+        # For contrastive learning, record cmp_loss
+        if hasattr(train_metrics, "cmp_loss"):
+            train_metrics.cmp_loss = loss.item()
+    else:
+        # For regular training, record loss
+        train_metrics.loss = loss.item()
+    
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -307,6 +315,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
+        "cmp_loss": AverageMeter("cmp_loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
