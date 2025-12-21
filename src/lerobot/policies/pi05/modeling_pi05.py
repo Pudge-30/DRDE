@@ -343,7 +343,7 @@ def vicreg_loss(
     lambda_param: float = 25.0,
     mu_param: float = 25.0,
     nu_param: float = 1.0,
-    gamma: float = 0.5,
+    gamma: float = 0.4,
     eps: float = 1e-4,
 ) -> Tensor:
     """VICReg loss with Variance-Invariance-Covariance Regularization (PyTorch version).
@@ -1269,7 +1269,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             lambda_param: float = 25.0,
             mu_param: float = 25.0,
             nu_param: float = 1.0,
-            gamma: float = 0.5,
+            gamma: float = 0.4,
     ) -> Tensor:
         """对比学习前向传播，使用 VICReg loss。
 
