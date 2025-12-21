@@ -2286,6 +2286,8 @@ class PI05Policy(PreTrainedPolicy):
 
                 loss_dict = {
                     "loss": losses.item(),
+                    "bc_loss": None,
+                    "cmp_loss": None,
                 }
             else:
                 actions = self.prepare_action(batch)
