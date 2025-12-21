@@ -118,7 +118,8 @@ def update_policy(
 
     # Record loss based on training mode
     train_metrics.loss = loss.item()
-    
+    train_metrics.bc_loss = output_dict["bc_loss"]
+    train_metrics.cmp_loss = output_dict["cmp_loss"]
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
