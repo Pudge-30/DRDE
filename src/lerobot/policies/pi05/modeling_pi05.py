@@ -2270,7 +2270,7 @@ class PI05Policy(PreTrainedPolicy):
             return feature_loss, loss_dict
 
         else:
-            self._apply_online_params()
+            self._apply_offline_params()
 
             # Prepare inputs
             images, img_masks = self._preprocess_images(batch)
