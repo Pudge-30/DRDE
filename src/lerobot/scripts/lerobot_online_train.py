@@ -528,7 +528,6 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
-    cmp=False,
     online=False,
 ) -> tuple[MetricsTracker, dict]:
     """
@@ -558,7 +557,7 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        loss, output_dict = policy.forward(batch, cmp=cmp, online=online)
+        loss, output_dict = policy.forward(batch, online=online)
 
     # Use accelerator's backward method
     accelerator.backward(loss)
@@ -589,11 +588,11 @@ def update_policy(
     if online:
         train_metrics.feature_loss = output_dict["feature_loss"]
         train_metrics.l2_actions = output_dict["l2_actions"]
-    elif cmp:
-        train_metrics.cmp_loss = output_dict["cmp_loss"]
     else:
         # For regular training, record loss
         train_metrics.loss = output_dict["loss"]
+        train_metrics.cmp_loss = output_dict["cmp_loss"]
+        train_metrics.bc_loss = output_dict["bc_loss"]
     
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
@@ -1622,8 +1621,6 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
         # Phase 3: Train on both offline and online datasets
         # Each training step consists of two sub-steps:
-        # 1. Train on offline dataset with cmp=False
-        # 2. Train on online dataset with cmp=True
         if is_main_process:
             offline_info = (
                 f"{offline_dataset.num_episodes} episodes from offline dataset"
@@ -1655,7 +1652,6 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     cfg.optimizer.grad_clip_norm,
                     accelerator=accelerator,
                     lr_scheduler=lr_scheduler,
-                    cmp=(train_step%4==0),
                 )
 
                 step += 1
@@ -1677,7 +1673,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     cfg.optimizer.grad_clip_norm,
                     accelerator=accelerator,
                     lr_scheduler=lr_scheduler,
-                    online=True,  # Train online data with cmp=True
+                    online=True,
                 )
 
                 step += 1

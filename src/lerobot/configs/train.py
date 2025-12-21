@@ -216,7 +216,7 @@ class OnlineConfig:
     online_dataset_repo_id: str | None = None
     # Root directory for the online dataset
     online_dataset_root: Path | None = None
-    # If online dataset has fewer frames, only offline training (cmp=False) will be performed
+    # If online dataset has fewer frames, only offline training will be performed
     min_frames_for_online_training: int = 50000
 
 

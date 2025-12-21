@@ -61,7 +61,6 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
-    cmp=False,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -89,7 +88,7 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        loss, output_dict = policy.forward(batch, cmp=cmp)
+        loss, output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
     # Use accelerator's backward method
@@ -118,13 +117,7 @@ def update_policy(
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
     # Record loss based on training mode
-    if cmp:
-        # For contrastive learning, record cmp_loss
-        if hasattr(train_metrics, "cmp_loss"):
-            train_metrics.cmp_loss = loss.item()
-    else:
-        # For regular training, record loss
-        train_metrics.loss = loss.item()
+    train_metrics.loss = loss.item()
     
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
@@ -316,6 +309,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
         "cmp_loss": AverageMeter("cmp_loss", ":.3f"),
+        "bc_loss": AverageMeter("bc_loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
@@ -350,8 +344,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             optimizer,
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            cmp=(step%4==0),
+            lr_scheduler=lr_scheduler
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we

@@ -343,7 +343,7 @@ def vicreg_loss(
     lambda_param: float = 25.0,
     mu_param: float = 25.0,
     nu_param: float = 1.0,
-    gamma: float = 1.0,
+    gamma: float = 0.5,
     eps: float = 1e-4,
 ) -> Tensor:
     """VICReg loss with Variance-Invariance-Covariance Regularization (PyTorch version).
@@ -382,9 +382,9 @@ def vicreg_loss(
     std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
     variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
 
-    print(std_z1)
-    print(std_z2)
-    print("++++++++++")
+    # print(std_z1)
+    # print(std_z2)
+    # print("++++++++++")
     # Covariance loss: encourage decorrelation of features
     z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
     z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
@@ -405,10 +405,10 @@ def vicreg_loss(
     # Total loss
     total_loss = lambda_param * invariance_loss + mu_param * variance_loss + nu_param * covariance_loss
 
-    print("----------------")
-    print(lambda_param * invariance_loss)
-    print(mu_param * variance_loss)
-    print(nu_param * covariance_loss)
+    # print("----------------")
+    # print(lambda_param * invariance_loss)
+    # print(mu_param * variance_loss)
+    # print(nu_param * covariance_loss)
 
     return total_loss
 
@@ -898,7 +898,7 @@ class SingleHeadContentAttention(nn.Module):
 
         # 输出层归一化和投影
         # 注意：LayerNorm 将在 forward 中应用在拼接后的序列上（包含 cls token）
-        #self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -936,9 +936,8 @@ class SingleHeadContentAttention(nn.Module):
 
         # Pre-LN: 在注意力之前应用 LayerNorm
         # 拼接 cls token 和 content tokens，然后对整个序列做 LayerNorm
-        x_concat = torch.cat([cls, x], dim=1)  # [batch_size, 1 + attn_act_len, hidden_dim]
-        #x_normed = self.layer_norm(x_concat)
-        x_normed = x_concat
+        x_normed = self.layer_norm(x)
+        x_normed = torch.cat([cls, x_normed], dim=1)
         # 分离 cls token 和 content tokens
         cls_normed = x_normed[:, :1]  # [batch_size, 1, hidden_dim]
         content_normed = x_normed[:, 1:]  # [batch_size, attn_act_len, hidden_dim]
@@ -1270,7 +1269,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             lambda_param: float = 25.0,
             mu_param: float = 25.0,
             nu_param: float = 1.0,
-            gamma: float = 1.0,
+            gamma: float = 0.5,
     ) -> Tensor:
         """对比学习前向传播，使用 VICReg loss。
 
@@ -1385,9 +1384,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         loss_scalar = vicreg_loss(
             cmp_vec_0,
             cmp_vec_1,
-            lambda_param=0 if self.cmp_step < 5 else lambda_param,
+            lambda_param=lambda_param,
             mu_param=mu_param,
-            nu_param=0 if self.cmp_step < 5 else nu_param,
+            nu_param=nu_param,
             gamma=gamma,
         )
 
@@ -1873,6 +1872,10 @@ class PI05Policy(PreTrainedPolicy):
         for p in self.parameters():
             p.requires_grad = id(p) in addition_ids
 
+    def _apply_offline_params(self) -> None:
+        for p in self.parameters():
+            p.requires_grad = True
+
     def _apply_online_params(self) -> None:
         # 为 online 训练设置参数：只训练 action_expert的参数。
         online_params = []
@@ -1902,16 +1905,6 @@ class PI05Policy(PreTrainedPolicy):
         online_param_ids = {id(p) for p in online_params}
         for p in self.parameters():
             p.requires_grad = id(p) in online_param_ids
-
-    def freeze_params(self) -> None:
-        """设置是否只训练新增参数，并立即应用到 requires_grad。"""
-        self.train_addition_only = True
-        self._apply_param_freezing()
-
-    def unfreeze_params(self) -> None:
-        """显式解冻所有参数，恢复联合训练。"""
-        self.train_addition_only = False
-        self._apply_param_freezing()
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -2051,7 +2044,7 @@ class PI05Policy(PreTrainedPolicy):
         Returns:
             tuple: (should_replan: Tensor [batch_size], similarity: Tensor [batch_size])
         """
-        delta_replan = getattr(self.config, "delta_replan", 0)
+        delta_replan = getattr(self.config, "attn_act_len", 0)
         device = tokens.device
         batch_size = tokens.shape[0]
         if delta_replan <= 0:
@@ -2223,7 +2216,7 @@ class PI05Policy(PreTrainedPolicy):
         self._predicted_actions_buffer = torch.cat((self._predicted_actions_buffer[:, delta_replan:, :], torch.zeros((batch_size, delta_replan, max_action_len)).to(device)), dim=1)
         return ret
 
-    def forward(self, batch: dict[str, Tensor], cmp=False, online=False) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], online=False) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
         
         Args:
@@ -2266,7 +2259,7 @@ class PI05Policy(PreTrainedPolicy):
             # 对齐形状到 [batch, attn_act_len, original_action_dim]
             pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
             # 每一步在 action 维度上的 L2 范数，然后对 batch 和时间步求平均
-            l2_per_step = torch.linalg.vector_norm(gen_actions_slice - pred_actions_slice, dim=-1)  # [batch, attn_act_len]
+            l2_per_step = torch.mean(torch.square(gen_actions_slice - pred_actions_slice), dim=-1) # [batch, attn_act_len]
             l2_actions = l2_per_step.mean()
 
             loss_dict = {
@@ -2277,34 +2270,27 @@ class PI05Policy(PreTrainedPolicy):
             return feature_loss, loss_dict
 
         else:
-            if cmp:
-                self.freeze_params()
-            if not cmp:
-                self.unfreeze_params()
+            self._apply_online_params()
 
             # Prepare inputs
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
             actions = self.prepare_action(batch)
-            if not cmp:
-                # Compute loss (no separate state needed for PI05)
-                losses = self.model.forward(images, img_masks, tokens, masks, actions)
-                losses = losses[:, :, :original_action_dim]
-                loss = losses.mean()
-                loss_dict = {
-                    "loss": loss.item(),
-                }
-            else:
-                losses = self.model.forward_cmp(images, img_masks, tokens, masks)
-                loss = losses.mean()
-                loss_dict = {
-                    "cmp_loss": loss.item(),
-                }
+            bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
+            bc_loss = bc_losses[:, :, :original_action_dim].mean()
 
+            cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
+            cmp_loss = cmp_losses.mean()
+            losses = bc_loss + 0.01 * cmp_loss
 
+            loss_dict = {
+                "loss": losses.item(),
+                "bc_loss": bc_loss.item(),
+                "cmp_loss": cmp_loss.item()
+            }
 
-            return loss, loss_dict
+            return losses, loss_dict
 
     def get_action_context(self, batch_size: int = 1, prev_steps: int | None = None, pred_steps: int | None = None) -> dict:
         """获取当前步骤的动作上下文信息。
