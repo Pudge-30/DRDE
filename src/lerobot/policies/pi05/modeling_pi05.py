@@ -1846,30 +1846,24 @@ class PI05Policy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
-    # def _apply_param_freezing(self) -> None:
-    #     # 如果不只训练新增参数，则全部参与训练
-    #     if not self.train_addition_only:
-    #         for p in self.parameters():
-    #             p.requires_grad = True
-    #         return
-    #
-    #     # 只训练 addition_params，其它参数 requires_grad=False
-    #     params = []
-    #
-    #     # content_attention 的参数
-    #     if self.model.content_attention is not None:
-    #         params.extend(self.model.content_attention.parameters())
-    #
-    #     if self.model.cmp_projection is not None:
-    #         params.extend(self.model.cmp_projection.parameters())
-    #
-    #     # cls_head_prefix 参数
-    #     if self.model.cls_head_prefix is not None:
-    #         params.append(self.model.cls_head_prefix)
-    #
-    #     addition_ids = {id(p) for p in params}
-    #     for p in self.parameters():
-    #         p.requires_grad = id(p) in addition_ids
+    def _apply_param_cmp(self) -> None:
+        self.offline_mode = True
+        params = []
+
+        # content_attention 的参数
+        if self.model.content_attention is not None:
+            params.extend(self.model.content_attention.parameters())
+
+        if self.model.cmp_projection is not None:
+            params.extend(self.model.cmp_projection.parameters())
+
+        # cls_head_prefix 参数
+        if self.model.cls_head_prefix is not None:
+            params.append(self.model.cls_head_prefix)
+
+        addition_ids = {id(p) for p in params}
+        for p in self.parameters():
+            p.requires_grad = id(p) in addition_ids
 
     def _apply_offline_params(self) -> None:
         self.offline_mode = True
@@ -2273,14 +2267,14 @@ class PI05Policy(PreTrainedPolicy):
             return feature_loss, loss_dict
 
         else:
-            if self.offline_mode is False:
-                self._apply_offline_params()
-
             # Prepare inputs
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
             if self.config.cmp_pretrain:
+                if self.offline_mode is False:
+                    self._apply_param_cmp()
+
                 cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
                 losses = 0.01 * cmp_losses.mean()
 
@@ -2290,6 +2284,8 @@ class PI05Policy(PreTrainedPolicy):
                     "cmp_loss": torch.tensor(0),
                 }
             else:
+                if self.offline_mode is False:
+                    self._apply_offline_params()
                 actions = self.prepare_action(batch)
                 bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
                 bc_loss = bc_losses[:, :, :original_action_dim].mean()
