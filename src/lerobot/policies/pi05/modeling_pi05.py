@@ -2286,8 +2286,8 @@ class PI05Policy(PreTrainedPolicy):
 
                 loss_dict = {
                     "loss": losses.item(),
-                    "bc_loss": None,
-                    "cmp_loss": None,
+                    "bc_loss": torch.tensor(0),
+                    "cmp_loss": torch.tensor(0),
                 }
             else:
                 actions = self.prepare_action(batch)
