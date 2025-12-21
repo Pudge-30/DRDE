@@ -1665,7 +1665,7 @@ class PI05Policy(PreTrainedPolicy):
 
         self.reset()
 
-        self.train_addition_only: bool = False
+        self.offline_mode: bool = False
 
     @classmethod
     def from_pretrained(
@@ -1846,37 +1846,38 @@ class PI05Policy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
-    def _apply_param_freezing(self) -> None:
-        """根据 train_addition_only 冻结或解冻参数。"""
-        # 如果不只训练新增参数，则全部参与训练
-        if not self.train_addition_only:
-            for p in self.parameters():
-                p.requires_grad = True
-            return
-
-        # 只训练 addition_params，其它参数 requires_grad=False
-        params = []
-
-        # content_attention 的参数
-        if self.model.content_attention is not None:
-            params.extend(self.model.content_attention.parameters())
-
-        if self.model.cmp_projection is not None:
-            params.extend(self.model.cmp_projection.parameters())
-
-        # cls_head_prefix 参数
-        if self.model.cls_head_prefix is not None:
-            params.append(self.model.cls_head_prefix)
-
-        addition_ids = {id(p) for p in params}
-        for p in self.parameters():
-            p.requires_grad = id(p) in addition_ids
+    # def _apply_param_freezing(self) -> None:
+    #     # 如果不只训练新增参数，则全部参与训练
+    #     if not self.train_addition_only:
+    #         for p in self.parameters():
+    #             p.requires_grad = True
+    #         return
+    #
+    #     # 只训练 addition_params，其它参数 requires_grad=False
+    #     params = []
+    #
+    #     # content_attention 的参数
+    #     if self.model.content_attention is not None:
+    #         params.extend(self.model.content_attention.parameters())
+    #
+    #     if self.model.cmp_projection is not None:
+    #         params.extend(self.model.cmp_projection.parameters())
+    #
+    #     # cls_head_prefix 参数
+    #     if self.model.cls_head_prefix is not None:
+    #         params.append(self.model.cls_head_prefix)
+    #
+    #     addition_ids = {id(p) for p in params}
+    #     for p in self.parameters():
+    #         p.requires_grad = id(p) in addition_ids
 
     def _apply_offline_params(self) -> None:
+        self.offline_mode = True
         for p in self.parameters():
             p.requires_grad = True
 
     def _apply_online_params(self) -> None:
+        self.offline_mode = False
         # 为 online 训练设置参数：只训练 action_expert的参数。
         online_params = []
         
@@ -2227,7 +2228,9 @@ class PI05Policy(PreTrainedPolicy):
         """
         original_action_dim = self.config.output_features[ACTION].shape[0]
         if online:
-            self._apply_online_params()
+            if self.offline_mode is True:
+                self._apply_online_params()
+
             prev_actions = batch.get('prev_actions')      # [batch, 10, action_dim]
             pred_action = batch.get('pred_action')        # [batch, 10, action_dim]
             
@@ -2270,7 +2273,8 @@ class PI05Policy(PreTrainedPolicy):
             return feature_loss, loss_dict
 
         else:
-            self._apply_offline_params()
+            if self.offline_mode is False:
+                self._apply_offline_params()
 
             # Prepare inputs
             images, img_masks = self._preprocess_images(batch)
