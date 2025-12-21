@@ -2280,19 +2280,27 @@ class PI05Policy(PreTrainedPolicy):
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-            actions = self.prepare_action(batch)
-            bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
-            bc_loss = bc_losses[:, :, :original_action_dim].mean()
+            if self.config.cmp_pretrain:
+                cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
+                losses = 0.01 * cmp_losses.mean()
 
-            cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
-            cmp_loss = 0.01 * cmp_losses.mean()
-            losses = bc_loss + cmp_loss
+                loss_dict = {
+                    "loss": losses.item(),
+                }
+            else:
+                actions = self.prepare_action(batch)
+                bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
+                bc_loss = bc_losses[:, :, :original_action_dim].mean()
 
-            loss_dict = {
-                "loss": losses.item(),
-                "bc_loss": bc_loss.item(),
-                "cmp_loss": cmp_loss.item()
-            }
+                cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
+                cmp_loss = 0.01 * cmp_losses.mean()
+                losses = bc_loss + cmp_loss
+
+                loss_dict = {
+                    "loss": losses.item(),
+                    "bc_loss": bc_loss.item(),
+                    "cmp_loss": cmp_loss.item()
+                }
 
             return losses, loss_dict
 
