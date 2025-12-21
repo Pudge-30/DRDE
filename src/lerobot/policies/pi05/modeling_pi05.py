@@ -2280,8 +2280,8 @@ class PI05Policy(PreTrainedPolicy):
 
                 loss_dict = {
                     "loss": losses.item(),
-                    "bc_loss": torch.tensor(0),
-                    "cmp_loss": torch.tensor(0),
+                    "bc_loss": 0.,
+                    "cmp_loss": 0.,
                 }
             else:
                 if self.offline_mode is False:

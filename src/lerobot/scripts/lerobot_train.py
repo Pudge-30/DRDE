@@ -380,7 +380,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
+                # Only upload checkpoint to wandb at the final step to save bandwidth
+                # For intermediate checkpoints, set wandb.disable_artifact=True in config
+                if wandb_logger and step == cfg.steps:
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
