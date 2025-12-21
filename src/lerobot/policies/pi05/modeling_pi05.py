@@ -2282,7 +2282,7 @@ class PI05Policy(PreTrainedPolicy):
 
             cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
             cmp_loss = 0.01 * cmp_losses.mean()
-            losses = bc_loss + 0.01 * cmp_loss
+            losses = bc_loss + cmp_loss
 
             loss_dict = {
                 "loss": losses.item(),
