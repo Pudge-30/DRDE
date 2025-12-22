@@ -1446,6 +1446,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
         "cmp_loss": AverageMeter("cmp_loss", ":.3f"),
+        "bc_loss": AverageMeter("bc_loss", ":.3f"),
         "feature_loss": AverageMeter("feature_loss", ":.3f"),
         "l2_actions": AverageMeter("l2_actions", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
