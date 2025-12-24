@@ -72,7 +72,7 @@ def get_safe_dtype(target_dtype, device_type):
 
 
 def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
-    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+        time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
@@ -142,10 +142,10 @@ def pad_vector(vector, new_dim):
 
 
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
-    images: torch.Tensor,
-    height: int,
-    width: int,
-    mode: str = "bilinear",
+        images: torch.Tensor,
+        height: int,
+        width: int,
+        mode: str = "bilinear",
 ) -> torch.Tensor:
     """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
     by padding with black. If the image is float32, it must be in the range [-1, 1].
@@ -216,17 +216,17 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 
 
 def _adjust_attention_and_position_for_none_inputs(
-    inputs_embeds: list[torch.Tensor | None],
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
+        inputs_embeds: list[torch.Tensor | None],
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Adjust attention_mask and position_ids when inputs_embeds contains None.
-    
+
     Args:
         inputs_embeds: List of input embeddings, may contain None
         attention_mask: Original attention mask [batch, seq_len, seq_len] or [batch, num_heads, seq_len, seq_len]
         position_ids: Original position ids [batch, seq_len]
-    
+
     Returns:
         Adjusted attention_mask and position_ids
     """
@@ -243,13 +243,13 @@ def _adjust_attention_and_position_for_none_inputs(
         # Extract prefix part from position_ids
         position_ids = position_ids[:, :prefix_len]
     # If both are not None, no adjustment needed
-    
+
     return attention_mask, position_ids
 
 
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
-    layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
+        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
 ):
     models = [paligemma.language_model, gemma_expert.model]
     # Track valid (non-None) inputs and their indices
@@ -274,11 +274,11 @@ def compute_layer_complete(
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
-    
+
     # If no valid inputs, return None for all outputs
     if not valid_indices:
         return [None] * len(inputs_embeds)
-    
+
     # Concatenate and process attention
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
@@ -337,14 +337,15 @@ def compute_layer_complete(
         valid_idx += 1
     return outputs_embeds
 
+
 def vicreg_loss(
-    z1: Tensor,
-    z2: Tensor,
-    lambda_param: float = 25.0,
-    mu_param: float = 25.0,
-    nu_param: float = 1.0,
-    gamma: float = 0.4,
-    eps: float = 1e-4,
+        z1: Tensor,
+        z2: Tensor,
+        lambda_param: float = 25.0,
+        mu_param: float = 25.0,
+        nu_param: float = 1.0,
+        gamma: float = 0.4,
+        eps: float = 1e-4,
 ) -> Tensor:
     """VICReg loss with Variance-Invariance-Covariance Regularization (PyTorch version).
 
@@ -412,10 +413,11 @@ def vicreg_loss(
 
     return total_loss
 
+
 def compute_vicreg_similarity(
-    z1: Tensor,
-    z2: Tensor,
-    eps: float = 1e-4,
+        z1: Tensor,
+        z2: Tensor,
+        eps: float = 1e-4,
 ) -> Tensor:
     """Compute similarity based on VICReg invariance loss (L2 distance).
 
@@ -444,6 +446,7 @@ def compute_vicreg_similarity(
     similarity = torch.mean(torch.square(z1_flat - z2_flat), dim=-1)  # [batch]
 
     return similarity
+
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
     """Configuration for Gemma model variants."""
@@ -487,11 +490,11 @@ class PaliGemmaWithExpertModel(
     """PaliGemma model with action expert for PI05."""
 
     def __init__(
-        self,
-        vlm_config,
-        action_expert_config,
-        use_adarms=None,
-        precision: Literal["bfloat16", "float32"] = "bfloat16",
+            self,
+            vlm_config,
+            action_expert_config,
+            use_adarms=None,
+            precision: Literal["bfloat16", "float32"] = "bfloat16",
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -565,13 +568,13 @@ class PaliGemmaWithExpertModel(
         return self.paligemma.language_model.embed_tokens(tokens)
 
     def forward(
-        self,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: list[torch.FloatTensor] | None = None,
-        use_cache: bool | None = None,
-        adarms_cond: list[torch.Tensor] | None = None,
+            self,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+            past_key_values: list[torch.FloatTensor] | None = None,
+            inputs_embeds: list[torch.FloatTensor] | None = None,
+            use_cache: bool | None = None,
+            adarms_cond: list[torch.Tensor] | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -605,10 +608,11 @@ class PaliGemmaWithExpertModel(
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
-                and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+                                                 hasattr(self.gemma_expert.model, "gradient_checkpointing")
+                                                 and self.gemma_expert.model.gradient_checkpointing
+                                                 and self.training
+                                         ) or (hasattr(self,
+                                                       "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
@@ -645,11 +649,12 @@ class PaliGemmaWithExpertModel(
                     cond_dim = getattr(norm, 'cond_dim', None)
                     has_weight = hasattr(norm, 'weight')
                     is_adarms = cond_dim is not None and not has_weight
-                    
+
                     if is_adarms and adarms_cond[i] is None:
                         # For adaRMS version with None cond, provide a zero cond tensor
                         batch_size = hidden_states.shape[0]
-                        zero_cond = torch.zeros(batch_size, cond_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+                        zero_cond = torch.zeros(batch_size, cond_dim, device=hidden_states.device,
+                                                dtype=hidden_states.dtype)
                         out_emb, _ = models[i].norm(hidden_states, cond=zero_cond)
                     elif adarms_cond[i] is not None:
                         out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
@@ -677,14 +682,14 @@ class PaliGemmaWithExpertModel(
         return [prefix_output, suffix_output], prefix_past_key_values
 
     def forward_partial(
-        self,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: list[torch.FloatTensor] | None = None,
-        use_cache: bool | None = None,
-        adarms_cond: list[torch.Tensor] | None = None,
-        part_layer_num: int | None = None,
+            self,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+            past_key_values: list[torch.FloatTensor] | None = None,
+            inputs_embeds: list[torch.FloatTensor] | None = None,
+            use_cache: bool | None = None,
+            adarms_cond: list[torch.Tensor] | None = None,
+            part_layer_num: int | None = None,
     ):
         """只处理前 part_layer_num 层，返回中间输出和状态。
 
@@ -721,10 +726,11 @@ class PaliGemmaWithExpertModel(
 
         # Check if gradient checkpointing is enabled
         use_gradient_checkpointing = (
-            hasattr(self.gemma_expert.model, "gradient_checkpointing")
-            and self.gemma_expert.model.gradient_checkpointing
-            and self.training
-        ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+                                             hasattr(self.gemma_expert.model, "gradient_checkpointing")
+                                             and self.gemma_expert.model.gradient_checkpointing
+                                             and self.training
+                                     ) or (hasattr(self,
+                                                   "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
         # Adjust attention_mask and position_ids if inputs_embeds contains None
         adjusted_attention_mask, adjusted_position_ids = _adjust_attention_and_position_for_none_inputs(
@@ -871,6 +877,7 @@ class PaliGemmaWithExpertModel(
     #
     #     return [prefix_output, suffix_output], None
 
+
 class SingleHeadContentAttention(nn.Module):
     """单头内容注意力网络。
 
@@ -930,7 +937,7 @@ class SingleHeadContentAttention(nn.Module):
 
         # 投影输入到 hidden_dim
         x = self.in_proj(suffix_outs)  # [batch_size, attn_act_len, hidden_dim]
-        
+
         # 扩展 class token 到 batch size
         cls = self.class_token.expand(batch_size, -1, -1)  # [batch_size, 1, hidden_dim]
 
@@ -960,6 +967,7 @@ class SingleHeadContentAttention(nn.Module):
         output = self.out_proj(attended)  # [batch_size, hidden_dim]
 
         return output
+
 
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
@@ -1007,13 +1015,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             self.cls_head_prefix = None
             self.part_layer_num = None
-        self.cmp_step=0
+        self.cmp_step = 0
 
         # 投影头：将 paligemma 的 hidden_dim (2048) 投影到 action_expert 的 hidden_dim (1024)
         # 用于对比学习中的维度匹配
         self.cmp_projection = nn.Sequential(
             nn.Linear(paligemma_config.width, paligemma_config.width),
-            #nn.LayerNorm(paligemma_config.width),
+            # nn.LayerNorm(paligemma_config.width),
             nn.GELU(),
             nn.Linear(paligemma_config.width, action_expert_config.width),
         )
@@ -1085,7 +1093,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+            self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -1094,7 +1102,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
-
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
@@ -1129,7 +1136,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def embed_suffix(self, noisy_actions, timestep, condition_token=None):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
-        
+
         Args:
             noisy_actions: [batch, chunk_size, action_dim] 噪声动作
             timestep: [batch] 时间步
@@ -1141,7 +1148,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         bsize = noisy_actions.shape[0]
-        
+
         # 如果有 condition token，先添加它作为第一个 token
         if condition_token is not None:
             # condition_token: [batch, hidden_dim] -> [batch, 1, hidden_dim]
@@ -1196,7 +1203,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, condition_token=None) -> Tensor:
         """Do a full training forward pass and compute the loss.
-        
+
         Args:
             images: 图像列表
             img_masks: 图像掩码列表
@@ -1221,8 +1228,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time, condition_token)
 
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
+                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+                == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
@@ -1250,7 +1257,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
         def action_out_proj_func(suffix_out):
@@ -1403,14 +1410,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
-        self,
-        images,
-        img_masks,
-        tokens,
-        masks,
-        noise=None,
-        num_steps=None,
-        **kwargs: Unpack[ActionSelectKwargs],
+            self,
+            images,
+            img_masks,
+            tokens,
+            masks,
+            noise=None,
+            num_steps=None,
+            **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
@@ -1489,15 +1496,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return x_t
 
     def denoise_step(
-        self,
-        prefix_pad_masks,
-        past_key_values,
-        x_t,
-        timestep,
-        condition_token=None,
+            self,
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            timestep,
+            condition_token=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep.
-        
+
         Args:
             prefix_pad_masks: prefix 的 padding mask
             past_key_values: 缓存的 key-value
@@ -1531,24 +1538,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
 
     def sample_actions_differentiable(
-        self,
-        images,
-        img_masks,
-        tokens,
-        masks,
-        condition_token=None,
-        noise=None,
-        num_steps=None,
+            self,
+            images,
+            img_masks,
+            tokens,
+            masks,
+            condition_token=None,
+            noise=None,
+            num_steps=None,
     ) -> Tensor:
         """可微分的动作采样方法，用于 online 训练。
-        
+
         与 sample_actions 类似，但不使用 @torch.no_grad()，允许梯度回传。
-        
+
         Args:
             images: 图像列表
             img_masks: 图像掩码列表
@@ -1557,7 +1564,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             condition_token: [batch, hidden_dim] 可选的条件 token
             noise: 可选的初始噪声
             num_steps: 采样步数
-            
+
         Returns:
             生成的动作 [batch, chunk_size, action_dim]
         """
@@ -1590,31 +1597,31 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        
+
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            
+
             # 完整的 forward pass（不使用 KV cache）
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
                 x_t, expanded_time, condition_token
             )
-            
+
             if (
-                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-                == torch.bfloat16
+                    self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+                    == torch.bfloat16
             ):
                 suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
                 prefix_embs_bf16 = prefix_embs.to(dtype=torch.bfloat16)
             else:
                 prefix_embs_bf16 = prefix_embs
-            
+
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
             att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-            
+
             att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
             att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-            
+
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -1623,11 +1630,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            
-            suffix_out = suffix_out[:, -self.config.chunk_size :]
+
+            suffix_out = suffix_out[:, -self.config.chunk_size:]
             suffix_out = suffix_out.to(dtype=torch.float32)
             v_t = self.action_out_proj(suffix_out)
-            
+
             # Euler step
             x_t = x_t + dt * v_t
             time = time + dt
@@ -1642,8 +1649,8 @@ class PI05Policy(PreTrainedPolicy):
     name = "pi05"
 
     def __init__(
-        self,
-        config: PI05Config,
+            self,
+            config: PI05Config,
     ):
         """
         Args:
@@ -1669,19 +1676,19 @@ class PI05Policy(PreTrainedPolicy):
 
     @classmethod
     def from_pretrained(
-        cls: builtins.type[T],
-        pretrained_name_or_path: str | Path,
-        *,
-        config: PreTrainedConfig | None = None,
-        force_download: bool = False,
-        resume_download: bool | None = None,
-        proxies: dict | None = None,
-        token: str | bool | None = None,
-        cache_dir: str | Path | None = None,
-        local_files_only: bool = False,
-        revision: str | None = None,
-        strict: bool = True,
-        **kwargs,
+            cls: builtins.type[T],
+            pretrained_name_or_path: str | Path,
+            *,
+            config: PreTrainedConfig | None = None,
+            force_download: bool = False,
+            resume_download: bool | None = None,
+            proxies: dict | None = None,
+            token: str | bool | None = None,
+            cache_dir: str | Path | None = None,
+            local_files_only: bool = False,
+            revision: str | None = None,
+            strict: bool = True,
+            **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
         print(
@@ -1790,7 +1797,7 @@ class PI05Policy(PreTrainedPolicy):
         return model
 
     def _fix_pytorch_state_dict_keys(
-        self, state_dict, model_config
+            self, state_dict, model_config
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
         """Fix state dict keys to match current model architecture."""
         import re
@@ -1803,8 +1810,8 @@ class PI05Policy(PreTrainedPolicy):
             # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
             # For gemma expert layers
             if re.match(
-                r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
-                key,
+                    r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
+                    key,
             ):
                 # Check if the model actually has adaRMS enabled for the expert
                 expert_uses_adarms = getattr(
@@ -1846,6 +1853,42 @@ class PI05Policy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def get_online_optim_params(self):
+        """返回 online 训练需要的参数。
+
+        Returns:
+            包含 action_expert 相关参数的迭代器
+        """
+        online_params = []
+
+        # gemma_expert 的参数
+        if hasattr(self.model, 'paligemma_with_expert'):
+            online_params.extend(
+                self.model.paligemma_with_expert.gemma_expert.parameters()
+            )
+
+        # action_in_proj 和 action_out_proj 的参数
+        if hasattr(self.model, 'action_in_proj'):
+            online_params.extend(self.model.action_in_proj.parameters())
+        if hasattr(self.model, 'action_out_proj'):
+            online_params.extend(self.model.action_out_proj.parameters())
+
+        # time_mlp 的参数
+        if hasattr(self.model, 'time_mlp_in'):
+            online_params.extend(self.model.time_mlp_in.parameters())
+        if hasattr(self.model, 'time_mlp_out'):
+            online_params.extend(self.model.time_mlp_out.parameters())
+
+        return online_params
+
+    def get_offline_optim_params(self):
+        """返回 offline 训练需要的参数（所有参数）。
+
+        Returns:
+            包含所有参数的迭代器
+        """
+        return self.parameters()
+
     def _apply_param_cmp(self) -> None:
         self.offline_mode = True
         params = []
@@ -1874,19 +1917,19 @@ class PI05Policy(PreTrainedPolicy):
         self.offline_mode = False
         # 为 online 训练设置参数：只训练 action_expert的参数。
         online_params = []
-        
+
         # gemma_expert 的参数
         if hasattr(self.model, 'paligemma_with_expert'):
             online_params.extend(
                 self.model.paligemma_with_expert.gemma_expert.parameters()
             )
-        
+
         # action_in_proj 和 action_out_proj 的参数
         if hasattr(self.model, 'action_in_proj'):
             online_params.extend(self.model.action_in_proj.parameters())
         if hasattr(self.model, 'action_out_proj'):
             online_params.extend(self.model.action_out_proj.parameters())
-        
+
         # time_mlp 的参数
         if hasattr(self.model, 'time_mlp_in'):
             online_params.extend(self.model.time_mlp_in.parameters())
@@ -1907,7 +1950,7 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        
+
         # 动作上下文追踪：每个样本在当前 chunk 中已执行的步数
         self.step_num_in_chunk: Tensor | None = None
         self._predicted_actions_buffer: Tensor | None = None
@@ -2019,12 +2062,12 @@ class PI05Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     def _should_replan(
-        self,
-        images,
-        img_masks,
-        tokens,
-        masks,
-        predict_actions: Tensor,
+            self,
+            images,
+            img_masks,
+            tokens,
+            masks,
+            predict_actions: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """
         Check if replanning is needed based on VICReg similarity comparison.
@@ -2043,13 +2086,19 @@ class PI05Policy(PreTrainedPolicy):
         device = tokens.device
         batch_size = tokens.shape[0]
         if delta_replan <= 0:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.float32, device=device)
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size,
+                                                                                         dtype=torch.float32,
+                                                                                         device=device)
 
         if self.model.cls_head_prefix is None or self.model.part_layer_num is None:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.float32, device=device)
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size,
+                                                                                         dtype=torch.float32,
+                                                                                         device=device)
 
         if self.model.content_attention is None:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size, dtype=torch.float32, device=device)
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size,
+                                                                                         dtype=torch.float32,
+                                                                                         device=device)
 
         device = tokens.device
         batch_size = tokens.shape[0]
@@ -2116,7 +2165,6 @@ class PI05Policy(PreTrainedPolicy):
         # Select first attn_act_len actions
         predict_actions = predict_actions[:, :attn_act_len, :origin_action_dim]
 
-
         # Get cmp_vec_1
         cmp_vec_1 = self.model.content_attention(predict_actions).to(dtype=torch.float32)
 
@@ -2156,7 +2204,7 @@ class PI05Policy(PreTrainedPolicy):
 
         batch_size = tokens.shape[0]
         device = tokens.device
-        
+
         # Initialize should_replan as all True (default: always plan initially or when buffer is empty)
         should_replan = torch.ones(batch_size, dtype=torch.bool, device=device)
 
@@ -2164,10 +2212,9 @@ class PI05Policy(PreTrainedPolicy):
         if delta_replan > 0 and self._predicted_actions_buffer is not None:
             # Check every delta_replan steps
             should_replan, similarity = self._should_replan(
-                images, img_masks, tokens, masks, self._predicted_actions_buffer[:,:delta_replan,:],
+                images, img_masks, tokens, masks, self._predicted_actions_buffer[:, :delta_replan, :],
             )
             should_replan = should_replan | (self.step_num_in_chunk >= self.config.chunk_size)
-
 
         # If replanning is needed, generate new actions
         # Handle list indexing for images and img_masks
@@ -2185,10 +2232,10 @@ class PI05Policy(PreTrainedPolicy):
             filtered_tokens = tokens[should_replan]
             filtered_masks = masks[should_replan]
 
-
         # Generate actions only for samples that need replanning
         if should_replan.any():
-            actions = self.model.sample_actions(filtered_images, filtered_img_masks, filtered_tokens, filtered_masks, **kwargs)
+            actions = self.model.sample_actions(filtered_images, filtered_img_masks, filtered_tokens, filtered_masks,
+                                                **kwargs)
             # Update buffer for samples that were replanned
             if self._predicted_actions_buffer is not None:
                 # print(self._predicted_actions_buffer[should_replan].shape)
@@ -2202,18 +2249,19 @@ class PI05Policy(PreTrainedPolicy):
                 self._predicted_actions_buffer = actions
                 self.step_num_in_chunk = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        ret =  self._predicted_actions_buffer[:, :delta_replan, :original_action_dim]
+        ret = self._predicted_actions_buffer[:, :delta_replan, :original_action_dim]
         self._last_actions_list = self._predicted_actions_buffer[:, :delta_replan, :original_action_dim]
 
         max_action_len = self._predicted_actions_buffer.shape[-1]
-        self._predicted_actions_buffer = torch.cat((self._predicted_actions_buffer[:, delta_replan:, :], torch.zeros((batch_size, delta_replan, max_action_len)).to(device)), dim=1)
+        self._predicted_actions_buffer = torch.cat((self._predicted_actions_buffer[:, delta_replan:, :],
+                                                    torch.zeros((batch_size, delta_replan, max_action_len)).to(device)),
+                                                   dim=1)
         return ret
 
     def forward(self, batch: dict[str, Tensor], online=False) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
-        
+
         Args:
             batch: 输入数据批次
             cmp: 是否为对比学习模式
@@ -2225,30 +2273,30 @@ class PI05Policy(PreTrainedPolicy):
             if self.offline_mode is True:
                 self._apply_online_params()
 
-            prev_actions = batch.get('prev_actions')      # [batch, 10, action_dim]
-            pred_action = batch.get('pred_action')        # [batch, 10, action_dim]
-            
+            prev_actions = batch.get('prev_actions')  # [batch, 10, action_dim]
+            pred_action = batch.get('pred_action')  # [batch, 10, action_dim]
+
             # 准备输入
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
             condition_token = self.model.content_attention(prev_actions)  # [batch, hidden_dim]
-            
+
             # 2. 使用 condition_token 生成动作（可微分）
             generated_actions = self.model.sample_actions_differentiable(
                 images, img_masks, tokens, masks,
                 condition_token=condition_token,
                 num_steps=self.config.num_inference_steps,
             )
-            
+
             # 3. 生成动作的前 attn_act_len 步过 content_attention
             attn_act_len = self.model.content_attention.attn_act_len
             gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]  # [batch, attn_act_len, action_dim]
             gen_feature = self.model.content_attention(gen_actions_slice)  # [batch, hidden_dim]
-            
+
             # 4. pred_action 过 content_attention
             pred_feature = self.model.content_attention(pred_action)  # [batch, hidden_dim]
-            
+
             # 5. 计算特征距离 loss
             feature_loss = torch.mean(F.relu(torch.square(gen_feature - pred_feature) - 0.1))
 
@@ -2256,14 +2304,14 @@ class PI05Policy(PreTrainedPolicy):
             # 对齐形状到 [batch, attn_act_len, original_action_dim]
             pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
             # 每一步在 action 维度上的 L2 范数，然后对 batch 和时间步求平均
-            l2_per_step = torch.mean(torch.square(gen_actions_slice - pred_actions_slice), dim=-1) # [batch, attn_act_len]
+            l2_per_step = torch.mean(torch.square(gen_actions_slice - pred_actions_slice), dim=-1)  # [batch, attn_act_len]
             l2_actions = l2_per_step.mean()
 
             loss_dict = {
                 "feature_loss": feature_loss.item(),
                 "l2_actions": l2_actions.item(),
             }
-            
+
             return feature_loss, loss_dict
 
         else:
@@ -2302,7 +2350,8 @@ class PI05Policy(PreTrainedPolicy):
 
             return losses, loss_dict
 
-    def get_action_context(self, batch_size: int = 1, prev_steps: int | None = None, pred_steps: int | None = None) -> dict:
+    def get_action_context(self, batch_size: int = 1, prev_steps: int | None = None,
+                           pred_steps: int | None = None) -> dict:
         """获取当前步骤的动作上下文信息。
 
         用于在线数据收集时记录每帧的动作上下文：
@@ -2334,23 +2383,21 @@ class PI05Policy(PreTrainedPolicy):
         device = next(self.parameters()).device
 
         chunk_size = self.config.chunk_size
-        
         # 初始化为零填充的数据（始终返回正确形状，不返回 None）
         prev_actions = torch.zeros(batch_size, prev_steps, original_action_dim, device=device, dtype=torch.float32)
         pred_action = torch.zeros(batch_size, pred_steps, original_action_dim, device=device, dtype=torch.float32)
         valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
+
         # 如果有预测 buffer，填充真实数据
         if self.step_num_in_chunk is not None:
 
             valid_mask = (self.step_num_in_chunk > prev_steps) & (self.step_num_in_chunk + pred_steps <= chunk_size)
-            
             # 为有效的样本填充真实数据
             for i in range(batch_size):
                 if valid_mask[i]:
                     prev_actions[i] = self._last_actions_list[i, :, :original_action_dim]
                     pred_action[i] = self._predicted_actions_buffer[i, :pred_steps, :original_action_dim]
-        
+
         result = {
             'prev_actions': prev_actions,
             'pred_action': pred_action,

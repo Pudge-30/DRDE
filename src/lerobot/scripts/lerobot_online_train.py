@@ -92,14 +92,14 @@ from lerobot.envs.utils import (
 
 class FillMissingActionContextProcessor:
     """为缺失的动作上下文字段填充默认值。
-    
+
     用于处理离线数据集不包含 prev_actions、pred_action、actions_seq_valid 字段的情况。
     当这些字段缺失时，用零填充并将 valid 标志设为 False。
     """
-    
+
     def __init__(self, action_dim: int, prev_steps: int = 10, pred_steps: int = 10):
         """初始化 Processor。
-        
+
         Args:
             action_dim: 动作维度
             prev_steps: prev_actions 的步数（默认10）
@@ -108,13 +108,13 @@ class FillMissingActionContextProcessor:
         self.action_dim = action_dim
         self.prev_steps = prev_steps
         self.pred_steps = pred_steps
-    
+
     def __call__(self, batch: dict) -> dict:
         """处理 batch，为缺失字段填充默认值。
-        
+
         Args:
             batch: 数据 batch
-            
+
         Returns:
             填充后的 batch
         """
@@ -124,33 +124,33 @@ class FillMissingActionContextProcessor:
             if isinstance(v, torch.Tensor):
                 sample_tensor = v
                 break
-        
+
         if sample_tensor is None:
             return batch
-        
+
         batch_size = sample_tensor.shape[0]
         device = sample_tensor.device
-        
+
         # 检查 prev_actions 是否存在或为 None
         if 'prev_actions' not in batch or batch.get('prev_actions') is None:
             batch['prev_actions'] = torch.zeros(
                 batch_size, self.prev_steps, self.action_dim,
                 device=device, dtype=torch.float32
             )
-        
+
         # 检查 pred_action 是否存在或为 None
         if 'pred_action' not in batch or batch.get('pred_action') is None:
             batch['pred_action'] = torch.zeros(
                 batch_size, self.pred_steps, self.action_dim,
                 device=device, dtype=torch.float32
             )
-        
+
         # 检查 actions_seq_valid 是否存在或为 None
         if 'actions_seq_valid' not in batch or batch.get('actions_seq_valid') is None:
             batch['actions_seq_valid'] = torch.zeros(
                 batch_size, 1, device=device, dtype=torch.bool
             )
-        
+
         return batch
 
 
@@ -228,6 +228,7 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
 
     def __len__(self) -> int:
         return len(self.valid_indices)
+
 
 # class ValidActionContextSampler(torch.utils.data.Sampler):
 #      """只采样 actions_seq_valid=True 的帧的 Sampler。
@@ -379,7 +380,7 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
-    
+
     # Action context tracking
     all_prev_actions = []
     all_pred_actions = []
@@ -503,7 +504,7 @@ def rollout(
         valid_prev_actions = [a for a in all_prev_actions if a is not None]
         valid_pred_actions = [a for a in all_pred_actions if a is not None]
         valid_flags = [v for v in all_actions_seq_valid if v is not None]
-        
+
         if len(valid_prev_actions) > 0:
             # Stack along sequence dimension: [batch, sequence, prev_steps, action_dim]
             ret["prev_actions"] = torch.stack(valid_prev_actions, dim=1)
@@ -520,15 +521,17 @@ def rollout(
 
 
 def update_policy(
-    train_metrics: MetricsTracker,
-    policy: PreTrainedPolicy,
-    batch: Any,
-    optimizer: Optimizer,
-    grad_clip_norm: float,
-    accelerator: Accelerator,
-    lr_scheduler=None,
-    lock=None,
-    online=False,
+        train_metrics: MetricsTracker,
+        policy: PreTrainedPolicy,
+        batch: Any,
+        optimizer: Optimizer,
+        grad_clip_norm: float,
+        accelerator: Accelerator,
+        lr_scheduler=None,
+        lock=None,
+        online=False,
+        online_optimizer: Optimizer | None = None,
+        online_lr_scheduler=None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -555,6 +558,14 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
+    # 根据 online 参数选择对应的优化器和调度器
+    if online and online_optimizer is not None:
+        current_optimizer = online_optimizer
+        current_lr_scheduler = online_lr_scheduler
+    else:
+        current_optimizer = optimizer
+        current_lr_scheduler = lr_scheduler
+
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         loss, output_dict = policy.forward(batch, online=online)
@@ -563,22 +574,28 @@ def update_policy(
     accelerator.backward(loss)
 
     # Clip gradients if specified
+    # 根据 online 模式选择需要 clip 的参数
+    if online and online_optimizer is not None:
+        params_to_clip = policy.get_online_optim_params()
+    else:
+        params_to_clip = policy.parameters()
+
     if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        grad_norm = accelerator.clip_grad_norm_(params_to_clip, grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
+            params_to_clip, float("inf"), error_if_nonfinite=False
         )
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
-        optimizer.step()
+        current_optimizer.step()
 
-    optimizer.zero_grad()
+    current_optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+    if current_lr_scheduler is not None:
+        current_lr_scheduler.step()
 
     # Update internal buffers if policy has update method
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
@@ -593,25 +610,25 @@ def update_policy(
         train_metrics.loss = output_dict["loss"]
         train_metrics.cmp_loss = output_dict["cmp_loss"]
         train_metrics.bc_loss = output_dict["bc_loss"]
-    
+
     train_metrics.grad_norm = grad_norm.item()
-    train_metrics.lr = optimizer.param_groups[0]["lr"]
+    train_metrics.lr = current_optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
 
 def collect_episodes(
-    env,
-    batch_size,
-    policy: PreTrainedPolicy,
-    env_preprocessor,
-    env_postprocessor,
-    preprocessor,
-    postprocessor,
-    n_episodes: int,
-    start_seed: int | None = None,
-    start_episode_index: int = 0,
-    return_action_context: bool = False,
+        env,
+        batch_size,
+        policy: PreTrainedPolicy,
+        env_preprocessor,
+        env_postprocessor,
+        preprocessor,
+        postprocessor,
+        n_episodes: int,
+        start_seed: int | None = None,
+        start_episode_index: int = 0,
+        return_action_context: bool = False,
 ) -> dict:
     """Collect episodes from the environment using the current policy.
 
@@ -625,7 +642,7 @@ def collect_episodes(
         n_episodes: Number of episodes to collect.
         start_seed: Starting seed for environment reset.
         start_episode_index: Starting episode index for the collected episodes.
-        return_action_context: Whether to collect action context (prev_actions, pred_action, 
+        return_action_context: Whether to collect action context (prev_actions, pred_action,
             actions_seq_valid) for online training. Defaults to False.
 
     Returns:
@@ -691,7 +708,7 @@ def collect_episodes(
                 if key in rollout_data:
                     # # 诊断日志：打印 rollout_data 中的形状
                     # logging.info(f"[DEBUG collect_episodes] rollout_data['{key}'] shape: {rollout_data[key].shape}")
-                    
+
                     # 按照与 _compile_episode_data 相同的逻辑处理每个 episode
                     ep_data_list = []
                     for ep_ix in range(rollout_data[ACTION].shape[0]):
@@ -701,7 +718,7 @@ def collect_episodes(
                             ep_data = rollout_data[key][ep_ix, : num_frames - 1]
                             # 最后一帧复制填充
                             ep_data = torch.cat([ep_data, ep_data[-1:]])
-                            
+
                             # 确保 actions_seq_valid 保持 (n, 1) 形状以匹配数据集定义
                             if key == "actions_seq_valid":
                                 if ep_data.ndim == 1:
@@ -709,7 +726,7 @@ def collect_episodes(
                                 # # 诊断日志
                                 # if ep_ix == 0:
                                 #     logging.info(f"[DEBUG collect_episodes] ep_data['{key}'] after unsqueeze: shape={ep_data.shape}")
-                            
+
                             # 移到 CPU（rollout 数据可能在 CUDA 上）
                             ep_data_list.append(ep_data.cpu())
                     if ep_data_list:
@@ -735,10 +752,9 @@ def collect_episodes(
 
 
 def add_episodes_to_dataset(
-    online_dataset: LeRobotDataset,
-    episode_data: dict,
+        online_dataset: LeRobotDataset,
+        episode_data: dict,
 ) -> None:
-
     """Add collected episodes to the dataset.
 
     This function converts episode_data from batch format to individual frames
@@ -833,7 +849,8 @@ def add_episodes_to_dataset(
                             value = value.cpu().numpy()
                         if isinstance(value, np.ndarray) and value.ndim == 3:
                             # Check if it's channel-first (C, H, W) - typically C=3 is small
-                            if value.shape[0] == 3 and value.shape[0] < value.shape[1] and value.shape[0] < value.shape[2]:
+                            if value.shape[0] == 3 and value.shape[0] < value.shape[1] and value.shape[0] < value.shape[
+                                2]:
                                 # Convert from (C, H, W) to (H, W, C)
                                 value = np.transpose(value, (1, 2, 0))
                         image_convert_time += time.time() - img_convert_start
@@ -866,7 +883,7 @@ def add_episodes_to_dataset(
             if isinstance(prev_actions, torch.Tensor):
                 prev_actions = prev_actions.cpu()
             frame_dict["prev_actions"] = prev_actions
-        
+
         if "pred_action" in episode_data and "pred_action" in online_dataset.features:
             pred_action = episode_data["pred_action"][frame_idx]
             # # 诊断日志
@@ -879,16 +896,16 @@ def add_episodes_to_dataset(
             if isinstance(pred_action, torch.Tensor):
                 pred_action = pred_action.cpu()
             frame_dict["pred_action"] = pred_action
-        
+
         if "actions_seq_valid" in episode_data and "actions_seq_valid" in online_dataset.features:
             actions_seq_valid_raw = episode_data["actions_seq_valid"][frame_idx]
-            
+
             # # 诊断日志：打印原始数据形状
             # if frame_idx == 0:
             #     logging.info(f"[DEBUG] actions_seq_valid raw type: {type(actions_seq_valid_raw)}, "
             #                f"shape: {actions_seq_valid_raw.shape if isinstance(actions_seq_valid_raw, torch.Tensor) else 'N/A'}, "
             #                f"episode_data['actions_seq_valid'] shape: {episode_data['actions_seq_valid'].shape}")
-            
+
             if isinstance(actions_seq_valid_raw, torch.Tensor):
                 # 确保是 [1] 形状的 bool tensor，并移到 CPU
                 if actions_seq_valid_raw.ndim == 1 and actions_seq_valid_raw.shape[0] == 1:
@@ -900,23 +917,26 @@ def add_episodes_to_dataset(
                 else:
                     # 其他情况，取第一个元素
                     # logging.warning(f"[DEBUG] Unexpected actions_seq_valid shape: {actions_seq_valid_raw.shape}")
-                    actions_seq_valid = torch.tensor([actions_seq_valid_raw.cpu().flatten()[0].item()], dtype=torch.bool)
+                    actions_seq_valid = torch.tensor([actions_seq_valid_raw.cpu().flatten()[0].item()],
+                                                     dtype=torch.bool)
             else:
                 actions_seq_valid = torch.tensor([actions_seq_valid_raw], dtype=torch.bool)
-            
+
             # # 诊断日志：打印处理后的形状
             # if frame_idx == 0:
             #     logging.info(f"[DEBUG] actions_seq_valid after processing: shape={actions_seq_valid.shape}, dtype={actions_seq_valid.dtype}")
-            
+
             frame_dict["actions_seq_valid"] = actions_seq_valid
-            
+
             # 不跳过帧，让所有帧都被保存到数据集
             # 训练时可以通过采样器（如 ValidActionContextSampler）来过滤无效帧
         # Log frame_dict keys and dataset features for first frame
         if frame_idx == 0:
             logging.info(f"Frame dict keys: {sorted(frame_dict.keys())}")
-            logging.info(f"Dataset expected features (excluding DEFAULT_FEATURES): {sorted(set(online_dataset.features.keys()) - {'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'})}")
-            logging.info(f"Extra keys in frame_dict (not in dataset features): {sorted(set(frame_dict.keys()) - {'task'} - set(online_dataset.features.keys()))}")
+            logging.info(
+                f"Dataset expected features (excluding DEFAULT_FEATURES): {sorted(set(online_dataset.features.keys()) - {'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'})}")
+            logging.info(
+                f"Extra keys in frame_dict (not in dataset features): {sorted(set(frame_dict.keys()) - {'task'} - set(online_dataset.features.keys()))}")
 
         # Record preprocessing time for this frame
         preprocess_time += time.time() - frame_start_time
@@ -943,8 +963,8 @@ def add_episodes_to_dataset(
         # Save episode if this is the last frame of the episode
         # 检测是否是 episode 的最后一帧（下一个帧属于不同的 episode，或者这是所有帧的最后一帧）
         is_last_frame_of_episode = (
-            frame_idx == total_frames - 1 or
-            episode_data["episode_index"][frame_idx + 1].item() != episode_index
+                frame_idx == total_frames - 1 or
+                episode_data["episode_index"][frame_idx + 1].item() != episode_index
         )
 
         # 如果是最后一帧，无论 done 标志如何都应该保存 episode
@@ -969,11 +989,12 @@ def add_episodes_to_dataset(
     total_time = time.time() - func_start_time
     logging.info(f"[PERF] add_episodes_to_dataset timing breakdown:")
     logging.info(f"[PERF]   Total time: {total_time:.3f}s for {total_frames} frames")
-    logging.info(f"[PERF]   Preprocess time: {preprocess_time:.3f}s ({100*preprocess_time/total_time:.1f}%)")
-    logging.info(f"[PERF]     - Image convert time: {image_convert_time:.3f}s ({100*image_convert_time/total_time:.1f}%)")
-    logging.info(f"[PERF]   add_frame time: {add_frame_time:.3f}s ({100*add_frame_time/total_time:.1f}%)")
-    logging.info(f"[PERF]   save_episode time: {save_episode_time:.3f}s ({100*save_episode_time/total_time:.1f}%)")
-    logging.info(f"[PERF]   Avg time per frame: {1000*total_time/total_frames:.2f}ms")
+    logging.info(f"[PERF]   Preprocess time: {preprocess_time:.3f}s ({100 * preprocess_time / total_time:.1f}%)")
+    logging.info(
+        f"[PERF]     - Image convert time: {image_convert_time:.3f}s ({100 * image_convert_time / total_time:.1f}%)")
+    logging.info(f"[PERF]   add_frame time: {add_frame_time:.3f}s ({100 * add_frame_time / total_time:.1f}%)")
+    logging.info(f"[PERF]   save_episode time: {save_episode_time:.3f}s ({100 * save_episode_time / total_time:.1f}%)")
+    logging.info(f"[PERF]   Avg time per frame: {1000 * total_time / total_frames:.2f}ms")
     logging.info(f"Added {total_frames} frames to dataset")
 
 
@@ -1022,22 +1043,27 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Create environment for data collection
-    if is_main_process:
-        logging.info("Creating environment for data collection")
-    collect_env_dict = make_env(
-        cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
-    )
-    # Keep the full dict to use all tasks, not just the first one
-    # Structure: {suite_name: {task_id: vec_env}}
+    # Create environment for data collection (only if online_collect is enabled)
+    collect_env_dict = None
+    if cfg.online.online_collect:
+        if is_main_process:
+            logging.info("Creating environment for data collection")
+        collect_env_dict = make_env(
+            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+        )
+        # Keep the full dict to use all tasks, not just the first one
+        # Structure: {suite_name: {task_id: vec_env}}
+    else:
+        if is_main_process:
+            logging.info("Skipping environment creation (online_collect=False)")
 
     # Create or load datasets
     offline_dataset = None
     online_dataset = None
-    
+
     if is_main_process:
         logging.info("Creating/loading datasets")
-        
+
         # Load offline dataset if specified
         if cfg.online.start_with_offline_dataset:
             logging.info("Loading offline dataset for training")
@@ -1046,15 +1072,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 f"Offline dataset loaded: {offline_dataset.num_episodes} episodes, "
                 f"{offline_dataset.num_frames} frames"
             )
-        
+
         # Create or load online dataset for collecting new episodes
         online_dataset_repo_id = cfg.online.online_dataset_repo_id or cfg.dataset.repo_id
         online_dataset_root = cfg.online.online_dataset_root or cfg.dataset.root
-        
+
         # Check if online dataset already exists by checking for info.json
         online_dataset_path = Path(online_dataset_root)
         online_meta_path = online_dataset_path / "meta" / "info.json"
-        
+
         need_to_create = False
         if online_meta_path.exists():
             # Dataset exists, load it
@@ -1104,10 +1130,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             else:
                 # Directory doesn't exist, need to create new one
                 need_to_create = True
-            
+
             if need_to_create:
                 logging.info(f"Creating new online dataset: {online_dataset_repo_id}")
-                
+
                 # Get configuration from offline dataset if available, otherwise from environment
                 if offline_dataset is not None:
                     # Copy configuration from offline dataset
@@ -1122,10 +1148,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     fps = cfg.env.fps
                     # Convert environment features to dataset features format
                     from lerobot.envs.utils import env_to_policy_features
-                    
+
                     # Get policy features from env config
                     policy_features = env_to_policy_features(cfg.env)
-                    
+
                     # Convert to dataset features format
                     features = {}
                     for key, feat in policy_features.items():
@@ -1149,16 +1175,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                                 "shape": feat.shape,
                                 "names": None,
                             }
-                    
+
                     # Add default features (reward, done)
                     features[REWARD] = {"dtype": "float32", "shape": (1,), "names": None}
                     features[DONE] = {"dtype": "bool", "shape": (1,), "names": None}
-                    
+
                     robot_type = None
                     logging.info(
                         f"Using configuration from environment: fps={fps}, "
                     )
-                
+
                 # Add action context features for online training
                 # Get action dimension from features
                 action_dim = features[ACTION]["shape"][-1] if ACTION in features else 7  # default to 7
@@ -1166,7 +1192,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 attn_act_len = getattr(cfg.policy, 'attn_act_len', 10)
                 prev_steps = attn_act_len
                 pred_steps = attn_act_len
-                
+
                 features["prev_actions"] = {
                     "dtype": "float32",
                     "shape": (prev_steps, action_dim),
@@ -1186,7 +1212,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     f"Added action context features: prev_actions shape={(prev_steps, action_dim)}, "
                     f"pred_action shape={(pred_steps, action_dim)}"
                 )
-                
+
                 # Create empty online dataset
                 online_dataset = LeRobotDataset.create(
                     online_dataset_repo_id,
@@ -1194,7 +1220,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     features=features,
                     root=online_dataset_root,
                     robot_type=robot_type,
-                    batch_encoding_size=cfg.dataset.video_encoding_batch_size if hasattr(cfg.dataset, "video_encoding_batch_size") else 1,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size if hasattr(cfg.dataset,
+                                                                                         "video_encoding_batch_size") else 1,
                     image_writer_threads=16,  # Enable async image writing for better performance
                 )
                 logging.info("Empty online dataset created successfully")
@@ -1205,7 +1232,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         # Load datasets on non-main processes
         if cfg.online.start_with_offline_dataset:
             offline_dataset = make_dataset(cfg)
-        
+
         online_dataset_repo_id = cfg.online.online_dataset_repo_id or cfg.dataset.repo_id
         online_dataset_root = cfg.online.online_dataset_root or cfg.dataset.root
         try:
@@ -1220,7 +1247,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 f"Online dataset {online_dataset_repo_id} not found. "
                 "It should have been created by the main process."
             )
-    
+
     # Use offline dataset for training if available, otherwise use online dataset
     # The online dataset will be used for collecting new episodes
     training_dataset = offline_dataset if offline_dataset is not None else online_dataset
@@ -1291,7 +1318,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         has_normalizer = any(isinstance(step, NormalizerProcessorStep) for step in collect_preprocessor.steps)
         logging.info(f"Collect preprocessor steps: {processor_names}")
         logging.info(f"Collect preprocessor contains normalizer_processor: {has_normalizer}")
-        
+
         # Also log training preprocessor for comparison
         training_processor_names = [type(step).__name__ for step in preprocessor.steps]
         training_has_normalizer = any(isinstance(step, NormalizerProcessorStep) for step in preprocessor.steps)
@@ -1309,20 +1336,55 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         pred_steps=attn_act_len,
     )
     if is_main_process:
-        logging.info(f"Created FillMissingActionContextProcessor with action_dim={action_dim}, attn_act_len={attn_act_len}")
+        logging.info(
+            f"Created FillMissingActionContextProcessor with action_dim={action_dim}, attn_act_len={attn_act_len}")
 
     if is_main_process:
-        logging.info("Creating optimizer and scheduler")
-    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+        logging.info("Creating optimizers and schedulers for online and offline training")
+
+    # 创建两个优化器：一个用于 online 训练，一个用于 offline 训练
+    # 获取两组参数
+    online_params = policy.get_online_optim_params()
+    offline_params = policy.get_offline_optim_params()
+
+    # 创建 online 优化器和调度器
+    online_optimizer = cfg.optimizer.build(online_params)
+    online_lr_scheduler = cfg.scheduler.build(online_optimizer, cfg.steps) if cfg.scheduler is not None else None
+
+    # 创建 offline 优化器和调度器
+    offline_optimizer = cfg.optimizer.build(offline_params)
+    offline_lr_scheduler = cfg.scheduler.build(offline_optimizer, cfg.steps) if cfg.scheduler is not None else None
+
+    # 为了兼容性，保留 optimizer 和 lr_scheduler 变量（默认使用 offline）
+    optimizer = offline_optimizer
+    lr_scheduler = offline_lr_scheduler
 
     step = 0  # Global training step counter
 
     if cfg.resume:
-        from lerobot.utils.train_utils import load_training_state
+        from lerobot.utils.train_utils import load_training_state, TRAINING_STATE_DIR
+        from lerobot.optim.optimizers import load_optimizer_state
+        from lerobot.optim.schedulers import load_scheduler_state
 
-        step, optimizer, lr_scheduler = load_training_state(
-            cfg.checkpoint_path, optimizer, lr_scheduler
+        # 加载 offline 优化器的状态（主要优化器，用于向后兼容）
+        step, offline_optimizer, offline_lr_scheduler = load_training_state(
+            cfg.checkpoint_path, offline_optimizer, offline_lr_scheduler
         )
+        optimizer = offline_optimizer
+        lr_scheduler = offline_lr_scheduler
+
+        # 尝试加载 online 优化器的状态（如果存在）
+        training_state_dir = Path(cfg.checkpoint_path) / TRAINING_STATE_DIR
+        online_opt_dir = training_state_dir / "online_optimizer"
+        online_sched_dir = training_state_dir / "online_scheduler"
+        if online_opt_dir.exists():
+            if is_main_process:
+                logging.info("Loading online optimizer state from checkpoint")
+            online_optimizer = load_optimizer_state(online_optimizer, online_opt_dir)
+        if online_sched_dir.exists() and online_lr_scheduler is not None:
+            if is_main_process:
+                logging.info("Loading online scheduler state from checkpoint")
+            online_lr_scheduler = load_scheduler_state(online_lr_scheduler, online_sched_dir)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -1355,7 +1417,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # Create dataloaders for offline and online datasets
     def create_dataloader(dataset, online=False):
         """创建 DataLoader。
-        
+
         Args:
             dataset: 数据集
             use_valid_action_sampler: 是否使用 ValidActionContextSampler
@@ -1421,25 +1483,29 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    prepare_list = [policy, optimizer, lr_scheduler]
+    prepare_list = [policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler]
     if offline_dataloader is not None:
         prepare_list.append(offline_dataloader)
     if online_dataloader is not None:
         prepare_list.append(online_dataloader)
-    
+
     prepared = accelerator.prepare(*prepare_list)
     if offline_dataloader is not None and online_dataloader is not None:
-        policy, optimizer, lr_scheduler, offline_dataloader, online_dataloader = prepared
+        policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler, offline_dataloader, online_dataloader = prepared
         offline_dl_iter = cycle(offline_dataloader)
         online_dl_iter = cycle(online_dataloader)
     elif offline_dataloader is not None:
-        policy, optimizer, lr_scheduler, offline_dataloader = prepared
+        policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler, offline_dataloader = prepared
         offline_dl_iter = cycle(offline_dataloader)
     elif online_dataloader is not None:
-        policy, optimizer, lr_scheduler, online_dataloader = prepared
+        policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler, online_dataloader = prepared
         online_dl_iter = cycle(online_dataloader)
     else:
-        policy, optimizer, lr_scheduler = prepared
+        policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler = prepared
+
+    # 为了兼容性，保留 optimizer 和 lr_scheduler 变量（指向 offline）
+    optimizer = offline_optimizer
+    lr_scheduler = offline_lr_scheduler
 
     policy.train()
 
@@ -1474,9 +1540,9 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # Main online training loop
     for iteration in range(cfg.online.n_iterations):
         if is_main_process:
-            logging.info(f"\n{'='*60}")
+            logging.info(f"\n{'=' * 60}")
             logging.info(f"Iteration {iteration + 1}/{cfg.online.n_iterations}")
-            logging.info(f"{'='*60}")
+            logging.info(f"{'=' * 60}")
 
         # Phase 1: Collect episodes from all tasks (only if online=True)
         if cfg.online.online_collect:
@@ -1491,27 +1557,27 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
                 # Get current episode count from online dataset to set correct episode indices
                 current_episode_count = online_dataset.num_episodes if hasattr(online_dataset, "num_episodes") else 0
-                
+
                 # Collect episodes from all tasks
                 all_episode_data = []
                 total_tasks = sum(len(tasks) for tasks in collect_env_dict.values())
                 episodes_per_task = cfg.online.collect_episodes_per_iteration // total_tasks
                 remaining_episodes = cfg.online.collect_episodes_per_iteration % total_tasks
-                
+
                 current_ep_idx = current_episode_count
                 task_idx = 0
-                
+
                 for suite_name, task_dict in collect_env_dict.items():
                     for task_id, env in task_dict.items():
                         # Distribute remaining episodes to first few tasks
                         n_episodes_this_task = episodes_per_task + (1 if task_idx < remaining_episodes else 0)
-                        
+
                         if n_episodes_this_task > 0:
                             if is_main_process:
                                 logging.info(
                                     f"Collecting {n_episodes_this_task} episodes from {suite_name} task {task_id}"
                                 )
-                            
+
                             task_episode_data = collect_episodes(
                                 env=env,
                                 batch_size=cfg.eval.batch_size,
@@ -1525,7 +1591,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                                 start_episode_index=current_ep_idx,
                                 return_action_context=True,  # Collect action context for online training
                             )
-                            
+
                             if task_episode_data:
                                 all_episode_data.append(task_episode_data)
                                 # Update episode index for next task
@@ -1536,9 +1602,9 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                                 else:
                                     # Fallback: increment by number of episodes collected
                                     current_ep_idx += n_episodes_this_task
-                        
+
                         task_idx += 1
-                
+
                 # Combine all episode data
                 if len(all_episode_data) > 1:
                     episode_data = {}
@@ -1579,13 +1645,13 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             # Force reload dataset metadata if needed
             if hasattr(online_dataset.meta, "reload"):
                 online_dataset.meta.reload()
-            
+
             # Recreate dataloaders with updated datasets
             if offline_dataset is not None:
                 offline_dataloader = create_dataloader(offline_dataset)
                 offline_dataloader = accelerator.prepare(offline_dataloader)
                 offline_dl_iter = cycle(offline_dataloader)
-            
+
             # Only create online dataloader if dataset has data
             # Use ValidActionContextSampler to only sample valid frames
             if online_dataset.num_frames > 0:
@@ -1607,8 +1673,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         # Check if we have enough episodes to start training
         # Count total episodes: offline + online
         total_episodes = (
-            (offline_dataset.num_episodes if offline_dataset is not None else 0)
-            + online_dataset.num_episodes
+                (offline_dataset.num_episodes if offline_dataset is not None else 0)
+                + online_dataset.num_episodes
         )
         if total_episodes < cfg.online.min_episodes_for_training:
             if is_main_process:
@@ -1649,15 +1715,17 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     train_tracker,
                     policy,
                     offline_batch,
-                    optimizer,
+                    offline_optimizer,
                     cfg.optimizer.grad_clip_norm,
                     accelerator=accelerator,
-                    lr_scheduler=lr_scheduler,
+                    lr_scheduler=offline_lr_scheduler,
+                    online=False,
+                    online_optimizer=online_optimizer,
+                    online_lr_scheduler=online_lr_scheduler,
                 )
 
                 step += 1
                 train_tracker.step()
-
 
             if (online_dataset.num_episodes > 0 and online_dataloader is not None
                     and online_dataset.num_frames >= cfg.online.min_frames_for_online_training):
@@ -1670,16 +1738,17 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     train_tracker,
                     policy,
                     online_batch,
-                    optimizer,
+                    offline_optimizer,
                     cfg.optimizer.grad_clip_norm,
                     accelerator=accelerator,
-                    lr_scheduler=lr_scheduler,
+                    lr_scheduler=offline_lr_scheduler,
                     online=True,
+                    online_optimizer=online_optimizer,
+                    online_lr_scheduler=online_lr_scheduler,
                 )
 
                 step += 1
                 train_tracker.step()
-
 
             # Log and save checkpoints after each training iteration
             # (which includes both offline and online training steps)
@@ -1700,16 +1769,30 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 if is_main_process:
                     logging.info(f"Checkpoint policy after step {step}")
                     checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                    # 保存 offline 优化器（主要优化器，用于向后兼容）
                     save_checkpoint(
                         checkpoint_dir=checkpoint_dir,
                         step=step,
                         cfg=cfg,
                         policy=accelerator.unwrap_model(policy),
-                        optimizer=optimizer,
-                        scheduler=lr_scheduler,
+                        optimizer=offline_optimizer,
+                        scheduler=offline_lr_scheduler,
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                     )
+                    # 额外保存 online 优化器状态到单独的文件
+                    from lerobot.optim.optimizers import save_optimizer_state as save_opt_state
+                    from lerobot.optim.schedulers import save_scheduler_state as save_sched_state
+                    from lerobot.utils.train_utils import TRAINING_STATE_DIR
+                    training_state_dir = checkpoint_dir / TRAINING_STATE_DIR
+                    # 创建 online 优化器的子目录
+                    online_opt_dir = training_state_dir / "online_optimizer"
+                    online_opt_dir.mkdir(parents=True, exist_ok=True)
+                    save_opt_state(online_optimizer, online_opt_dir)
+                    if online_lr_scheduler is not None:
+                        online_sched_dir = training_state_dir / "online_scheduler"
+                        online_sched_dir.mkdir(parents=True, exist_ok=True)
+                        save_sched_state(online_lr_scheduler, online_sched_dir)
                     update_last_checkpoint(checkpoint_dir)
                     if wandb_logger:
                         wandb_logger.log_policy(checkpoint_dir)
@@ -1718,12 +1801,12 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
         if is_main_process:
             total_episodes = (
-                (offline_dataset.num_episodes if offline_dataset is not None else 0)
-                + online_dataset.num_episodes
+                    (offline_dataset.num_episodes if offline_dataset is not None else 0)
+                    + online_dataset.num_episodes
             )
             total_frames = (
-                (offline_dataset.num_frames if offline_dataset is not None else 0)
-                + online_dataset.num_frames
+                    (offline_dataset.num_frames if offline_dataset is not None else 0)
+                    + online_dataset.num_frames
             )
             if cfg.online.online_collect:
                 logging.info(
@@ -1745,16 +1828,29 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     if cfg.save_checkpoint and is_main_process:
         logging.info(f"Final checkpoint at step {step}")
         checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+        # 保存 offline 优化器（主要优化器，用于向后兼容）
         save_checkpoint(
             checkpoint_dir=checkpoint_dir,
             step=step,
             cfg=cfg,
             policy=accelerator.unwrap_model(policy),
-            optimizer=optimizer,
-            scheduler=lr_scheduler,
+            optimizer=offline_optimizer,
+            scheduler=offline_lr_scheduler,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
         )
+        # 额外保存 online 优化器状态
+        from lerobot.optim.optimizers import save_optimizer_state as save_opt_state
+        from lerobot.optim.schedulers import save_scheduler_state as save_sched_state
+        from lerobot.utils.train_utils import TRAINING_STATE_DIR
+        training_state_dir = checkpoint_dir / TRAINING_STATE_DIR
+        online_opt_dir = training_state_dir / "online_optimizer"
+        online_opt_dir.mkdir(parents=True, exist_ok=True)
+        save_opt_state(online_optimizer, online_opt_dir)
+        if online_lr_scheduler is not None:
+            online_sched_dir = training_state_dir / "online_scheduler"
+            online_sched_dir.mkdir(parents=True, exist_ok=True)
+            save_sched_state(online_lr_scheduler, online_sched_dir)
         update_last_checkpoint(checkpoint_dir)
         if wandb_logger:
             wandb_logger.log_policy(checkpoint_dir)
