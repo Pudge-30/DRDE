@@ -1647,10 +1647,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 online_dataset.meta.reload()
 
             # Recreate dataloaders with updated datasets
-            if offline_dataset is not None:
-                offline_dataloader = create_dataloader(offline_dataset)
-                offline_dataloader = accelerator.prepare(offline_dataloader)
-                offline_dl_iter = cycle(offline_dataloader)
+            # if offline_dataset is not None:
+            #     offline_dataloader = create_dataloader(offline_dataset)
+            #     offline_dataloader = accelerator.prepare(offline_dataloader)
+            #     offline_dl_iter = cycle(offline_dataloader)
 
             # Only create online dataloader if dataset has data
             # Use ValidActionContextSampler to only sample valid frames
