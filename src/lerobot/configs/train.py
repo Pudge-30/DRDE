@@ -218,6 +218,8 @@ class OnlineConfig:
     online_dataset_root: Path | None = None
     # If online dataset has fewer frames, only offline training will be performed
     min_frames_for_online_training: int = 2000
+    # train interval
+    train_interval = 100000
 
 
 @dataclass(kw_only=True)

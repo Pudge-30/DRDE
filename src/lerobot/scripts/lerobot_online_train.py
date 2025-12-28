@@ -1727,7 +1727,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 step += 1
                 train_tracker.step()
 
-            if (online_dataset.num_episodes > 0 and online_dataloader is not None
+            if (online_dataset.num_episodes > 0 and step % cfg.online.train_interval == 0 and online_dataloader is not None
                     and online_dataset.num_frames >= cfg.online.min_frames_for_online_training):
                 start_time = time.perf_counter()
                 online_batch = next(online_dl_iter)
