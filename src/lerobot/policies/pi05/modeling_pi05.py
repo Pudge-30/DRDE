@@ -414,6 +414,134 @@ def vicreg_loss(
     return total_loss
 
 
+def contrastive_triplet_loss(
+        z1: Tensor,
+        z2: Tensor,
+        lambda_param: float = 1.0,
+        mu_param: float = 0.0,
+        nu_param: float = 0.0,
+        gamma: float = 0.5,
+        eps: float = 1e-4,
+        temperature: float = 0.07,
+        use_triplet: bool = True,
+) -> Tensor:
+    """基于正负样本对的对比学习损失函数，支持 Triplet Loss 和 InfoNCE 风格。
+
+    该函数使用 z1 和 z2 作为正样本对（应该相似），并从 batch 内构造负样本。
+    支持两种模式：
+    1. Triplet Loss: 使用 margin 控制正负样本之间的距离
+    2. InfoNCE 风格: 使用温度参数和 softmax 进行对比学习
+
+    Args:
+        z1: First representation [batch, num_tokens, dim] or [batch, dim]
+        z2: Second representation [batch, num_tokens, dim] or [batch, dim]
+        lambda_param: 正样本对损失权重（Triplet Loss 中的 margin，或 InfoNCE 中的主损失权重）
+        mu_param: 负样本损失权重（可选，用于平衡正负样本）
+        nu_param: 正则化项权重（可选，用于防止表示坍塌）
+        gamma: Triplet Loss 的 margin，或 InfoNCE 的温度参数（当 use_triplet=False 时）
+        eps: 数值稳定性常数
+        temperature: InfoNCE 的温度参数（当 use_triplet=False 时使用）
+        use_triplet: 是否使用 Triplet Loss（True）或 InfoNCE 风格（False）
+
+    Returns:
+        对比学习损失值（标量张量）
+    """
+    # Handle both 2D and 3D inputs
+    if z1.dim() == 2:
+        z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+    if z2.dim() == 2:
+        z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+
+    batch_size, num_tokens, dim = z1.shape
+
+    # Reshape to (batch*num_tokens, dim)
+    z1_flat = z1.reshape(-1, dim)  # [batch*num_tokens, dim]
+    z2_flat = z2.reshape(-1, dim)  # [batch*num_tokens, dim]
+    n_samples = z1_flat.shape[0]
+
+    # Normalize embeddings for stable distance computation
+    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # [batch*num_tokens, dim]
+    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # [batch*num_tokens, dim]
+
+    if use_triplet:
+        # Triplet Loss 模式
+        # z1 作为 anchor，z2 作为 positive
+        # 从 batch 内其他样本构造 negative
+        
+        # 计算正样本对距离（anchor 和 positive）
+        pos_dist = torch.sum(torch.square(z1_norm - z2_norm), dim=-1)  # [n_samples]
+        
+        # 构造负样本：使用 batch 内其他样本作为 negative
+        # 对于每个样本 i，z1[i] 和 z2[i] 是正样本对
+        # z1[i] 和 z2[j] (j != i) 是负样本对
+        
+        # 计算 z1 与所有 z2 的成对距离
+        # z1_norm: [n_samples, dim], z2_norm: [n_samples, dim]
+        # 计算所有成对距离: [n_samples, n_samples]
+        all_distances = torch.cdist(z1_norm, z2_norm, p=2) ** 2  # [n_samples, n_samples]
+        
+        # 创建掩码，排除对角线（正样本对）
+        eye_mask = torch.eye(n_samples, dtype=torch.bool, device=z1.device)
+        
+        # 对于每个样本，找到最近的负样本（hard negative mining）
+        # 将正样本对的距离设为很大的值，这样 min 就不会选到它们
+        neg_distances = all_distances.clone()
+        neg_distances[eye_mask] = float('inf')
+        neg_dist = torch.min(neg_distances, dim=-1)[0]  # [n_samples] - 使用最近的负样本
+        
+        # Triplet Loss: max(0, pos_dist - neg_dist + margin)
+        # margin 由 gamma 参数控制
+        triplet_loss = F.relu(pos_dist - neg_dist + gamma)  # [n_samples]
+        triplet_loss = torch.mean(triplet_loss)  # scalar
+        
+        # 可选的正样本对拉近损失（鼓励正样本对更相似）
+        pos_loss = torch.mean(pos_dist)  # scalar
+        
+        # 总损失
+        total_loss = lambda_param * triplet_loss + mu_param * pos_loss
+        
+    else:
+        # InfoNCE 风格对比学习
+        # z1 和 z2 作为正样本对，batch 内其他样本作为负样本
+        
+        # 计算相似度矩阵（使用余弦相似度）
+        # z1_norm: [n_samples, dim], z2_norm: [n_samples, dim]
+        similarity_matrix = torch.matmul(z1_norm, z2_norm.T)  # [n_samples, n_samples]
+        
+        # 对角线是正样本对的相似度
+        pos_similarity = torch.diag(similarity_matrix)  # [n_samples]
+        
+        # 应用温度参数
+        pos_similarity = pos_similarity / temperature  # [n_samples]
+        
+        # 对于每个样本，所有其他样本都是负样本
+        # 计算 softmax 分母（包含正样本和所有负样本）
+        # 对每一行应用 softmax
+        logits = similarity_matrix / temperature  # [n_samples, n_samples]
+        
+        # InfoNCE Loss: -log(exp(pos_sim) / sum(exp(all_sim)))
+        # 即：-pos_sim + log(sum(exp(all_sim)))
+        log_sum_exp = torch.logsumexp(logits, dim=-1)  # [n_samples]
+        info_nce_loss = -pos_similarity + log_sum_exp  # [n_samples]
+        info_nce_loss = torch.mean(info_nce_loss)  # scalar
+        
+        # 可选的正样本对拉近损失
+        pos_loss = torch.mean(1.0 - pos_similarity * temperature)  # 转换为距离形式
+        
+        # 总损失
+        total_loss = lambda_param * info_nce_loss + mu_param * pos_loss
+    
+    # 可选的正则化项（防止表示坍塌）
+    if nu_param > 0:
+        # 鼓励表示的方差不为零
+        std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
+        std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
+        reg_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
+        total_loss = total_loss + nu_param * reg_loss
+    
+    return total_loss
+
+
 def compute_vicreg_similarity(
         z1: Tensor,
         z2: Tensor,
@@ -1278,21 +1406,28 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             nu_param: float = 1.0,
             gamma: float = 0.4,
     ) -> Tensor:
-        """对比学习前向传播，使用 VICReg loss。
+        """对比学习前向传播，使用基于正负样本对的 Triplet Loss。
 
         Args:
             images: 图像列表
             img_masks: 图像掩码列表
             tokens: 语言 tokens
             masks: 语言 token 掩码
-            actions: 动作张量 [batch_size, chunk_size, action_dim]
-            lambda_param: VICReg invariance loss 权重
-            mu_param: VICReg variance loss 权重
-            nu_param: VICReg covariance loss 权重
-            gamma: VICReg 目标标准差
+            lambda_param: 保留参数（兼容性，当前未使用）
+            mu_param: 保留参数（兼容性，当前未使用）
+            nu_param: 保留参数（兼容性，当前未使用）
+            gamma: 保留参数（兼容性，当前未使用）
 
         Returns:
-            VICReg loss (scalar tensor)
+            对比学习损失 (scalar tensor)
+            
+        Note:
+            当前使用 contrastive_triplet_loss，参数固定为：
+            - lambda_param=1.0 (主损失权重)
+            - mu_param=0.0 (正样本对拉近损失权重)
+            - nu_param=0.0 (正则化项权重)
+            - gamma=0.5 (Triplet Loss 的 margin)
+            - use_triplet=True (使用 Triplet Loss 模式)
         """
         if self.cls_head_prefix is None:
             raise ValueError(
@@ -1387,18 +1522,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"Dimension mismatch: cmp_vec_0 shape {cmp_vec_0.shape} != cmp_vec_1 shape {cmp_vec_1.shape}"
             )
 
-        # 第三步：使用 VICReg loss 计算对比学习损失
-        loss_scalar = vicreg_loss(
+        # 第三步：使用对比学习损失计算（基于正负样本对的 Triplet Loss）
+        # 原来的 VICReg loss（已注释）
+        # loss_scalar = vicreg_loss(
+        #     cmp_vec_0,
+        #     cmp_vec_1,
+        #     lambda_param=lambda_param,
+        #     mu_param=mu_param,
+        #     nu_param=nu_param,
+        #     gamma=gamma,
+        # )
+        
+        # 使用基于正负样本对的对比学习损失（Triplet Loss）
+        loss_scalar = contrastive_triplet_loss(
             cmp_vec_0,
             cmp_vec_1,
-            lambda_param=lambda_param,
-            mu_param=mu_param,
-            nu_param=nu_param,
-            gamma=gamma,
+            lambda_param=1.0,  # 主损失权重
+            mu_param=0.0,       # 可选：正样本对拉近损失权重
+            nu_param=0.0,       # 可选：正则化项权重
+            gamma=0.5,          # Triplet Loss 的 margin（距离阈值）
+            use_triplet=True,   # 使用 Triplet Loss 模式
         )
 
         # 将标量损失扩展为 [batch_size, 1, action_dim] 以匹配 forward 的返回格式
-        # vicreg_loss 返回的是标量（0维），没有 batch 维度，需要扩展
+        # 损失函数返回的是标量（0维），没有 batch 维度，需要扩展
         batch_size = cmp_vec_0.shape[0]
         action_dim = self.config.max_action_dim
 
