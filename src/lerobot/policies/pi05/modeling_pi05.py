@@ -399,8 +399,8 @@ def vicreg_loss(
     offdiag_z2 = cov_z2 * off_diagonal_mask
 
     # Covariance loss (normalize by dim, not number of elements)
-    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / dim
-    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / dim
+    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim*dim)
+    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim*dim)
     covariance_loss = cov_loss_z1 + cov_loss_z2
 
     # Total loss
@@ -414,130 +414,417 @@ def vicreg_loss(
     return total_loss
 
 
-def contrastive_triplet_loss(
+# def contrastive_triplet_loss(
+#         z1: Tensor,
+#         z2: Tensor,
+#         lambda_param: float = 1.0,
+#         mu_param: float = 0.0,
+#         nu_param: float = 0.0,
+#         gamma: float = 0.5,
+#         eps: float = 1e-4,
+#         temperature: float = 0.07,
+#         use_triplet: bool = True,
+# ) -> Tensor:
+#     """基于正负样本对的对比学习损失函数，支持 Triplet Loss 和 InfoNCE 风格。
+#
+#     该函数使用 z1 和 z2 作为正样本对（应该相似），并从 batch 内构造负样本。
+#     支持两种模式：
+#     1. Triplet Loss: 使用 margin 控制正负样本之间的距离
+#     2. InfoNCE 风格: 使用温度参数和 softmax 进行对比学习
+#
+#     Args:
+#         z1: First representation [batch, num_tokens, dim] or [batch, dim]
+#         z2: Second representation [batch, num_tokens, dim] or [batch, dim]
+#         lambda_param: 正样本对损失权重（Triplet Loss 中的 margin，或 InfoNCE 中的主损失权重）
+#         mu_param: 负样本损失权重（可选，用于平衡正负样本）
+#         nu_param: 正则化项权重（可选，用于防止表示坍塌）
+#         gamma: Triplet Loss 的 margin，或 InfoNCE 的温度参数（当 use_triplet=False 时）
+#         eps: 数值稳定性常数
+#         temperature: InfoNCE 的温度参数（当 use_triplet=False 时使用）
+#         use_triplet: 是否使用 Triplet Loss（True）或 InfoNCE 风格（False）
+#
+#     Returns:
+#         对比学习损失值（标量张量）
+#     """
+#     # Handle both 2D and 3D inputs
+#     if z1.dim() == 2:
+#         z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+#     if z2.dim() == 2:
+#         z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+#
+#     batch_size, num_tokens, dim = z1.shape
+#
+#     # Reshape to (batch*num_tokens, dim)
+#     z1_flat = z1.reshape(-1, dim)  # [batch*num_tokens, dim]
+#     z2_flat = z2.reshape(-1, dim)  # [batch*num_tokens, dim]
+#     n_samples = z1_flat.shape[0]
+#
+#     # Normalize embeddings for stable distance computation
+#     z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # [batch*num_tokens, dim]
+#     z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # [batch*num_tokens, dim]
+#
+#     if use_triplet:
+#         # Triplet Loss 模式
+#         # z1 作为 anchor，z2 作为 positive
+#         # 从 batch 内其他样本构造 negative
+#
+#         # 计算正样本对距离（anchor 和 positive）
+#         pos_dist = torch.sum(torch.square(z1_norm - z2_norm), dim=-1)  # [n_samples]
+#
+#         # 构造负样本：使用 batch 内其他样本作为 negative
+#         # 对于每个样本 i，z1[i] 和 z2[i] 是正样本对
+#         # z1[i] 和 z2[j] (j != i) 是负样本对
+#
+#         # 计算 z1 与所有 z2 的成对距离
+#         # z1_norm: [n_samples, dim], z2_norm: [n_samples, dim]
+#         # 计算所有成对距离: [n_samples, n_samples]
+#         all_distances = torch.cdist(z1_norm, z2_norm, p=2) ** 2  # [n_samples, n_samples]
+#
+#         # 创建掩码，排除对角线（正样本对）
+#         eye_mask = torch.eye(n_samples, dtype=torch.bool, device=z1.device)
+#
+#         # 对于每个样本，找到最近的负样本（hard negative mining）
+#         # 将正样本对的距离设为很大的值，这样 min 就不会选到它们
+#         neg_distances = all_distances.clone()
+#         neg_distances[eye_mask] = float('inf')
+#         neg_dist = torch.min(neg_distances, dim=-1)[0]  # [n_samples] - 使用最近的负样本
+#
+#         # Triplet Loss: max(0, pos_dist - neg_dist + margin)
+#         # margin 由 gamma 参数控制
+#         triplet_loss = F.relu(pos_dist - neg_dist + gamma)  # [n_samples]
+#         triplet_loss = torch.mean(triplet_loss)  # scalar
+#
+#         # 可选的正样本对拉近损失（鼓励正样本对更相似）
+#         pos_loss = torch.mean(pos_dist)  # scalar
+#
+#         # 总损失
+#         total_loss = lambda_param * triplet_loss + mu_param * pos_loss
+#
+#     else:
+#         # InfoNCE 风格对比学习
+#         # z1 和 z2 作为正样本对，batch 内其他样本作为负样本
+#
+#         # 计算相似度矩阵（使用余弦相似度）
+#         # z1_norm: [n_samples, dim], z2_norm: [n_samples, dim]
+#         similarity_matrix = torch.matmul(z1_norm, z2_norm.T)  # [n_samples, n_samples]
+#
+#         # 对角线是正样本对的相似度
+#         pos_similarity = torch.diag(similarity_matrix)  # [n_samples]
+#
+#         # 应用温度参数
+#         pos_similarity = pos_similarity / temperature  # [n_samples]
+#
+#         # 对于每个样本，所有其他样本都是负样本
+#         # 计算 softmax 分母（包含正样本和所有负样本）
+#         # 对每一行应用 softmax
+#         logits = similarity_matrix / temperature  # [n_samples, n_samples]
+#
+#         # InfoNCE Loss: -log(exp(pos_sim) / sum(exp(all_sim)))
+#         # 即：-pos_sim + log(sum(exp(all_sim)))
+#         log_sum_exp = torch.logsumexp(logits, dim=-1)  # [n_samples]
+#         info_nce_loss = -pos_similarity + log_sum_exp  # [n_samples]
+#         info_nce_loss = torch.mean(info_nce_loss)  # scalar
+#
+#         # 可选的正样本对拉近损失
+#         pos_loss = torch.mean(1.0 - pos_similarity * temperature)  # 转换为距离形式
+#
+#         # 总损失
+#         total_loss = lambda_param * info_nce_loss + mu_param * pos_loss
+#
+#     # 可选的正则化项（防止表示坍塌）
+#     if nu_param > 0:
+#         # 鼓励表示的方差不为零
+#         std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
+#         std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
+#         reg_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
+#         total_loss = total_loss + nu_param * reg_loss
+#
+#     return total_loss
+
+
+def contrastive_loss_with_structure(
         z1: Tensor,
         z2: Tensor,
-        lambda_param: float = 1.0,
-        mu_param: float = 0.0,
-        nu_param: float = 0.0,
-        gamma: float = 0.5,
-        eps: float = 1e-4,
+        z2_original: Tensor,
         temperature: float = 0.07,
-        use_triplet: bool = True,
+        temperature_structure: float = 0.07,
+        top_k: int = 16,
+        lambda_align: float = 1.0,
+        lambda_structure: float = 1.0,
+        lambda_anticollapse: float = 1.0,
+        gamma: float = 0.4,
+        eps: float = 1e-4,
+        log_interval: int = 10,
 ) -> Tensor:
-    """基于正负样本对的对比学习损失函数，支持 Triplet Loss 和 InfoNCE 风格。
-
-    该函数使用 z1 和 z2 作为正样本对（应该相似），并从 batch 内构造负样本。
-    支持两种模式：
-    1. Triplet Loss: 使用 margin 控制正负样本之间的距离
-    2. InfoNCE 风格: 使用温度参数和 softmax 进行对比学习
+    """对比学习损失函数，包含三个组件：
+    1. InfoNCE 对齐损失：让正样本对 (z1[i], z2[i]) 靠近（使用余弦相似度）
+    2. 结构保持损失：使用 Soft Rank 方法保持 z2 的前 top_k 个最近邻排序一致性
+    3. 防坍缩损失：variance + covariance 防止表示空间坍缩
 
     Args:
-        z1: First representation [batch, num_tokens, dim] or [batch, dim]
-        z2: Second representation [batch, num_tokens, dim] or [batch, dim]
-        lambda_param: 正样本对损失权重（Triplet Loss 中的 margin，或 InfoNCE 中的主损失权重）
-        mu_param: 负样本损失权重（可选，用于平衡正负样本）
-        nu_param: 正则化项权重（可选，用于防止表示坍塌）
-        gamma: Triplet Loss 的 margin，或 InfoNCE 的温度参数（当 use_triplet=False 时）
+        z1: First representation [batch, dim] or [batch, num_tokens, dim]
+        z2: Second representation [batch, dim] or [batch, num_tokens, dim]
+        z2_original: z2 的原始输入，用于计算原始距离排序
+                     例如 actions [batch, attn_act_len, action_dim]
+        temperature: InfoNCE 温度参数
+        temperature_structure: 结构保持损失的温度参数（用于 Softmax 概率分布）
+        top_k: 保持前 k 个最近邻的排序
+        lambda_align: 对齐损失权重
+        lambda_structure: 结构保持损失权重
+        lambda_anticollapse: 防坍缩损失权重
+        gamma: Variance loss 的目标标准差
         eps: 数值稳定性常数
-        temperature: InfoNCE 的温度参数（当 use_triplet=False 时使用）
-        use_triplet: 是否使用 Triplet Loss（True）或 InfoNCE 风格（False）
+        log_interval: 每隔多少步打印一次日志（默认每10步）
 
     Returns:
-        对比学习损失值（标量张量）
+        总损失值（标量张量）
     """
+    # 使用函数属性来跟踪调用次数（静态变量）
+    if not hasattr(contrastive_loss_with_structure, 'step_count'):
+        contrastive_loss_with_structure.step_count = 0
+    contrastive_loss_with_structure.step_count += 1
     # Handle both 2D and 3D inputs
     if z1.dim() == 2:
-        z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
-    if z2.dim() == 2:
-        z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
-
-    batch_size, num_tokens, dim = z1.shape
-
-    # Reshape to (batch*num_tokens, dim)
-    z1_flat = z1.reshape(-1, dim)  # [batch*num_tokens, dim]
-    z2_flat = z2.reshape(-1, dim)  # [batch*num_tokens, dim]
-    n_samples = z1_flat.shape[0]
-
-    # Normalize embeddings for stable distance computation
-    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # [batch*num_tokens, dim]
-    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # [batch*num_tokens, dim]
-
-    if use_triplet:
-        # Triplet Loss 模式
-        # z1 作为 anchor，z2 作为 positive
-        # 从 batch 内其他样本构造 negative
-        
-        # 计算正样本对距离（anchor 和 positive）
-        pos_dist = torch.sum(torch.square(z1_norm - z2_norm), dim=-1)  # [n_samples]
-        
-        # 构造负样本：使用 batch 内其他样本作为 negative
-        # 对于每个样本 i，z1[i] 和 z2[i] 是正样本对
-        # z1[i] 和 z2[j] (j != i) 是负样本对
-        
-        # 计算 z1 与所有 z2 的成对距离
-        # z1_norm: [n_samples, dim], z2_norm: [n_samples, dim]
-        # 计算所有成对距离: [n_samples, n_samples]
-        all_distances = torch.cdist(z1_norm, z2_norm, p=2) ** 2  # [n_samples, n_samples]
-        
-        # 创建掩码，排除对角线（正样本对）
-        eye_mask = torch.eye(n_samples, dtype=torch.bool, device=z1.device)
-        
-        # 对于每个样本，找到最近的负样本（hard negative mining）
-        # 将正样本对的距离设为很大的值，这样 min 就不会选到它们
-        neg_distances = all_distances.clone()
-        neg_distances[eye_mask] = float('inf')
-        neg_dist = torch.min(neg_distances, dim=-1)[0]  # [n_samples] - 使用最近的负样本
-        
-        # Triplet Loss: max(0, pos_dist - neg_dist + margin)
-        # margin 由 gamma 参数控制
-        triplet_loss = F.relu(pos_dist - neg_dist + gamma)  # [n_samples]
-        triplet_loss = torch.mean(triplet_loss)  # scalar
-        
-        # 可选的正样本对拉近损失（鼓励正样本对更相似）
-        pos_loss = torch.mean(pos_dist)  # scalar
-        
-        # 总损失
-        total_loss = lambda_param * triplet_loss + mu_param * pos_loss
-        
+        z1_flat = z1  # [batch, dim]
     else:
-        # InfoNCE 风格对比学习
-        # z1 和 z2 作为正样本对，batch 内其他样本作为负样本
-        
-        # 计算相似度矩阵（使用余弦相似度）
-        # z1_norm: [n_samples, dim], z2_norm: [n_samples, dim]
-        similarity_matrix = torch.matmul(z1_norm, z2_norm.T)  # [n_samples, n_samples]
-        
-        # 对角线是正样本对的相似度
-        pos_similarity = torch.diag(similarity_matrix)  # [n_samples]
-        
-        # 应用温度参数
-        pos_similarity = pos_similarity / temperature  # [n_samples]
-        
-        # 对于每个样本，所有其他样本都是负样本
-        # 计算 softmax 分母（包含正样本和所有负样本）
-        # 对每一行应用 softmax
-        logits = similarity_matrix / temperature  # [n_samples, n_samples]
-        
-        # InfoNCE Loss: -log(exp(pos_sim) / sum(exp(all_sim)))
-        # 即：-pos_sim + log(sum(exp(all_sim)))
-        log_sum_exp = torch.logsumexp(logits, dim=-1)  # [n_samples]
-        info_nce_loss = -pos_similarity + log_sum_exp  # [n_samples]
-        info_nce_loss = torch.mean(info_nce_loss)  # scalar
-        
-        # 可选的正样本对拉近损失
-        pos_loss = torch.mean(1.0 - pos_similarity * temperature)  # 转换为距离形式
-        
-        # 总损失
-        total_loss = lambda_param * info_nce_loss + mu_param * pos_loss
+        z1_flat = z1.reshape(-1, z1.shape[-1])  # [batch*num_tokens, dim]
     
-    # 可选的正则化项（防止表示坍塌）
-    if nu_param > 0:
-        # 鼓励表示的方差不为零
-        std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
-        std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
-        reg_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
-        total_loss = total_loss + nu_param * reg_loss
+    if z2.dim() == 2:
+        z2_flat = z2  # [batch, dim]
+    else:
+        z2_flat = z2.reshape(-1, z2.shape[-1])  # [batch*num_tokens, dim]
+    
+    batch_size = z1_flat.shape[0]
+    dim = z1_flat.shape[-1]
+
+    # ========== 1. InfoNCE 对齐损失（加权版本，避免与 Structure Loss 冲突）==========
+    # 归一化 embeddings 用于稳定计算
+    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # [batch_size, dim]
+    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # [batch_size, dim]
+    
+    # 计算相似度矩阵（使用余弦相似度）
+    similarity_matrix = torch.matmul(z1_norm, z2_norm.T)  # [batch_size, batch_size]
+    
+    # 对角线是正样本对的相似度
+    pos_similarity = torch.diag(similarity_matrix)  # [batch_size]
+    
+    # ========== 计算原空间距离用于加权 ==========
+    # 从 z2_original 计算原始表示（用于计算原空间距离）
+    if z2_original.dim() == 3:
+        z2_orig_repr = torch.mean(z2_original, dim=1)  # [batch_size, feature_dim]
+    else:
+        z2_orig_repr = z2_original  # [batch_size, feature_dim]
+    
+    # 计算原空间距离矩阵（用于加权负样本）
+    orig_distances_for_weight = torch.cdist(z2_orig_repr, z2_orig_repr, p=2)  # [batch_size, batch_size]
+    
+    # 计算权重：距离远的权重大（需要推远），距离近的权重小（不需要太远）
+    # 这样可以让 InfoNCE 与 Structure Loss 协调：近邻不会被强行推太远
+    # 使用改进版本：median + sigmoid 映射，避免 max 的不稳定性和 inf 值
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
+    dist = orig_distances_for_weight.clone()
+    dist = dist.masked_fill(eye_mask, 0.0)  # 设为 0 而不是 inf，避免数值问题
+    
+    # 使用 median 作为尺度（比 max 更稳定，对 outlier 不敏感）
+    non_diag_distances = dist[~eye_mask]
+    if len(non_diag_distances) > 0:
+        scale = non_diag_distances.median().detach() + eps  # 使用 median 而不是 max
+    else:
+        scale = torch.tensor(1.0, device=z2.device) + eps
+    
+    # 归一化距离：dist / scale
+    dist_normalized = dist / scale  # [0, ~max/scale]
+    
+    # 使用 sigmoid 映射到权重范围 [w_min, w_max]
+    # sigmoid(x - 1.0) 将中心点移到 1.0，使得距离接近 scale 时权重约为 0.5
+    w_min = 0.1  # 最小权重，避免完全忽略近邻（距离很近的样本权重为 0.1）
+    w_max = 1.0  # 最大权重（距离很远的样本权重为 1.0）
+    # 距离近 -> 权重小，距离远 -> 权重大
+    weights = w_min + (w_max - w_min) * torch.sigmoid(dist_normalized - 1.0)  # [batch_size, batch_size]
+    weights[eye_mask] = 1.0  # 正样本权重为 1（不影响正样本）
+    
+    # 应用温度参数
+    pos_similarity_scaled = pos_similarity / temperature  # [batch_size]
+    
+    # 加权 InfoNCE Loss: 正样本权重为 1（不加权），负样本加权
+    # 数学形式: -log(exp(pos_sim/T) / (exp(pos_sim/T) + sum(w_ij * exp(neg_sim/T))))
+    # 正样本参与计算但权重为 1，保持标准 InfoNCE 形式
+    logits = similarity_matrix / temperature  # [batch_size, batch_size]
+    with torch.no_grad():
+        B = similarity_matrix.size(0)
+        pos = pos_similarity.mean().item()
+        neg = (similarity_matrix.sum() - pos_similarity.sum()) / (B * (B - 1))
+        print("pos:", pos, "neg:", neg, "gap:", pos - neg)
+    # 对所有样本应用权重：logits_ij = logits_ij + log(weights_ij)
+    # 正样本权重为 1，所以 log(1) = 0，正样本 logits 不变
+    # 负样本权重 < 1，所以 log(weights) < 0，负样本 logits 减小
+    weighted_logits = logits + torch.log(weights + eps)  # [batch_size, batch_size]
+    
+    # 对所有样本（包括正样本）计算 logsumexp
+    log_sum_exp = torch.logsumexp(weighted_logits, dim=-1)  # [batch_size]
+    
+    # 损失 = -pos_sim/T + log(exp(pos_sim/T) + sum(weighted_neg))
+    align_loss = -pos_similarity_scaled + log_sum_exp  # [batch_size]
+    align_loss = torch.mean(align_loss)  # scalar
+
+    # ========== 2. 结构保持损失（前 k 个排序） ==========
+    # 复用 InfoNCE 部分已计算的原空间距离
+    # 使用 InfoNCE 部分计算的 orig_distances_for_weight（但需要重新处理对角线）
+    orig_distances = orig_distances_for_weight.clone()  # [batch_size, batch_size]
+    
+    # 排除对角线（自己到自己的距离）
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
+    orig_distances[eye_mask] = float('inf')
+    
+    # 确保 top_k 不超过可用的样本数量
+    max_k = min(top_k, batch_size - 1)
+    
+    # 初始化统计变量
+    total_pairs = 0
+    violated_pairs = 0
+    
+    if max_k <= 0:
+        structure_loss = torch.tensor(0.0, device=z2.device, dtype=z2.dtype)
+    else:
+        # 对每个样本，找到前 k 个最近邻的索引（在原始空间中）
+        _, orig_knn_indices = torch.topk(orig_distances, k=max_k, dim=-1, largest=False)  # [batch_size, max_k]
+        
+        # 计算学习后的距离矩阵（使用余弦距离，与 InfoNCE 对齐损失保持一致）
+        # 重用 InfoNCE 部分已计算的 z2_norm
+        # 计算余弦相似度矩阵
+        learned_similarity = torch.matmul(z2_norm, z2_norm.T)  # [batch_size, batch_size]
+        # 转换为余弦距离：distance = 1 - similarity（距离越小，相似度越大）
+        learned_distances = 1.0 - learned_similarity  # [batch_size, batch_size]
+        
+        # 对于每个样本，使用 Soft Rank 方法保持排序一致性
+        # Soft Rank: 通过可微排序直接优化排序一致性，比 KL 散度更直接有效
+        structure_losses = []
+        for i in range(batch_size):
+            knn_indices = orig_knn_indices[i]  # [max_k]
+            
+            # 原始空间中这 k 个邻居的距离
+            orig_knn_dists = orig_distances[i, knn_indices]  # [max_k]
+            
+            # 学习后空间中这 k 个邻居的距离（余弦距离）
+            learned_knn_dists = learned_distances[i, knn_indices]  # [max_k]
+            
+            # ========== Soft Rank 方法 ==========
+            # Soft Rank: 通过可微排序直接优化排序一致性
+            # 对于距离 d，soft rank[i] = sum_j sigmoid((d_j - d_i) / tau)
+            # 这给出了每个元素在所有元素中的"软排名"（有多少个元素比它大）
+            # 距离越小，rank 越小（排名越靠前，rank 接近 0）
+            
+            # 计算原始距离的 soft rank
+            # 构建距离差值矩阵：diff[i,j] = d[j] - d[i]
+            # 如果 d[j] > d[i]，sigmoid 接近 1；如果 d[j] < d[i]，sigmoid 接近 0
+            orig_dists_expanded = orig_knn_dists.unsqueeze(0)  # [1, max_k]
+            orig_dists_expanded_T = orig_knn_dists.unsqueeze(1)  # [max_k, 1]
+            orig_diff = orig_dists_expanded_T - orig_dists_expanded  # [max_k, max_k]
+            # soft rank = sum_j sigmoid((d_j - d_i) / tau)
+            orig_soft_ranks = torch.sigmoid(orig_diff / temperature_structure).sum(dim=1)  # [max_k]
+            
+            # 计算学习后距离的 soft rank
+            learned_dists_expanded = learned_knn_dists.unsqueeze(0)  # [1, max_k]
+            learned_dists_expanded_T = learned_knn_dists.unsqueeze(1)  # [max_k, 1]
+            learned_diff = learned_dists_expanded_T - learned_dists_expanded  # [max_k, max_k]
+            learned_soft_ranks = torch.sigmoid(learned_diff / temperature_structure).sum(dim=1)  # [max_k]
+            
+            # 使用 L1 损失匹配 soft ranks（直接优化排序一致性）
+            # 这比 KL 散度更直接，因为直接优化排序位置而不是概率分布
+            rank_loss = F.l1_loss(learned_soft_ranks/ (max_k - 1), orig_soft_ranks/ (max_k - 1))
+            
+            # ========== Pairwise Sign Loss ==========
+            # 轻量级成对排序符号一致性损失
+            # 直接优化距离差值的符号一致性，比 soft rank 更直接
+            # 只关心相对大小关系（d[j] > d[i] 还是 d[j] < d[i]），不关心具体数值
+            pair_loss = torch.mean(
+                (learned_diff.sign() - orig_diff.sign()).abs()
+            )
+            
+            # 结合 soft rank loss 和 pairwise sign loss
+            # pair_loss 权重较小（0.1），避免过度影响，但能有效惩罚排序错误
+            combined_loss = rank_loss + 0.1 * pair_loss
+            structure_losses.append(combined_loss)
+            
+            # 统计信息：计算排序一致性（通过比较硬排序）
+            # 原始排序（按距离从小到大）
+            orig_ranks = torch.argsort(orig_knn_dists)  # [max_k]
+            # 学习后排序（按距离从小到大）
+            learned_ranks = torch.argsort(learned_knn_dists)  # [max_k]
+            # 计算排序一致的邻居数量
+            rank_matches = (orig_ranks == learned_ranks).sum().item()
+            total_pairs += max_k
+            violated_pairs += (max_k - rank_matches)  # 不一致的数量
+        
+        structure_loss = torch.mean(torch.stack(structure_losses))  # scalar
+        violation_rate = violated_pairs / total_pairs if total_pairs > 0 else 0.0
+
+    # ========== 3. 防坍缩损失（Variance + Covariance） ==========
+    # Variance loss: 鼓励每个特征维度的标准差接近 gamma
+    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
+    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
+    variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
+    
+    # Covariance loss: 鼓励特征维度之间去相关
+    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch_size, dim]
+    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch_size, dim]
+    
+    cov_z1 = (z1_centered.T @ z1_centered) / (batch_size - 1)  # [dim, dim]
+    cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)  # [dim, dim]
+    
+    # Off-diagonal mask
+    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)
+    offdiag_z1 = cov_z1 * off_diagonal_mask
+    offdiag_z2 = cov_z2 * off_diagonal_mask
+    
+    # Covariance loss (normalize by dim)
+    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim*dim)
+    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim*dim)
+    covariance_loss = cov_loss_z1 + cov_loss_z2
+    
+    anticollapse_loss = variance_loss + covariance_loss
+
+    # ========== 总损失 ==========
+    weighted_align_loss = lambda_align * align_loss
+    weighted_structure_loss = lambda_structure * structure_loss
+    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss
+    
+    total_loss = weighted_align_loss + weighted_structure_loss + weighted_anticollapse_loss
+    
+    # ========== 日志输出 ==========
+    step = contrastive_loss_with_structure.step_count
+    if step % log_interval == 0:
+        # 将 tensor 转换为 Python 数值用于打印
+        align_val = align_loss.item()
+        structure_val = structure_loss.item()
+        variance_val = variance_loss.item()
+        covariance_val = covariance_loss.item()
+        anticollapse_val = anticollapse_loss.item()
+        total_val = total_loss.item()
+        weighted_align_val = weighted_align_loss.item()
+        weighted_structure_val = weighted_structure_loss.item()
+        weighted_anticollapse_val = weighted_anticollapse_loss.item()
+        
+        # 计算正样本余弦相似度平均值
+        pos_sim_mean = pos_similarity.mean().item()
+        
+        print(f"\n[Step {step}] Contrastive Loss Breakdown:")
+        print(f"  ├─ Align Loss (InfoNCE):")
+        print(f"  │   raw: {align_val:.6f}, weighted (×{lambda_align:.2f}): {weighted_align_val:.6f}")
+        print(f"  │   └─ Positive similarity (avg): {pos_sim_mean:.4f}")
+        print(f"  ├─ Structure Loss (top-{top_k} ranking, soft-rank L1):")
+        print(f"  │   raw: {structure_val:.6f}, weighted (×{lambda_structure:.2f}): {weighted_structure_val:.6f}")
+        print(f"  │   temperature: {temperature_structure:.3f}")
+        if max_k > 0 and total_pairs > 0:
+            consistent_pairs = total_pairs - violated_pairs
+            consistent_rate = (consistent_pairs / total_pairs) * 100
+            print(f"  │   └─ Ranking consistency: {consistent_pairs}/{total_pairs} ({consistent_rate:.1f}%)")
+        print(f"  ├─ Anti-collapse Loss:")
+        print(f"  │   ├─ Variance: {variance_val:.6f}")
+        print(f"  │   ├─ Covariance: {covariance_val:.6f}")
+        print(f"  │   └─ Total: {anticollapse_val:.6f}, weighted (×{lambda_anticollapse:.2f}): {weighted_anticollapse_val:.6f}")
+        print(f"  └─ Total Loss: {total_val:.6f}")
+        print("-" * 70)
     
     return total_loss
 
@@ -1153,6 +1440,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             nn.GELU(),
             nn.Linear(paligemma_config.width, action_expert_config.width),
         )
+        self.share_projection = nn.Sequential(
+            nn.Linear(action_expert_config.width, paligemma_config.width),
+            nn.GELU(),
+            nn.Linear(paligemma_config.width, action_expert_config.width),
+        )
+
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -1532,17 +1825,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         #     nu_param=nu_param,
         #     gamma=gamma,
         # )
-        
-        # 使用基于正负样本对的对比学习损失（Triplet Loss）
-        loss_scalar = contrastive_triplet_loss(
-            cmp_vec_0,
-            cmp_vec_1,
-            lambda_param=1.0,  # 主损失权重
-            mu_param=0.0,       # 可选：正样本对拉近损失权重
-            nu_param=0.0,       # 可选：正则化项权重
-            gamma=0.5,          # Triplet Loss 的 margin（距离阈值）
-            use_triplet=True,   # 使用 Triplet Loss 模式
-        )
+
+        cmp_vec_0 = self.share_projection(cmp_vec_0)
+        cmp_vec_1 = self.share_projection(cmp_vec_1)
+        # 使用基于正负样本对的对比学习损失（Listwise Ranking with KL divergence）
+        loss_scalar = contrastive_loss_with_structure(
+                        z1=cmp_vec_0,                    # [batch, hidden_dim]
+                        z2=cmp_vec_1,                    # [batch, hidden_dim]
+                        z2_original=selected_actions,     # [batch, attn_act_len, action_dim]
+                        temperature=0.07,                # InfoNCE 温度
+                        temperature_structure=0.07,        # 结构保持损失温度（用于 Softmax）
+                        top_k=16,                         # 保持前 k 个排序
+                        lambda_align=5.0,                # 对齐损失权重
+                        lambda_structure=5.0,            # 结构保持损失权重
+                        lambda_anticollapse=1.0,         # 防坍缩损失权重
+                        gamma=0.4,                      # variance 目标标准差
+                    )
 
         # 将标量损失扩展为 [batch_size, 1, action_dim] 以匹配 forward 的返回格式
         # 损失函数返回的是标量（0维），没有 batch 维度，需要扩展
@@ -2046,6 +2344,9 @@ class PI05Policy(PreTrainedPolicy):
 
         if self.model.cmp_projection is not None:
             params.extend(self.model.cmp_projection.parameters())
+
+        if self.model.share_projection is not None:
+            params.extend(self.model.share_projection.parameters())
 
         # cls_head_prefix 参数
         if self.model.cls_head_prefix is not None:
