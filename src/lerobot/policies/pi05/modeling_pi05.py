@@ -546,33 +546,46 @@ def contrastive_loss_with_structure(
         z1: Tensor,
         z2: Tensor,
         z2_original: Tensor,
-        bilinear_U: nn.Module = None,
-        bilinear_V: nn.Module = None,
+        z1_attended: Tensor = None,  # v12: cross-attention 后的 z1，用于跨模态对比
         temperature: float = 0.07,
         temperature_structure: float = 0.07,
+        temperature_intra: float = 0.2,  # 同模态对比的温度
+        beta_intra: float = 1.0,  # action 软权重的温度
         top_k: int = 16,
-        lambda_align: float = 1.0,
+        lambda_intra: float = 1.0,  # 同模态 loss 权重
+        lambda_cross: float = 1.0,  # 跨模态 loss 权重
         lambda_structure: float = 1.0,
         lambda_anticollapse: float = 1.0,
         gamma: float = 0.4,
         eps: float = 1e-4,
         log_interval: int = 10,
 ) -> Tensor:
-    """对比学习损失函数，包含三个组件：
-    1. v9 Bilinear 对齐损失：score = (z1 @ U) @ (z2 @ V).T，不要求 z1 ≈ z2
-    2. 结构保持损失：使用 Soft Rank 方法保持 z2 的前 top_k 个最近邻排序一致性
-    3. 防坍缩损失：variance + covariance 防止表示空间坍缩
+    """v12 对比学习损失函数：
+
+    核心改进：
+    - intra-modal loss 用原始 z1，让 cmp_projection 学习
+    - cross-modal loss 用 attended z1，利用 cross-attention 建立跨模态对齐
+
+    1. 同模态损失（借鉴 RS-CL）：z1 vs z1 + action 软权重
+       - 目的：解决 z1 internal_sim = 0.98 的问题
+       - 方法：让原始 z1 结构对齐 action 结构
+    2. 跨模态损失：z1_attended vs z2，使用 cosine similarity
+       - 目的：建立观察-动作配对关系，用于漂移检测
+       - 用 attended z1 让 cross-attention 学习跨模态对齐
+    3. 结构保持损失：保持 z2 的 top_k 邻居排序一致性
+    4. 防坍缩损失：variance + covariance
 
     Args:
-        z1: First representation [batch, dim] or [batch, num_tokens, dim]
-        z2: Second representation [batch, dim] or [batch, num_tokens, dim]
-        z2_original: z2 的原始输入，用于计算原始距离排序
-        bilinear_U: v9 Bilinear 投影层 z1 -> [batch, rank]
-        bilinear_V: v9 Bilinear 投影层 z2 -> [batch, rank]
-        temperature: InfoNCE 温度参数
-        temperature_structure: 结构保持损失的温度参数
+        z1: 观察特征 [batch, dim]
+        z2: 动作特征 [batch, dim]
+        z2_original: 原始动作序列 [batch, seq_len, action_dim]，用于计算 action 距离
+        temperature: 跨模态 InfoNCE 温度
+        temperature_structure: 结构保持损失的温度
+        temperature_intra: 同模态对比的温度（RS-CL 用 0.2）
+        beta_intra: action 软权重的温度（RS-CL 用 1.0）
         top_k: 保持前 k 个最近邻的排序
-        lambda_align: 对齐损失权重
+        lambda_intra: 同模态 loss 权重
+        lambda_cross: 跨模态 loss 权重
         lambda_structure: 结构保持损失权重
         lambda_anticollapse: 防坍缩损失权重
         gamma: Variance loss 的目标标准差
@@ -600,93 +613,116 @@ def contrastive_loss_with_structure(
     batch_size = z1_flat.shape[0]
     dim = z1_flat.shape[-1]
 
-    # ========== 1. v9 Bilinear 对齐损失 ==========
-    # 核心：用 Bilinear 打分替代 cosine similarity
-    # score = (z1 @ U) @ (z2 @ V).T，学习配对关系而不要求 z1 ≈ z2
-    if bilinear_U is not None and bilinear_V is not None:
-        z1_proj = bilinear_U(z1_flat)  # [batch_size, rank]
-        z2_proj = bilinear_V(z2_flat)  # [batch_size, rank]
-        score_matrix = torch.matmul(z1_proj, z2_proj.T)  # [batch_size, batch_size]
+    # ========== 计算 action 距离矩阵（用于 intra-modal 和 cross-modal） ==========
+    # 从 z2_original 计算原始动作表示
+    if z2_original.dim() == 3:
+        actions_flat = z2_original.reshape(batch_size, -1)  # [batch_size, seq_len * action_dim]
     else:
-        # 兼容旧代码
-        z1_norm = F.normalize(z1_flat, p=2, dim=-1)
-        z2_norm = F.normalize(z2_flat, p=2, dim=-1)
-        score_matrix = torch.matmul(z1_norm, z2_norm.T)
+        actions_flat = z2_original  # [batch_size, feature_dim]
+
+    # 计算 action 空间距离矩阵
+    action_distances = torch.cdist(actions_flat, actions_flat, p=2)  # [batch_size, batch_size]
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
+
+    # ========== 1. v11 同模态损失（新增，借鉴 RS-CL）==========
+    # 目的：让 z1 结构对齐 action 结构，解决 z1 internal_sim = 0.98 的问题
+    # 方法：z1 vs z1 对比学习，用 action 距离作为软权重
+
+    # z1 cosine similarity matrix
+    z1_norm = F.normalize(z1_flat, p=2, dim=-1)
+    z1_sim = torch.matmul(z1_norm, z1_norm.T)  # [batch_size, batch_size]
+
+    # Action-based soft weights (RS-CL style)
+    # w_ij = softmax(-action_dist / beta)，action 相近的样本应该在 z1 空间也相近
+    action_sim_weights = F.softmax(-action_distances / beta_intra, dim=-1)  # [batch_size, batch_size]
+
+    # Soft-weighted InfoNCE for z1 vs z1
+    # L = -sum_j w_ij * log(exp(sim(z1_i, z1_j) / tau) / sum_k exp(sim(z1_i, z1_k) / tau))
+    z1_logits = z1_sim / temperature_intra  # [batch_size, batch_size]
+    z1_log_softmax = F.log_softmax(z1_logits, dim=-1)  # [batch_size, batch_size]
+    intra_loss = -(action_sim_weights * z1_log_softmax).sum(dim=-1).mean()
+
+    # 记录 z1 internal similarity 用于监控
+    z1_internal_sim = z1_sim[~eye_mask].mean().item()
+
+    # 计算 action-based 目标相似度（z1 应该趋向的值）
+    # action 相近的样本权重大，所以加权平均的 z1_sim 应该接近这个目标
+    with torch.no_grad():
+        # 将 action 距离转换为相似度（距离小 → 相似度高）
+        action_dist_normalized = action_distances / (action_distances.max() + eps)
+        action_sim_target = 1.0 - action_dist_normalized  # [0, 1]
+        # 目标：z1_internal_sim 应该趋向 action_sim 的分布
+        z1_target_sim = action_sim_target[~eye_mask].mean().item()
+
+    # ========== 2. v12 跨模态损失（使用 attended z1）==========
+    # 目的：建立 z1-z2 配对关系，用于漂移检测
+    # 方法：z1_attended vs z2 双向 InfoNCE，使用 cosine similarity
+    # 注意：intra-modal loss 用原始 z1，cross-modal loss 用 attended z1
+
+    # 如果提供了 z1_attended，用它来计算 cross-modal loss
+    if z1_attended is not None:
+        if z1_attended.dim() == 2:
+            z1_cross = z1_attended
+        else:
+            z1_cross = z1_attended.reshape(-1, z1_attended.shape[-1])
+        z1_cross_norm = F.normalize(z1_cross, p=2, dim=-1)
+    else:
+        # 没有 attended，使用原始 z1
+        z1_cross_norm = z1_norm
+
+    z2_norm = F.normalize(z2_flat, p=2, dim=-1)
+    cross_sim = torch.matmul(z1_cross_norm, z2_norm.T)  # [batch_size, batch_size]
+
+    # 记录 z2 internal similarity 用于监控
+    z2_sim = torch.matmul(z2_norm, z2_norm.T)
+    z2_internal_sim = z2_sim[~eye_mask].mean().item()
 
     # 对角线是正样本对的分数
-    pos_scores = torch.diag(score_matrix)  # [batch_size]
-    
-    # ========== 计算原空间距离用于加权 ==========
-    # 从 z2_original 计算原始表示（用于计算原空间距离）
-    if z2_original.dim() == 3:
-        z2_orig_repr = torch.mean(z2_original, dim=1)  # [batch_size, feature_dim]
-    else:
-        z2_orig_repr = z2_original  # [batch_size, feature_dim]
-    
-    # 计算原空间距离矩阵（用于加权负样本）
-    orig_distances_for_weight = torch.cdist(z2_orig_repr, z2_orig_repr, p=2)  # [batch_size, batch_size]
-    
-    # 计算权重：距离远的权重大（需要推远），距离近的权重小（不需要太远）
-    # 这样可以让 InfoNCE 与 Structure Loss 协调：近邻不会被强行推太远
-    # 使用改进版本：median + sigmoid 映射，避免 max 的不稳定性和 inf 值
-    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
-    dist = orig_distances_for_weight.clone()
-    dist = dist.masked_fill(eye_mask, 0.0)  # 设为 0 而不是 inf，避免数值问题
-    
-    # 使用 median 作为尺度（比 max 更稳定，对 outlier 不敏感）
+    pos_scores = torch.diag(cross_sim)  # [batch_size]
+
+    # 计算跨模态加权（距离近的负样本权重小，距离远的权重大）
+    dist = action_distances.clone()
+    dist = dist.masked_fill(eye_mask, 0.0)
     non_diag_distances = dist[~eye_mask]
     if len(non_diag_distances) > 0:
-        scale = non_diag_distances.median().detach() + eps  # 使用 median 而不是 max
+        scale = non_diag_distances.median().detach() + eps
     else:
         scale = torch.tensor(1.0, device=z2.device) + eps
-    
-    # 归一化距离：dist / scale
-    dist_normalized = dist / scale  # [0, ~max/scale]
-    
-    # 使用 sigmoid 映射到权重范围 [w_min, w_max]
-    # sigmoid(x - 1.0) 将中心点移到 1.0，使得距离接近 scale 时权重约为 0.5
-    w_min = 0.1  # 最小权重，避免完全忽略近邻（距离很近的样本权重为 0.1）
-    w_max = 1.0  # 最大权重（距离很远的样本权重为 1.0）
-    # 距离近 -> 权重小，距离远 -> 权重大
-    weights = w_min + (w_max - w_min) * torch.sigmoid(dist_normalized - 1.0)  # [batch_size, batch_size]
-    weights[eye_mask] = 1.0  # 正样本权重为 1（不影响正样本）
-    
+    dist_normalized = dist / scale
+    w_min, w_max = 0.1, 1.0
+    cross_weights = w_min + (w_max - w_min) * torch.sigmoid(dist_normalized - 1.0)
+    cross_weights[eye_mask] = 1.0
+
     # 应用温度参数
-    pos_scores_scaled = pos_scores / temperature  # [batch_size]
+    pos_scores_scaled = pos_scores / temperature
+    cross_logits = cross_sim / temperature
+    weighted_cross_logits = cross_logits + torch.log(cross_weights + eps)
 
-    # v9 Bilinear InfoNCE Loss
-    logits = score_matrix / temperature  # [batch_size, batch_size]
+    # 日志（inline，简洁版）
+    step = contrastive_loss_with_structure.step_count
     with torch.no_grad():
-        B = score_matrix.size(0)
-        pos = pos_scores.mean().item()
-        neg = (score_matrix.sum() - pos_scores.sum()) / (B * (B - 1))
-        score_min = score_matrix.min().item()
-        score_max = score_matrix.max().item()
-        score_std = score_matrix.std().item()
-        print(f"pos: {pos:.4f}, neg: {neg:.4f}, gap: {pos - neg:.4f} | range: [{score_min:.2f}, {score_max:.2f}], std: {score_std:.2f}")
-
-    # 加权 logits
-    weighted_logits = logits + torch.log(weights + eps)  # [batch_size, batch_size]
+        B = cross_sim.size(0)
+        pos_mean = pos_scores.mean().item()
+        neg_mean = (cross_sim.sum() - pos_scores.sum()).item() / (B * (B - 1))
+        cross_gap = pos_mean - neg_mean
+        # 只在 log_interval 时打印
+        if step % log_interval == 0:
+            # 关键指标一行显示
+            print(f"[v12] z1_sim: {z1_internal_sim:.3f} (target: {z1_target_sim:.3f}) | z2_sim: {z2_internal_sim:.3f} | cross_gap: {cross_gap:.4f}")
 
     # 双向 InfoNCE 损失 (CLIP 风格)
-    # 方向1：z1 → z2（对行 softmax）- 给定观察，找对应的动作
-    log_sum_exp_row = torch.logsumexp(weighted_logits, dim=-1)  # [batch_size]
-    loss_z1_to_z2 = -pos_scores_scaled + log_sum_exp_row  # [batch_size]
+    log_sum_exp_row = torch.logsumexp(weighted_cross_logits, dim=-1)
+    loss_z1_to_z2 = -pos_scores_scaled + log_sum_exp_row
+    log_sum_exp_col = torch.logsumexp(weighted_cross_logits, dim=0)
+    loss_z2_to_z1 = -pos_scores_scaled + log_sum_exp_col
+    cross_loss = (torch.mean(loss_z1_to_z2) + torch.mean(loss_z2_to_z1)) / 2
 
-    # 方向2：z2 → z1（对列 softmax）- 给定动作，找对应的观察
-    log_sum_exp_col = torch.logsumexp(weighted_logits, dim=0)  # [batch_size]
-    loss_z2_to_z1 = -pos_scores_scaled + log_sum_exp_col  # [batch_size]
+    # ========== 3. 结构保持损失（前 k 个排序） ==========
+    # 复用已计算的 action 距离矩阵（但需要重新处理对角线）
+    orig_distances = action_distances.clone()  # [batch_size, batch_size]
 
-    # 组合双向损失
-    align_loss = (torch.mean(loss_z1_to_z2) + torch.mean(loss_z2_to_z1)) / 2
-
-    # ========== 2. 结构保持损失（前 k 个排序） ==========
-    # 复用 InfoNCE 部分已计算的原空间距离
-    # 使用 InfoNCE 部分计算的 orig_distances_for_weight（但需要重新处理对角线）
-    orig_distances = orig_distances_for_weight.clone()  # [batch_size, batch_size]
-    
     # 排除对角线（自己到自己的距离）
-    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
+    # eye_mask 已在上面定义
     orig_distances[eye_mask] = float('inf')
     
     # 确保 top_k 不超过可用的样本数量
@@ -794,36 +830,46 @@ def contrastive_loss_with_structure(
     anticollapse_loss = variance_loss + covariance_loss
 
     # ========== 总损失 ==========
-    weighted_align_loss = lambda_align * align_loss
+    weighted_intra_loss = lambda_intra * intra_loss
+    weighted_cross_loss = lambda_cross * cross_loss
     weighted_structure_loss = lambda_structure * structure_loss
     weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss
-    
-    total_loss = weighted_align_loss + weighted_structure_loss + weighted_anticollapse_loss
-    
-    # ========== 日志输出 ==========
+
+    total_loss = weighted_intra_loss + weighted_cross_loss + weighted_structure_loss + weighted_anticollapse_loss
+
+    # ========== 日志输出（详细版）==========
     step = contrastive_loss_with_structure.step_count
     if step % log_interval == 0:
         # 将 tensor 转换为 Python 数值用于打印
-        align_val = align_loss.item()
+        intra_val = intra_loss.item()
+        cross_val = cross_loss.item()
         structure_val = structure_loss.item()
         variance_val = variance_loss.item()
         covariance_val = covariance_loss.item()
         anticollapse_val = anticollapse_loss.item()
         total_val = total_loss.item()
-        weighted_align_val = weighted_align_loss.item()
+        weighted_intra_val = weighted_intra_loss.item()
+        weighted_cross_val = weighted_cross_loss.item()
         weighted_structure_val = weighted_structure_loss.item()
         weighted_anticollapse_val = weighted_anticollapse_loss.item()
-        
-        # 计算正样本分数平均值（v9 Bilinear 分数，不是余弦相似度）
+
+        # 计算正样本分数平均值（cosine similarity）
         pos_sim_mean = pos_scores.mean().item()
-        
-        print(f"\n[Step {step}] Contrastive Loss Breakdown:")
-        print(f"  ├─ Align Loss (InfoNCE):")
-        print(f"  │   raw: {align_val:.6f}, weighted (×{lambda_align:.2f}): {weighted_align_val:.6f}")
-        print(f"  │   └─ Positive score (avg): {pos_sim_mean:.4f}")
+
+        # 获取温度值
+        temp_val = temperature.item() if hasattr(temperature, 'item') else temperature
+
+        print(f"\n[Step {step}] v12 Contrastive Loss Breakdown:")
+        print(f"  ├─ Intra-Modal Loss (z1 vs z1, RS-CL style):")
+        print(f"  │   raw: {intra_val:.6f}, weighted (×{lambda_intra:.2f}): {weighted_intra_val:.6f}")
+        print(f"  │   ├─ z1 internal sim: {z1_internal_sim:.4f} (current)")
+        print(f"  │   └─ z1 target sim:   {z1_target_sim:.4f} (based on action distance)")
+        print(f"  ├─ Cross-Modal Loss (z1 vs z2, cosine + weight):")
+        print(f"  │   raw: {cross_val:.6f}, weighted (×{lambda_cross:.2f}): {weighted_cross_val:.6f}")
+        print(f"  │   ├─ pos: {pos_mean:.4f}, neg: {neg_mean:.4f}, gap: {cross_gap:.4f}")
+        print(f"  │   └─ temperature: {temp_val:.4f}")
         print(f"  ├─ Structure Loss (top-{top_k} ranking, soft-rank L1):")
         print(f"  │   raw: {structure_val:.6f}, weighted (×{lambda_structure:.2f}): {weighted_structure_val:.6f}")
-        print(f"  │   temperature: {temperature_structure:.3f}")
         if max_k > 0 and total_pairs > 0:
             consistent_pairs = total_pairs - violated_pairs
             consistent_rate = (consistent_pairs / total_pairs) * 100
@@ -832,9 +878,12 @@ def contrastive_loss_with_structure(
         print(f"  │   ├─ Variance: {variance_val:.6f}")
         print(f"  │   ├─ Covariance: {covariance_val:.6f}")
         print(f"  │   └─ Total: {anticollapse_val:.6f}, weighted (×{lambda_anticollapse:.2f}): {weighted_anticollapse_val:.6f}")
+        print(f"  ├─ Feature Statistics:")
+        print(f"  │   ├─ z1 internal sim: {z1_internal_sim:.4f} (should decrease from ~0.98)")
+        print(f"  │   └─ z2 internal sim: {z2_internal_sim:.4f} (should stay ~0.60)")
         print(f"  └─ Total Loss: {total_val:.6f}")
         print("-" * 70)
-    
+
     return total_loss
 
 
@@ -1393,6 +1442,77 @@ class SingleHeadContentAttention(nn.Module):
         return output
 
 
+class CrossModalAttention(nn.Module):
+    """跨模态注意力模块，让一个模态"看到"另一个模态。
+
+    核心思想：z1 和 z2 来自不同模态，直接比较难以建立配对关系。
+    通过 cross-attention，让 z1 基于 batch 内所有 z2 生成 attended 表示，
+    正样本对 (z1[i], z2[i]) 的 attention 应该更强。
+    """
+
+    def __init__(self, hidden_dim: int = 1024, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        # Q 来自一个模态，K/V 来自另一个模态
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        self.layer_norm_q = nn.LayerNorm(hidden_dim)
+        self.layer_norm_kv = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query: Tensor, key_value: Tensor) -> Tensor:
+        """
+        Args:
+            query: [batch, hidden_dim] - 查询模态（如观察 z1）
+            key_value: [batch, hidden_dim] - 键值模态（如动作 z2）
+        Returns:
+            attended: [batch, hidden_dim] - query 基于 key_value 的表示
+        """
+        batch_size = query.size(0)
+
+        # LayerNorm
+        q = self.layer_norm_q(query)  # [batch, hidden_dim]
+        kv = self.layer_norm_kv(key_value)  # [batch, hidden_dim]
+
+        # 投影
+        Q = self.q_proj(q)  # [batch, hidden_dim]
+        K = self.k_proj(kv)  # [batch, hidden_dim]
+        V = self.v_proj(kv)  # [batch, hidden_dim]
+
+        # 重塑为多头格式 [batch, num_heads, head_dim]
+        Q = Q.view(batch_size, self.num_heads, self.head_dim)
+        K = K.view(batch_size, self.num_heads, self.head_dim)
+        V = V.view(batch_size, self.num_heads, self.head_dim)
+
+        # 注意力计算：每个 query i 与 batch 内所有 key j 计算
+        # Q: [batch_q, num_heads, head_dim]
+        # K: [batch_k, num_heads, head_dim]
+        # attn[i, h, j] = Q[i, h, :] @ K[j, h, :] / sqrt(head_dim)
+        # 使用 einsum: 'bnh,cnh->bnc' 表示 batch_q x num_heads x batch_k
+        attn_weights = torch.einsum('bnh,cnh->bnc', Q, K) / (self.head_dim ** 0.5)
+        attn_weights = F.softmax(attn_weights, dim=-1)  # 对 batch_k 维度 softmax
+        attn_weights = self.dropout(attn_weights)
+
+        # 加权求和：output[i, h, :] = sum_j attn[i, h, j] * V[j, h, :]
+        # attn: [batch_q, num_heads, batch_k]
+        # V: [batch_k, num_heads, head_dim]
+        # 使用 einsum: 'bnc,cnh->bnh'
+        attended = torch.einsum('bnc,cnh->bnh', attn_weights, V)
+
+        # 重塑回 [batch, hidden_dim]
+        attended = attended.reshape(batch_size, self.hidden_dim)
+        attended = self.out_proj(attended)
+
+        # 残差连接
+        return query + attended
+
+
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
@@ -1455,19 +1575,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             nn.Linear(paligemma_config.width, action_expert_config.width),
         )
 
-        # v9: Bilinear 对比学习
-        # 核心思想：z1（观察）和 z2（动作）不需要相似，只需要能判断是否配对
-        # 打分函数：score = (z1 @ U) @ (z2 @ V).T
-        # 使用低秩分解减少参数：1024x1024 → 1024x256 + 1024x256
-        bilinear_rank = 256
-        self.bilinear_U = nn.Linear(action_expert_config.width, bilinear_rank, bias=False)
-        self.bilinear_V = nn.Linear(action_expert_config.width, bilinear_rank, bias=False)
-        nn.init.normal_(self.bilinear_U.weight, std=0.01)
-        nn.init.normal_(self.bilinear_V.weight, std=0.01)
-
         # 可学习温度参数
         import math
         self.infonce_log_inv_temp = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
+
+        # v12: Cross-Modal Attention 模块
+        # 让 z1 和 z2 在对比之前先"交互"，建立跨模态对齐基础
+        self.cross_modal_attention = CrossModalAttention(
+            hidden_dim=action_expert_config.width,  # 1024
+            num_heads=8,
+            dropout=0.1,
+        )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -1809,9 +1927,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         # 从中间输出中提取分类头对应的输出（第一个 token）
-        cmp_vec_0 = intermediate_embeds[0][:, 0, :]  # [batch_size, paligemma_hidden_dim]
+        cmp_vec_0_raw = intermediate_embeds[0][:, 0, :]  # [batch_size, paligemma_hidden_dim]
         # 通过投影头将 cmp_vec_0 从 paligemma 的维度投影到 action_expert 的维度
-        cmp_vec_0 = self.cmp_projection(cmp_vec_0)  # [batch_size, action_expert_hidden_dim]
+        cmp_vec_0 = self.cmp_projection(cmp_vec_0_raw)  # [batch_size, action_expert_hidden_dim]
         cmp_vec_0 = cmp_vec_0.to(dtype=torch.float32)  # 转换为 float32 用于损失计算
 
         # 确保维度正确
@@ -1831,6 +1949,153 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         cmp_vec_1 = self.content_attention(selected_actions)  # [batch_size, hidden_dim]
         cmp_vec_1 = cmp_vec_1.to(dtype=torch.float32)  # 转换为 float32 用于损失计算
 
+        # ========== 全面诊断（每 100 步打印一次） ==========
+        if self.cmp_step % 100 == 0:
+            with torch.no_grad():
+                print(f"\n{'#'*70}")
+                print(f"# COMPREHENSIVE DIAGNOSIS - Step {self.cmp_step}")
+                print(f"{'#'*70}")
+
+                def compute_internal_sim(x, name):
+                    """计算 batch 内样本间的平均相似度（排除对角线）"""
+                    x_norm = F.normalize(x.reshape(x.size(0), -1).float(), p=2, dim=-1)
+                    sim_matrix = x_norm @ x_norm.T
+                    mask = ~torch.eye(sim_matrix.size(0), dtype=torch.bool, device=sim_matrix.device)
+                    off_diag_mean = sim_matrix[mask].mean().item()
+                    off_diag_std = sim_matrix[mask].std().item()
+                    return off_diag_mean, off_diag_std
+
+                def print_tensor_stats(x, name):
+                    """打印张量统计信息"""
+                    x_flat = x.reshape(x.size(0), -1).float()
+                    print(f"  {name}:")
+                    print(f"    shape: {list(x.shape)}, dtype: {x.dtype}")
+                    print(f"    mean: {x_flat.mean().item():.6f}, std: {x_flat.std().item():.6f}")
+                    print(f"    min: {x_flat.min().item():.6f}, max: {x_flat.max().item():.6f}")
+                    sim_mean, sim_std = compute_internal_sim(x, name)
+                    print(f"    internal_sim: {sim_mean:.4f} (std: {sim_std:.4f})")
+                    return sim_mean
+
+                # ========== 1. 输入数据诊断 ==========
+                print(f"\n{'='*60}")
+                print("[1] INPUT DATA DIAGNOSIS")
+                print(f"{'='*60}")
+
+                # 图像输入
+                print("\n[1.1] Images (raw input):")
+                for i, img in enumerate(images):
+                    if img is not None:
+                        sim_mean, _ = compute_internal_sim(img, f"image_{i}")
+                        print(f"  image_{i}: shape={list(img.shape)}, internal_sim={sim_mean:.4f}")
+
+                # Tokens 输入
+                print(f"\n[1.2] Tokens: shape={list(tokens.shape)}")
+
+                # ========== 2. VLM 中间层诊断 ==========
+                print(f"\n{'='*60}")
+                print("[2] VLM INTERMEDIATE LAYERS DIAGNOSIS")
+                print(f"{'='*60}")
+
+                # prefix_embs（VLM 输入 embedding）
+                print("\n[2.1] prefix_embs (VLM input embeddings):")
+                print_tensor_stats(prefix_embs, "prefix_embs")
+
+                # cls_head_prefix
+                print("\n[2.2] cls_head_prefix (learnable CLS token):")
+                print(f"  shape: {list(self.cls_head_prefix.shape)}")
+                print(f"  mean: {self.cls_head_prefix.mean().item():.6f}, std: {self.cls_head_prefix.std().item():.6f}")
+
+                # intermediate_embeds（VLM 中间输出，多层）
+                print("\n[2.3] intermediate_embeds (VLM partial output):")
+                for idx, emb in enumerate(intermediate_embeds):
+                    if emb is not None:
+                        # 只看 CLS token 位置
+                        cls_emb = emb[:, 0, :]
+                        sim_mean = print_tensor_stats(cls_emb, f"layer_{idx}_cls_token")
+
+                # ========== 3. z1 特征链诊断（关键！）==========
+                print(f"\n{'='*60}")
+                print("[3] Z1 FEATURE CHAIN DIAGNOSIS (CRITICAL)")
+                print(f"{'='*60}")
+
+                # cmp_vec_0_raw（cmp_projection 之前）
+                print("\n[3.1] cmp_vec_0_raw (BEFORE cmp_projection):")
+                z1_raw_sim = print_tensor_stats(cmp_vec_0_raw, "cmp_vec_0_raw")
+
+                # cmp_projection 各层
+                print("\n[3.2] cmp_projection layer-by-layer:")
+                x = cmp_vec_0_raw.float()
+                for i, layer in enumerate(self.cmp_projection):
+                    x = layer(x)
+                    layer_name = f"cmp_projection[{i}] ({layer.__class__.__name__})"
+                    print_tensor_stats(x, layer_name)
+
+                # cmp_vec_0（cmp_projection 之后）
+                print("\n[3.3] cmp_vec_0 (AFTER cmp_projection):")
+                z1_proj_sim = print_tensor_stats(cmp_vec_0, "cmp_vec_0")
+
+                # ========== 4. z2 特征链诊断 ==========
+                print(f"\n{'='*60}")
+                print("[4] Z2 FEATURE CHAIN DIAGNOSIS")
+                print(f"{'='*60}")
+
+                # selected_actions（content_attention 输入）
+                print("\n[4.1] selected_actions (input to content_attention):")
+                print_tensor_stats(selected_actions, "selected_actions")
+
+                # content_attention 内部
+                print("\n[4.2] content_attention internals:")
+                # in_proj 输出 (in_proj 接受 [batch, seq_len, input_dim])
+                in_proj_out = self.content_attention.in_proj(selected_actions)  # [batch, attn_act_len, hidden_dim]
+                print_tensor_stats(in_proj_out, "after in_proj")
+
+                # cmp_vec_1（content_attention 输出）
+                print("\n[4.3] cmp_vec_1 (AFTER content_attention):")
+                z2_sim = print_tensor_stats(cmp_vec_1, "cmp_vec_1")
+
+                # ========== 5. 跨模态相似度诊断 ==========
+                print(f"\n{'='*60}")
+                print("[5] CROSS-MODAL SIMILARITY DIAGNOSIS")
+                print(f"{'='*60}")
+
+                # 计算 cosine similarity score matrix
+                z1_norm = F.normalize(cmp_vec_0, p=2, dim=-1)
+                z2_norm = F.normalize(cmp_vec_1, p=2, dim=-1)
+                score_matrix = z1_norm @ z2_norm.T  # [batch, batch]
+                diag_scores = torch.diag(score_matrix)
+                mask = ~torch.eye(score_matrix.size(0), dtype=torch.bool, device=score_matrix.device)
+                off_diag_scores = score_matrix[mask]
+
+                print(f"\n[5.1] Score matrix statistics (cosine similarity):")
+                print(f"  Diagonal (positive pairs): mean={diag_scores.mean().item():.4f}, std={diag_scores.std().item():.4f}")
+                print(f"  Off-diagonal (negative pairs): mean={off_diag_scores.mean().item():.4f}, std={off_diag_scores.std().item():.4f}")
+                print(f"  Gap (pos - neg): {diag_scores.mean().item() - off_diag_scores.mean().item():.4f}")
+
+                # ========== 6. 问题汇总 ==========
+                print(f"\n{'='*60}")
+                print("[6] PROBLEM SUMMARY")
+                print(f"{'='*60}")
+
+                problems = []
+                if z1_raw_sim > 0.9:
+                    problems.append(f"WARNING: z1_raw (before projection) internal_sim={z1_raw_sim:.4f} > 0.9 - VLM output already collapsed!")
+                if z1_proj_sim > 0.9:
+                    problems.append(f"WARNING: z1 (after projection) internal_sim={z1_proj_sim:.4f} > 0.9 - z1 features collapsed!")
+                if z2_sim > 0.9:
+                    problems.append(f"WARNING: z2 internal_sim={z2_sim:.4f} > 0.9 - z2 features collapsed!")
+
+                gap = diag_scores.mean().item() - off_diag_scores.mean().item()
+                if abs(gap) < 0.05:
+                    problems.append(f"WARNING: pos-neg gap={gap:.4f} is too small - cannot distinguish positive from negative pairs!")
+
+                if len(problems) == 0:
+                    print("  No critical problems detected.")
+                else:
+                    for p in problems:
+                        print(f"  {p}")
+
+                print(f"\n{'#'*70}\n")
+
         # 确保维度匹配
         if cmp_vec_0.shape != cmp_vec_1.shape:
             raise ValueError(
@@ -1848,20 +2113,29 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         #     gamma=gamma,
         # )
 
-        # v10: 双向 Bilinear 对比学习 + 增强反坍缩
+        # v12: Cross-Modal Attention + 同模态对比（借鉴 RS-CL）+ 跨模态对比（cosine similarity）
+        # 核心改进：在对比之前，让 z1 先"看到" z2，建立跨模态对齐基础
         learned_temperature = torch.exp(-self.infonce_log_inv_temp)
+
+        # z1 通过 cross-attention 与 z2 交互
+        # z1_attended[i] 是 z1[i] 基于 batch 内所有 z2 的加权表示
+        # 正样本对 (z1[i], z2[i]) 的 attention 应该更强
+        cmp_vec_0_attended = self.cross_modal_attention(cmp_vec_0, cmp_vec_1)
+
         loss_scalar = contrastive_loss_with_structure(
-                        z1=cmp_vec_0,                    # [batch, hidden_dim]
+                        z1=cmp_vec_0,                    # [batch, hidden_dim] - 原始 z1（intra-modal loss 需要）
                         z2=cmp_vec_1,                    # [batch, hidden_dim]
                         z2_original=selected_actions,     # [batch, attn_act_len, action_dim]
-                        bilinear_U=self.bilinear_U,      # v9: Bilinear 投影
-                        bilinear_V=self.bilinear_V,      # v9: Bilinear 投影
-                        temperature=learned_temperature,  # 可学习温度
+                        z1_attended=cmp_vec_0_attended,  # [batch, hidden_dim] - attended z1（cross-modal loss 用）
+                        temperature=learned_temperature,  # 跨模态温度（可学习）
                         temperature_structure=0.5,
+                        temperature_intra=0.2,           # 同模态温度（RS-CL 默认 0.2）
+                        beta_intra=1.0,                  # action 软权重温度（RS-CL 默认 1.0）
                         top_k=16,
-                        lambda_align=3.0,                # 降低：给 anticollapse 更多空间
-                        lambda_structure=3.0,            # 降低：平衡各项 loss
-                        lambda_anticollapse=5.0,         # 增大：防止坍缩
+                        lambda_intra=1.0,                # 同模态 loss 权重
+                        lambda_cross=1.0,                # 跨模态 loss 权重
+                        lambda_structure=1.0,            # 结构保持 loss 权重
+                        lambda_anticollapse=1.0,         # 防坍缩 loss 权重
                         gamma=0.4,
                     )
 
@@ -2810,7 +3084,7 @@ class PI05Policy(PreTrainedPolicy):
                 bc_loss = bc_losses[:, :, :original_action_dim].mean()
 
                 cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
-                cmp_loss = 0.01 * cmp_losses.mean()
+                cmp_loss = 0.1 * cmp_losses.mean()  # v12: 从 0.01 改为 0.1，让 cmp 梯度贡献更大
                 losses = bc_loss + cmp_loss
 
                 loss_dict = {

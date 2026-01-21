@@ -578,6 +578,73 @@ def update_policy(
     # Use accelerator's backward method
     accelerator.backward(loss)
 
+    # ========== 梯度流诊断（每 100 步打印一次） ==========
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if hasattr(unwrapped_policy, 'model') and hasattr(unwrapped_policy.model, 'cmp_step'):
+        cmp_step = unwrapped_policy.model.cmp_step
+        if cmp_step % 100 == 0 and cmp_step > 0:
+            print(f"\n{'='*60}")
+            print(f"[Gradient Diagnosis After Backward - Step {cmp_step}]")
+            print(f"{'='*60}")
+
+            model = unwrapped_policy.model
+
+            # 检查关键参数的梯度
+            grad_info = []
+
+            # cross_modal_attention (v12)
+            if hasattr(model, 'cross_modal_attention') and model.cross_modal_attention is not None:
+                cma_grad_norms = []
+                for name, param in model.cross_modal_attention.named_parameters():
+                    if param.grad is not None:
+                        cma_grad_norms.append(param.grad.norm().item())
+                if cma_grad_norms:
+                    grad_info.append(f"  cross_modal_attention grad norm: {sum(cma_grad_norms)/len(cma_grad_norms):.6f} (avg of {len(cma_grad_norms)} params)")
+                else:
+                    grad_info.append(f"  cross_modal_attention grad:      All None!")
+
+            # infonce_log_inv_temp
+            if hasattr(model, 'infonce_log_inv_temp') and model.infonce_log_inv_temp.grad is not None:
+                grad_norm = model.infonce_log_inv_temp.grad.norm().item()
+                grad_info.append(f"  infonce_log_inv_temp grad norm: {grad_norm:.6f}")
+            else:
+                grad_info.append(f"  infonce_log_inv_temp grad:      None!")
+
+            # content_attention
+            if hasattr(model, 'content_attention') and model.content_attention is not None:
+                ca_grad_norms = []
+                for name, param in model.content_attention.named_parameters():
+                    if param.grad is not None:
+                        ca_grad_norms.append(param.grad.norm().item())
+                if ca_grad_norms:
+                    grad_info.append(f"  content_attention grad norm:    {sum(ca_grad_norms)/len(ca_grad_norms):.6f} (avg of {len(ca_grad_norms)} params)")
+                else:
+                    grad_info.append(f"  content_attention grad:         All None!")
+
+            # cmp_projection
+            if hasattr(model, 'cmp_projection') and model.cmp_projection is not None:
+                cp_grad_norms = []
+                for name, param in model.cmp_projection.named_parameters():
+                    if param.grad is not None:
+                        cp_grad_norms.append(param.grad.norm().item())
+                if cp_grad_norms:
+                    grad_info.append(f"  cmp_projection grad norm:       {sum(cp_grad_norms)/len(cp_grad_norms):.6f} (avg of {len(cp_grad_norms)} params)")
+                else:
+                    grad_info.append(f"  cmp_projection grad:            All None!")
+
+            print("\n[6] Gradient norms after backward:")
+            for info in grad_info:
+                print(info)
+
+            # 检查是否有梯度为 0 或 None 的情况
+            has_issue = any("None" in info or "0.000000" in info for info in grad_info)
+            if has_issue:
+                print("\n⚠️  WARNING: Some gradients are None or zero!")
+            else:
+                print("\n✓ All key gradients are non-zero")
+
+            print(f"{'='*60}\n")
+
     # Clip gradients if specified
     # 根据 online 模式选择需要 clip 的参数
     if online and online_optimizer is not None:
