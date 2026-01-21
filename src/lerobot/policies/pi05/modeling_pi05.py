@@ -546,6 +546,8 @@ def contrastive_loss_with_structure(
         z1: Tensor,
         z2: Tensor,
         z2_original: Tensor,
+        bilinear_U: nn.Module = None,
+        bilinear_V: nn.Module = None,
         temperature: float = 0.07,
         temperature_structure: float = 0.07,
         top_k: int = 16,
@@ -557,7 +559,7 @@ def contrastive_loss_with_structure(
         log_interval: int = 10,
 ) -> Tensor:
     """对比学习损失函数，包含三个组件：
-    1. InfoNCE 对齐损失：让正样本对 (z1[i], z2[i]) 靠近（使用余弦相似度）
+    1. v9 Bilinear 对齐损失：score = (z1 @ U) @ (z2 @ V).T，不要求 z1 ≈ z2
     2. 结构保持损失：使用 Soft Rank 方法保持 z2 的前 top_k 个最近邻排序一致性
     3. 防坍缩损失：variance + covariance 防止表示空间坍缩
 
@@ -565,16 +567,17 @@ def contrastive_loss_with_structure(
         z1: First representation [batch, dim] or [batch, num_tokens, dim]
         z2: Second representation [batch, dim] or [batch, num_tokens, dim]
         z2_original: z2 的原始输入，用于计算原始距离排序
-                     例如 actions [batch, attn_act_len, action_dim]
+        bilinear_U: v9 Bilinear 投影层 z1 -> [batch, rank]
+        bilinear_V: v9 Bilinear 投影层 z2 -> [batch, rank]
         temperature: InfoNCE 温度参数
-        temperature_structure: 结构保持损失的温度参数（用于 Softmax 概率分布）
+        temperature_structure: 结构保持损失的温度参数
         top_k: 保持前 k 个最近邻的排序
         lambda_align: 对齐损失权重
         lambda_structure: 结构保持损失权重
         lambda_anticollapse: 防坍缩损失权重
         gamma: Variance loss 的目标标准差
         eps: 数值稳定性常数
-        log_interval: 每隔多少步打印一次日志（默认每10步）
+        log_interval: 每隔多少步打印一次日志
 
     Returns:
         总损失值（标量张量）
@@ -597,16 +600,21 @@ def contrastive_loss_with_structure(
     batch_size = z1_flat.shape[0]
     dim = z1_flat.shape[-1]
 
-    # ========== 1. InfoNCE 对齐损失（加权版本，避免与 Structure Loss 冲突）==========
-    # 归一化 embeddings 用于稳定计算
-    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # [batch_size, dim]
-    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # [batch_size, dim]
-    
-    # 计算相似度矩阵（使用余弦相似度）
-    similarity_matrix = torch.matmul(z1_norm, z2_norm.T)  # [batch_size, batch_size]
-    
-    # 对角线是正样本对的相似度
-    pos_similarity = torch.diag(similarity_matrix)  # [batch_size]
+    # ========== 1. v9 Bilinear 对齐损失 ==========
+    # 核心：用 Bilinear 打分替代 cosine similarity
+    # score = (z1 @ U) @ (z2 @ V).T，学习配对关系而不要求 z1 ≈ z2
+    if bilinear_U is not None and bilinear_V is not None:
+        z1_proj = bilinear_U(z1_flat)  # [batch_size, rank]
+        z2_proj = bilinear_V(z2_flat)  # [batch_size, rank]
+        score_matrix = torch.matmul(z1_proj, z2_proj.T)  # [batch_size, batch_size]
+    else:
+        # 兼容旧代码
+        z1_norm = F.normalize(z1_flat, p=2, dim=-1)
+        z2_norm = F.normalize(z2_flat, p=2, dim=-1)
+        score_matrix = torch.matmul(z1_norm, z2_norm.T)
+
+    # 对角线是正样本对的分数
+    pos_scores = torch.diag(score_matrix)  # [batch_size]
     
     # ========== 计算原空间距离用于加权 ==========
     # 从 z2_original 计算原始表示（用于计算原空间距离）
@@ -644,28 +652,33 @@ def contrastive_loss_with_structure(
     weights[eye_mask] = 1.0  # 正样本权重为 1（不影响正样本）
     
     # 应用温度参数
-    pos_similarity_scaled = pos_similarity / temperature  # [batch_size]
-    
-    # 加权 InfoNCE Loss: 正样本权重为 1（不加权），负样本加权
-    # 数学形式: -log(exp(pos_sim/T) / (exp(pos_sim/T) + sum(w_ij * exp(neg_sim/T))))
-    # 正样本参与计算但权重为 1，保持标准 InfoNCE 形式
-    logits = similarity_matrix / temperature  # [batch_size, batch_size]
+    pos_scores_scaled = pos_scores / temperature  # [batch_size]
+
+    # v9 Bilinear InfoNCE Loss
+    logits = score_matrix / temperature  # [batch_size, batch_size]
     with torch.no_grad():
-        B = similarity_matrix.size(0)
-        pos = pos_similarity.mean().item()
-        neg = (similarity_matrix.sum() - pos_similarity.sum()) / (B * (B - 1))
-        print("pos:", pos, "neg:", neg, "gap:", pos - neg)
-    # 对所有样本应用权重：logits_ij = logits_ij + log(weights_ij)
-    # 正样本权重为 1，所以 log(1) = 0，正样本 logits 不变
-    # 负样本权重 < 1，所以 log(weights) < 0，负样本 logits 减小
+        B = score_matrix.size(0)
+        pos = pos_scores.mean().item()
+        neg = (score_matrix.sum() - pos_scores.sum()) / (B * (B - 1))
+        score_min = score_matrix.min().item()
+        score_max = score_matrix.max().item()
+        score_std = score_matrix.std().item()
+        print(f"pos: {pos:.4f}, neg: {neg:.4f}, gap: {pos - neg:.4f} | range: [{score_min:.2f}, {score_max:.2f}], std: {score_std:.2f}")
+
+    # 加权 logits
     weighted_logits = logits + torch.log(weights + eps)  # [batch_size, batch_size]
-    
-    # 对所有样本（包括正样本）计算 logsumexp
-    log_sum_exp = torch.logsumexp(weighted_logits, dim=-1)  # [batch_size]
-    
-    # 损失 = -pos_sim/T + log(exp(pos_sim/T) + sum(weighted_neg))
-    align_loss = -pos_similarity_scaled + log_sum_exp  # [batch_size]
-    align_loss = torch.mean(align_loss)  # scalar
+
+    # 双向 InfoNCE 损失 (CLIP 风格)
+    # 方向1：z1 → z2（对行 softmax）- 给定观察，找对应的动作
+    log_sum_exp_row = torch.logsumexp(weighted_logits, dim=-1)  # [batch_size]
+    loss_z1_to_z2 = -pos_scores_scaled + log_sum_exp_row  # [batch_size]
+
+    # 方向2：z2 → z1（对列 softmax）- 给定动作，找对应的观察
+    log_sum_exp_col = torch.logsumexp(weighted_logits, dim=0)  # [batch_size]
+    loss_z2_to_z1 = -pos_scores_scaled + log_sum_exp_col  # [batch_size]
+
+    # 组合双向损失
+    align_loss = (torch.mean(loss_z1_to_z2) + torch.mean(loss_z2_to_z1)) / 2
 
     # ========== 2. 结构保持损失（前 k 个排序） ==========
     # 复用 InfoNCE 部分已计算的原空间距离
@@ -689,12 +702,8 @@ def contrastive_loss_with_structure(
         # 对每个样本，找到前 k 个最近邻的索引（在原始空间中）
         _, orig_knn_indices = torch.topk(orig_distances, k=max_k, dim=-1, largest=False)  # [batch_size, max_k]
         
-        # 计算学习后的距离矩阵（使用余弦距离，与 InfoNCE 对齐损失保持一致）
-        # 重用 InfoNCE 部分已计算的 z2_norm
-        # 计算余弦相似度矩阵
-        learned_similarity = torch.matmul(z2_norm, z2_norm.T)  # [batch_size, batch_size]
-        # 转换为余弦距离：distance = 1 - similarity（距离越小，相似度越大）
-        learned_distances = 1.0 - learned_similarity  # [batch_size, batch_size]
+        # 计算学习后的距离矩阵（使用 L2 距离）
+        learned_distances = torch.cdist(z2_flat, z2_flat, p=2)  # [batch_size, batch_size]
         
         # 对于每个样本，使用 Soft Rank 方法保持排序一致性
         # Soft Rank: 通过可微排序直接优化排序一致性，比 KL 散度更直接有效
@@ -805,13 +814,13 @@ def contrastive_loss_with_structure(
         weighted_structure_val = weighted_structure_loss.item()
         weighted_anticollapse_val = weighted_anticollapse_loss.item()
         
-        # 计算正样本余弦相似度平均值
-        pos_sim_mean = pos_similarity.mean().item()
+        # 计算正样本分数平均值（v9 Bilinear 分数，不是余弦相似度）
+        pos_sim_mean = pos_scores.mean().item()
         
         print(f"\n[Step {step}] Contrastive Loss Breakdown:")
         print(f"  ├─ Align Loss (InfoNCE):")
         print(f"  │   raw: {align_val:.6f}, weighted (×{lambda_align:.2f}): {weighted_align_val:.6f}")
-        print(f"  │   └─ Positive similarity (avg): {pos_sim_mean:.4f}")
+        print(f"  │   └─ Positive score (avg): {pos_sim_mean:.4f}")
         print(f"  ├─ Structure Loss (top-{top_k} ranking, soft-rank L1):")
         print(f"  │   raw: {structure_val:.6f}, weighted (×{lambda_structure:.2f}): {weighted_structure_val:.6f}")
         print(f"  │   temperature: {temperature_structure:.3f}")
@@ -1446,6 +1455,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             nn.Linear(paligemma_config.width, action_expert_config.width),
         )
 
+        # v9: Bilinear 对比学习
+        # 核心思想：z1（观察）和 z2（动作）不需要相似，只需要能判断是否配对
+        # 打分函数：score = (z1 @ U) @ (z2 @ V).T
+        # 使用低秩分解减少参数：1024x1024 → 1024x256 + 1024x256
+        bilinear_rank = 256
+        self.bilinear_U = nn.Linear(action_expert_config.width, bilinear_rank, bias=False)
+        self.bilinear_V = nn.Linear(action_expert_config.width, bilinear_rank, bias=False)
+        nn.init.normal_(self.bilinear_U.weight, std=0.01)
+        nn.init.normal_(self.bilinear_V.weight, std=0.01)
+
+        # 可学习温度参数
+        import math
+        self.infonce_log_inv_temp = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -1826,20 +1848,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         #     gamma=gamma,
         # )
 
-        cmp_vec_0 = self.share_projection(cmp_vec_0)
-        cmp_vec_1 = self.share_projection(cmp_vec_1)
-        # 使用基于正负样本对的对比学习损失（Listwise Ranking with KL divergence）
+        # v10: 双向 Bilinear 对比学习 + 增强反坍缩
+        learned_temperature = torch.exp(-self.infonce_log_inv_temp)
         loss_scalar = contrastive_loss_with_structure(
                         z1=cmp_vec_0,                    # [batch, hidden_dim]
                         z2=cmp_vec_1,                    # [batch, hidden_dim]
                         z2_original=selected_actions,     # [batch, attn_act_len, action_dim]
-                        temperature=0.07,                # InfoNCE 温度
-                        temperature_structure=0.07,        # 结构保持损失温度（用于 Softmax）
-                        top_k=16,                         # 保持前 k 个排序
-                        lambda_align=5.0,                # 对齐损失权重
-                        lambda_structure=5.0,            # 结构保持损失权重
-                        lambda_anticollapse=1.0,         # 防坍缩损失权重
-                        gamma=0.4,                      # variance 目标标准差
+                        bilinear_U=self.bilinear_U,      # v9: Bilinear 投影
+                        bilinear_V=self.bilinear_V,      # v9: Bilinear 投影
+                        temperature=learned_temperature,  # 可学习温度
+                        temperature_structure=0.5,
+                        top_k=16,
+                        lambda_align=3.0,                # 降低：给 anticollapse 更多空间
+                        lambda_structure=3.0,            # 降低：平衡各项 loss
+                        lambda_anticollapse=5.0,         # 增大：防止坍缩
+                        gamma=0.4,
                     )
 
         # 将标量损失扩展为 [batch_size, 1, action_dim] 以匹配 forward 的返回格式

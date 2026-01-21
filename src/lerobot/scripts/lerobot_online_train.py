@@ -1,5 +1,10 @@
 #!/usr/bin/env python
 
+import sys
+from pathlib import Path
+# 确保使用当前项目的 lerobot 包 (src 目录)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
