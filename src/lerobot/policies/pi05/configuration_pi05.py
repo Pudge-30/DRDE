@@ -153,7 +153,10 @@ class PI05Config(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
+    def observation_delta_indices(self) -> list[int] | None:
+        """返回 [0, attn_act_len]，用于三元因果链：obs_t → action_t → obs_{t+k}"""
+        if self.attn_act_len > 0:
+            return [0, self.attn_act_len]
         return None
 
     @property
