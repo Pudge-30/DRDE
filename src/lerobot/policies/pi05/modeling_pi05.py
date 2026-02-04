@@ -618,32 +618,32 @@ class ITMHead(nn.Module):
         device = z1.device  # 当前设备
 
         # 正样本：(z1_i, z2_i)
-        pos_logits = self.forward(z1, z2)  # [B] 正样本匹配分数
-        pos_labels = torch.ones(batch_size, device=device)  # 正样本标签=1
+        pos_logits = self.forward(z1, z2)  # [B]
+        pos_labels = torch.ones(batch_size, device=device)
 
         if neg_z2 is not None:
             # ===== GT 时序错位负样本（替换 batch cross-pair）=====
             # 使用 action-distance soft label：距离近 → 不推太远，距离远 → 推远
-            neg_logits = self.forward(z1, neg_z2)  # [B] 负样本匹配分数
+            neg_logits = self.forward(z1, neg_z2)  # [B]
 
             # 计算 soft label
             if neg_distance is not None:
                 with torch.no_grad():
                     # 计算 scale：使用 action_distances 的 median，或 fallback 到固定值
-                    if action_distances is not None:  # L1 使用 action 距离做尺度
+                    if action_distances is not None:
                         eps = 1e-6
-                        eye_mask = torch.eye(batch_size, dtype=torch.bool, device=device)  # 对角线 mask
-                        non_diag = action_distances[~eye_mask]  # 去除自距离
-                        scale = non_diag.median().detach() + eps  # 使用 median 作为尺度
+                        eye_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+                        non_diag = action_distances[~eye_mask]
+                        scale = non_diag.median().detach() + eps
                     else:
                         scale = 1.0  # L2 (obs) 没有 action_distances，用固定 scale
 
                     # soft_label = exp(-distance / (scale × beta))
                     # distance 小 → label 接近 1（不推远），distance 大 → label 接近 0（推远）
-                    neg_labels = torch.exp(-neg_distance / (scale * soft_label_beta))  # 软负标签，根据负样本距离生成一对距离敏感的标签，用于计算负样本的BCE
+                    neg_labels = torch.exp(-neg_distance / (scale * soft_label_beta))
 
                     # Debug logging (每 100 次调用打印一次)
-                    self._log_counter += 1  # 调试计数器累加
+                    self._log_counter += 1
                     if self._log_counter % 100 == 0:
                         label_type = "L1" if action_distances is not None else "L2"
                         print(f"[ITMHead {label_type}] call={self._log_counter}, "
@@ -656,32 +656,29 @@ class ITMHead(nn.Module):
                               f"max={neg_labels.max().item():.4f}")
             else:
                 # 没有 distance 信息，回退到硬标签
-                neg_labels = torch.zeros(batch_size, device=device)  # 硬负标签=0
+                neg_labels = torch.zeros(batch_size, device=device)
 
-            # 正样本二分类损失（logit + label=1）
-            pos_loss = F.binary_cross_entropy_with_logits(pos_logits, pos_labels)  # 正样本 BCE
-            # 负样本逐样本损失（logit + soft label）
+            pos_loss = F.binary_cross_entropy_with_logits(pos_logits, pos_labels)
             neg_loss_per_sample = F.binary_cross_entropy_with_logits(
                 neg_logits, neg_labels, reduction='none'
-            )  # [B] 逐样本负样本 BCE
+            )  # [B]
 
             # 按 validity mask 屏蔽 episode 过短的样本
-            if neg_z2_valid is not None:  # 仅使用有效负样本
+            if neg_z2_valid is not None:
                 valid_mask = neg_z2_valid.float().to(device)
-                n_valid = valid_mask.sum().clamp(min=1.0)  # 防止除零
-                neg_loss = (neg_loss_per_sample * valid_mask).sum() / n_valid  # masked mean
+                n_valid = valid_mask.sum().clamp(min=1.0)
+                neg_loss = (neg_loss_per_sample * valid_mask).sum() / n_valid
             else:
-                neg_loss = neg_loss_per_sample.mean()  # 全量平均
+                neg_loss = neg_loss_per_sample.mean()
 
-            # 正负样本对等权平均得到 ITM 总损失
-            loss = (pos_loss + neg_loss) / 2.0  # 正负平均
+            loss = (pos_loss + neg_loss) / 2.0
 
             # 诊断信息
             with torch.no_grad():
-                pos_acc = (pos_logits > 0).float().mean().item()  # 正样本判真率
-                neg_acc = (neg_logits < 0).float().mean().item()  # 负样本判假率
-                n_valid_int = int(neg_z2_valid.sum().item()) if neg_z2_valid is not None else batch_size  # 有效数
-                avg_neg_soft_label = neg_labels.mean().item() if neg_distance is not None else 0.0  # 软标签均值
+                pos_acc = (pos_logits > 0).float().mean().item()
+                neg_acc = (neg_logits < 0).float().mean().item()
+                n_valid_int = int(neg_z2_valid.sum().item()) if neg_z2_valid is not None else batch_size
+                avg_neg_soft_label = neg_labels.mean().item() if neg_distance is not None else 0.0
 
             info = {
                 "pos_score": pos_logits.mean().item(),
@@ -717,7 +714,6 @@ class ForwardModel(nn.Module):
         )
 
     def forward(self, z1: Tensor, z2: Tensor) -> Tensor:
-        # 功能总结：预测 z3（残差式前向动力学），只学习 delta。
         delta = self.mlp(torch.cat([z1, z2], dim=-1))
         return z1 + delta
 
@@ -728,7 +724,6 @@ def _clamp_embedding_norm(z: Tensor, max_norm: float = 0.0) -> Tensor:
     max_norm <= 0 时直接返回原始 z（MEAN_STD 模式不需要 clamp）。
     max_norm > 0 时，norm 超过阈值的 embedding 等比缩放到 max_norm（QUANTILES 建议 32.0）。
     """
-    # 功能总结：限制 embedding 的 L2 范数，避免数值膨胀。
     if max_norm <= 0:
         return z
     z_norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -804,28 +799,28 @@ def contrastive_loss_with_structure(
     eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)  # 对角线 mask
 
     # 计算 z1/z2 内部相似度（用于监控）
-    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # z1 归一化
-    z1_sim = torch.matmul(z1_norm, z1_norm.T)  # 余弦相似度矩阵
-    z1_internal_sim = z1_sim[~eye_mask].mean().item()  # 去除对角线平均
+    z1_norm = F.normalize(z1_flat, p=2, dim=-1)
+    z1_sim = torch.matmul(z1_norm, z1_norm.T)
+    z1_internal_sim = z1_sim[~eye_mask].mean().item()
 
-    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # z2 归一化
-    z2_sim = torch.matmul(z2_norm, z2_norm.T)  # 余弦相似度矩阵
-    z2_internal_sim = z2_sim[~eye_mask].mean().item()  # 去除对角线平均
+    z2_norm = F.normalize(z2_flat, p=2, dim=-1)
+    z2_sim = torch.matmul(z2_norm, z2_norm.T)
+    z2_internal_sim = z2_sim[~eye_mask].mean().item()
 
     # ========== 1. 跨模态损失 (z1 vs z2) — ITM 三元因果链 ==========
     if itm_head is not None:
         # Flatten z3 for L2
-        z3_flat = None  # L2 正样本（obs_{t+k}）
+        z3_flat = None
         if z3 is not None:
             z3_flat = z3 if z3.dim() == 2 else z3.reshape(-1, z3.shape[-1])
 
         # Flatten z2_neg for L1 GT 时序错位负样本
-        z2_neg_flat = None  # L1 负样本（action 时序错位）
+        z2_neg_flat = None
         if z2_neg is not None:
             z2_neg_flat = z2_neg if z2_neg.dim() == 2 else z2_neg.reshape(-1, z2_neg.shape[-1])
 
         # Flatten z3_neg for L2 GT 远离 t+k 的负样本
-        z3_neg_flat = None  # L2 负样本（远离的未来观测）
+        z3_neg_flat = None
         if z3_neg is not None:
             z3_neg_flat = z3_neg if z3_neg.dim() == 2 else z3_neg.reshape(-1, z3_neg.shape[-1])
 
@@ -837,8 +832,8 @@ def contrastive_loss_with_structure(
         )
 
         # L2: action_t ↔ obs_{t+k} — GT 远离 t+k 的负样本
-        cross_loss_L2 = torch.tensor(0.0, device=z2.device)  # 默认无 L2
-        itm_info_2 = None  # L2 诊断信息
+        cross_loss_L2 = torch.tensor(0.0, device=z2.device)
+        itm_info_2 = None
         if z3_flat is not None:
             cross_loss_L2, itm_info_2 = itm_head.compute_loss(
                 z2_flat, z3_flat,
@@ -846,21 +841,20 @@ def contrastive_loss_with_structure(
                 neg_distance=z3_neg_distance,  # L2 obs 嵌入距离
             )
 
-        # 汇总跨模态损失（L1+L2）
         cross_loss = cross_loss_L1 + cross_loss_L2
 
         # 诊断用：从 ITM info 提取 gap 信息
         with torch.no_grad():
-            pos_mean = itm_info['pos_score']  # 正样本分数均值
-            neg_mean = (itm_info['neg_score_1'] + itm_info['neg_score_2']) / 2  # 负样本分数均值
-            cross_gap = pos_mean - neg_mean  # 正负差距
+            pos_mean = itm_info['pos_score']
+            neg_mean = (itm_info['neg_score_1'] + itm_info['neg_score_2']) / 2
+            cross_gap = pos_mean - neg_mean
 
     # ========== 2. 结构保持损失 ==========
-    orig_distances = action_distances.clone()  # 原始动作距离
-    orig_distances[eye_mask] = float('inf')  # 屏蔽自距离
-    max_k = min(top_k, batch_size - 1)  # 实际 k
-    total_pairs = 0  # 统计总对数
-    violated_pairs = 0  # 统计不一致对数
+    orig_distances = action_distances.clone()
+    orig_distances[eye_mask] = float('inf')
+    max_k = min(top_k, batch_size - 1)
+    total_pairs = 0
+    violated_pairs = 0
 
     if max_k <= 0:
         structure_loss = torch.tensor(0.0, device=z2.device, dtype=z2.dtype)
@@ -924,11 +918,10 @@ def contrastive_loss_with_structure(
 
     # ========== 总损失（使用动态权重）==========
     # intra_loss 已移除（不再使用同模态 RS-CL），仅保留 cross/structure/anticollapse
-    weighted_cross_loss = lambda_cross_eff * cross_loss  # 跨模态加权
-    weighted_structure_loss = lambda_structure * structure_loss  # 结构加权
-    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss  # 防坍缩加权
+    weighted_cross_loss = lambda_cross_eff * cross_loss
+    weighted_structure_loss = lambda_structure * structure_loss
+    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss
 
-    # 三项损失线性加权得到 CMP 总损失
     total_loss = weighted_cross_loss + weighted_structure_loss + weighted_anticollapse_loss
 
     # ========== 日志输出 ==========
@@ -2167,7 +2160,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         def encode_obs(imgs, img_msks):
             """将一组图像通过 VLM + ObsQueryBridge 编码为 z [B, 512]"""
-            # 1) 取前缀 embedding（图像+语言）
             prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                 imgs, img_msks, tokens, masks
             )
@@ -2190,12 +2182,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inter_embeds, _ = self._apply_checkpoint(
                 forward_partial_func, prefix_embs_with_cls, dummy_suffix_embs, att_4d, pos_ids
             )
-            # vlm_seq = inter_embeds[0]  # 原版：CMP 梯度回传到 VLM front 6 layers
-            # 5) 关键：CMP 梯度在此处截断，VLM 仅由 BC 更新
-            vlm_seq = inter_embeds[0].detach()  # 切断 CMP → VLM 梯度，BC 独占 VLM 更新
-            # 6) 通过 ObsQueryBridge 得到 z 表示
+            vlm_seq = inter_embeds[0]
             z = self.obs_query_bridge(vlm_seq).to(dtype=torch.float32)
-            # 7) 可选的 embedding 范数裁剪
             return _clamp_embedding_norm(z, self.config.embedding_max_norm)
 
         # ========== z1: obs_t ==========
@@ -2204,17 +2192,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             raise ValueError(f"Expected cmp_vec_0 to be 2D, got shape {cmp_vec_0.shape}")
 
         # ========== z2: action_t → ContentAttention → proj_z2 ==========
-        attn_act_len = self.content_attention.attn_act_len  # 取前几步动作
-        actions = self.sample_actions(images, img_masks, tokens, masks)  # 采样动作序列
-        origin_action_dim = self.config.output_features[ACTION].shape[0]  # 原始动作维度
-        selected_actions = actions[:, :attn_act_len, :origin_action_dim]  # 选取用于 CMP 的动作
-        cmp_vec_1_raw = self.content_attention(selected_actions)  # 动作聚合表征
-        # action 表征投影到 CMP 共享空间，并进行可选范数裁剪
+        attn_act_len = self.content_attention.attn_act_len
+        actions = self.sample_actions(images, img_masks, tokens, masks)
+        origin_action_dim = self.config.output_features[ACTION].shape[0]
+        selected_actions = actions[:, :attn_act_len, :origin_action_dim]
+        cmp_vec_1_raw = self.content_attention(selected_actions)
         cmp_vec_1 = _clamp_embedding_norm(self.proj_z2(cmp_vec_1_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
 
         # ========== z2_neg: 同 episode GT 时序错位负样本 ==========
-        cmp_vec_1_neg = None  # L1 负样本表征
-        neg_valid = None  # L1 负样本有效标记
+        cmp_vec_1_neg = None
+        neg_valid = None
         if neg_gt_actions is not None and neg_action_valid is not None:
             # neg_gt_actions: [B, att_len, action_dim]
             cmp_vec_1_neg_raw = self.content_attention(neg_gt_actions)
@@ -2227,8 +2214,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             cmp_vec_2 = encode_obs(future_images, future_img_masks)
 
         # ========== z3_neg: 同 episode 远离 t+k 的 GT obs（L2 负样本）==========
-        cmp_vec_2_neg = None  # z3_neg：远离未来观测
-        neg_future_valid_flag = None  # L2 负样本有效标记
+        cmp_vec_2_neg = None
+        neg_future_valid_flag = None
         if neg_future_images is not None and neg_future_img_masks is not None:
             cmp_vec_2_neg = encode_obs(neg_future_images, neg_future_img_masks)
             neg_future_valid_flag = neg_future_valid  # [B] bool
@@ -2240,7 +2227,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
 
         # ========== 计算 L2 负样本距离（obs 嵌入 L2 距离）==========
-        neg_future_distance = None  # L2 负样本距离
+        neg_future_distance = None
         if cmp_vec_2 is not None and cmp_vec_2_neg is not None:
             # [B] 每个样本的 obs 嵌入 L2 距离
             neg_future_distance = torch.norm(cmp_vec_2 - cmp_vec_2_neg, p=2, dim=-1)
@@ -2258,7 +2245,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                           f"max={neg_action_distance.max().item():.4f}")
 
         # ========== 调用 contrastive_loss_with_structure ==========
-        loss_scalar, cmp_loss_info = contrastive_loss_with_structure(  # CMP 主损失
+        loss_scalar, cmp_loss_info = contrastive_loss_with_structure(
             z1=cmp_vec_0,
             z2=cmp_vec_1,
             z2_original=selected_actions,
@@ -2275,11 +2262,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # ========== L_forward: 前向动力学预测 loss（cosine loss）==========
         # 用 cosine loss 而非 MSE：只关注方向预测，不受 embedding norm 膨胀影响
         if cmp_vec_2 is not None:  # z3 存在时才计算
-            # 仅更新 forward_model：输入与目标均 detach
             predicted_z3 = self.forward_model(cmp_vec_0.detach(), cmp_vec_1.detach())
             cos_sim = F.cosine_similarity(predicted_z3, cmp_vec_2.detach(), dim=-1)
             l_forward = (1.0 - cos_sim).mean()
-            # 将前向动力学损失叠加到 CMP 总损失
             loss_scalar = loss_scalar + l_forward
 
             with torch.no_grad():
@@ -2895,7 +2880,6 @@ class PI05Policy(PreTrainedPolicy):
         self._drift_chunk_ids: list[int] = []             # 对应 chunk index
         self._drift_segment_ids: list[int] = []           # 对应 segment index
         self._replan_count: int = 0                        # drift 触发 replan 的次数
-        self._force_replan_next: bool = False                 # 自适应步长：中等 drift 触发的延迟 replan 标志
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -3100,7 +3084,6 @@ class PI05Policy(PreTrainedPolicy):
         n_action_steps = self.config.n_action_steps
         n_segments = self.config.chunk_size // n_action_steps  # 50 // 10 = 5
         drift_threshold = getattr(self.config, 'replan_drift_threshold', 0.0)
-        drift_threshold_mid = getattr(self.config, 'replan_drift_threshold_mid', 0.0)
         replan_mode = getattr(self.config, 'replan_mode', 'drift')
 
         # ── fixed 模式：每 n_action_steps 步固定 replan（等价 baseline 行为） ──
@@ -3120,14 +3103,7 @@ class PI05Policy(PreTrainedPolicy):
                        and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None)
             trigger_replan = False  # drift 触发 replan 标志
 
-            # 检查上一段设置的延迟 replan 标志
-            if self._force_replan_next:
-                trigger_replan = True
-                self._force_replan_next = False
-                self._replan_count += 1
-                print(f"[Replan-deferred] chunk={self._current_chunk_idx}, "
-                      f"seg={self._chunk_segment_index}, replan #{self._replan_count}")
-            elif self._full_action_chunk is not None and self._chunk_segment_index < n_segments:
+            if self._full_action_chunk is not None and self._chunk_segment_index < n_segments:
                 # ---- 旧 chunk 还有剩余段：计算 stale ITM 和 drift ----
                 seg_idx = self._chunk_segment_index
                 start = seg_idx * n_action_steps
@@ -3159,21 +3135,14 @@ class PI05Policy(PreTrainedPolicy):
                         self._drift_chunk_ids.append(self._current_chunk_idx)
                         self._drift_segment_ids.append(seg_idx)
 
-                        # drift-based replan 判断（三级响应）
-                        drift_val = drift.mean().item()
-                        if drift_threshold > 0 and drift_val > drift_threshold:
-                            # 大 drift → 立即 replan
+                        # drift-based replan 判断
+                        if drift_threshold > 0 and drift.mean().item() > drift_threshold:
                             trigger_replan = True
                             self._replan_count += 1
-                            print(f"[Replan-immediate] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                                  f"drift={drift_val:.4f} > high={drift_threshold:.4f}, "
+                            print(f"[Replan] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"drift={drift.mean().item():.4f} > {drift_threshold:.4f}, "
                                   f"replan #{self._replan_count}")
-                        elif drift_threshold_mid > 0 and drift_val > drift_threshold_mid:
-                            # 中 drift → 用完当前段，下次强制 replan
-                            self._force_replan_next = True
-                            print(f"[Replan-scheduled] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                                  f"drift={drift_val:.4f} > mid={drift_threshold_mid:.4f}")
-                        if not trigger_replan:
+                        else:
                             # 不 replan 时，为下一段准备 predicted_z3_next
                             if seg_idx + 1 < n_segments:
                                 next_start = (seg_idx + 1) * n_action_steps

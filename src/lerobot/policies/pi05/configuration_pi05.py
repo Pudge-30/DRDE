@@ -92,14 +92,21 @@ class PI05Config(PreTrainedConfig):
     attn_act_len: int = 10       # SingleHeadContentAttention 的输入长度
     neg_chunk_size: int | None = None  # L1/L2 负样本采样跨度，None 时回退到 chunk_size
     cmp_pretrain: bool = False
-    replan_drift_threshold: float = 0.0  # >0 时启用 drift-based replan（high threshold，立即 replan）
-    replan_drift_threshold_mid: float = 0.0  # >0 时启用自适应步长（mid threshold，延迟一段后 replan）
+    replan_drift_threshold: float = 0.0  # >0 时启用 drift-based replan（建议 1.5x 训练 l_forward，如 0.10）
     replan_mode: str = "drift"  # "drift": drift-based replan; "fixed": 每 n_action_steps 步固定 replan (同 baseline)
-    embedding_max_norm: float = 0.0  # 0 = 关闭；>0 = 手动指定 clamp norm
+    embedding_max_norm: float = -1.0  # -1 = 自动（QUANTILES→32, MEAN_STD→0）；0 = 关闭；>0 = 手动指定
 
 
     def __post_init__(self):
         super().__post_init__()
+
+        # 自动根据归一化模式设置 embedding_max_norm
+        if self.embedding_max_norm < 0:
+            uses_quantiles = any(
+                v == NormalizationMode.QUANTILES or v == "QUANTILES"
+                for v in self.normalization_mapping.values()
+            )
+            self.embedding_max_norm = 32.0 if uses_quantiles else 0.0
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:

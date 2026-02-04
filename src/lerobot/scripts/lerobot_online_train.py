@@ -1327,13 +1327,12 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
     _attn_val = getattr(cfg.policy, "attn_act_len", None)
     if _attn_val is not None and _attn_val > 0:
-        _neg_chunk_size = int(getattr(cfg.policy, "neg_chunk_size", cfg.policy.chunk_size))
         training_dataset.neg_action_config = {
-            "chunk_size": max(1, _neg_chunk_size),
+            "chunk_size": cfg.policy.chunk_size,
             "att_len": _attn_val,
         }
         logging.info(
-            f"[CMP] neg_action_config set: chunk_size={max(1, _neg_chunk_size)}, "
+            f"[CMP] neg_action_config set: chunk_size={cfg.policy.chunk_size}, "
             f"att_len={_attn_val}"
         )
     else:
