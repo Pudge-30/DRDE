@@ -1324,6 +1324,20 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # The online dataset will be used for collecting new episodes
     training_dataset = offline_dataset if offline_dataset is not None else online_dataset
 
+    # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
+    _attn_val = getattr(cfg.policy, "attn_act_len", None)
+    if _attn_val is not None and _attn_val > 0:
+        training_dataset.neg_action_config = {
+            "chunk_size": cfg.policy.chunk_size,
+            "att_len": _attn_val,
+        }
+        logging.info(
+            f"[CMP] neg_action_config set: chunk_size={cfg.policy.chunk_size}, "
+            f"att_len={_attn_val}"
+        )
+    else:
+        logging.warning(f"[CMP] neg_action_config NOT set! attn_act_len={_attn_val}")
+
     # Create policy
     if is_main_process:
         logging.info("Creating policy")
@@ -1334,6 +1348,29 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     )
 
     accelerator.wait_for_everyone()
+
+    # ===== 配置对齐验证：训练伊始打印关键配置 =====
+    if is_main_process:
+        logging.info("=" * 60)
+        logging.info("CONFIG ALIGNMENT CHECK")
+        logging.info("=" * 60)
+        logging.info(f"  pretrained_path:      {cfg.policy.pretrained_path}")
+        logging.info(f"  normalization_mapping: {policy.config.normalization_mapping}")
+        logging.info(f"  empty_cameras:         {policy.config.empty_cameras}")
+        logging.info(f"  device:                {policy.config.device}")
+        logging.info(f"  n_action_steps:        {policy.config.n_action_steps}")
+        logging.info(f"  chunk_size:            {policy.config.chunk_size}")
+        logging.info(f"  input_features:        {list(policy.config.input_features.keys())}")
+        logging.info(f"  output_features:       {list(policy.config.output_features.keys())}")
+        logging.info(f"  dtype:                 {policy.config.dtype}")
+        logging.info(f"  gradient_checkpointing:{policy.config.gradient_checkpointing}")
+        logging.info(f"  optimizer_lr:          {policy.config.optimizer_lr}")
+        logging.info(f"  scheduler_warmup:      {policy.config.scheduler_warmup_steps}")
+        logging.info(f"  scheduler_decay:       {policy.config.scheduler_decay_steps}")
+        logging.info(f"  attn_act_len:          {policy.config.attn_act_len}")
+        logging.info(f"  part_layer_num:        {policy.config.part_layer_num}")
+        logging.info(f"  cmp_pretrain:          {policy.config.cmp_pretrain}")
+        logging.info("=" * 60)
 
     # Create processors
     processor_kwargs = {}
@@ -1385,7 +1422,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
     # Log processor steps for debugging
     if is_main_process:
-        from lerobot.processor.normalize_processor import NormalizerProcessorStep
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
         processor_names = [type(step).__name__ for step in collect_preprocessor.steps]
         has_normalizer = any(isinstance(step, NormalizerProcessorStep) for step in collect_preprocessor.steps)
         logging.info(f"Collect preprocessor steps: {processor_names}")
@@ -1396,6 +1433,22 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         training_has_normalizer = any(isinstance(step, NormalizerProcessorStep) for step in preprocessor.steps)
         logging.info(f"Training preprocessor steps: {training_processor_names}")
         logging.info(f"Training preprocessor contains normalizer_processor: {training_has_normalizer}")
+
+        # 打印 preprocessor/postprocessor 实际使用的 norm_map
+        logging.info("=" * 60)
+        logging.info("PREPROCESSOR / POSTPROCESSOR NORM_MAP CHECK")
+        logging.info("=" * 60)
+        for step in preprocessor.steps:
+            if isinstance(step, NormalizerProcessorStep):
+                logging.info(f"  Preprocessor norm_map:  {step.norm_map}")
+                logging.info(f"  Preprocessor features:  {list(step.features.keys())}")
+                logging.info(f"  Preprocessor stats keys:{list(step._tensor_stats.keys()) if hasattr(step, '_tensor_stats') else 'N/A'}")
+        for step in postprocessor.steps:
+            if isinstance(step, UnnormalizerProcessorStep):
+                logging.info(f"  Postprocessor norm_map: {step.norm_map}")
+                logging.info(f"  Postprocessor features: {list(step.features.keys())}")
+                logging.info(f"  Postprocessor stats keys:{list(step._tensor_stats.keys()) if hasattr(step, '_tensor_stats') else 'N/A'}")
+        logging.info("=" * 60)
 
     # Create FillMissingActionContextProcessor for offline dataset training
     # Get action dimension from training dataset
@@ -1425,7 +1478,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
     # 创建 offline 优化器和调度器
     offline_optimizer = cfg.optimizer.build(offline_params)
-    offline_lr_scheduler = cfg.scheduler.build(offline_optimizer, cfg.steps) if cfg.scheduler is not None else None
+    offline_lr_scheduler = cfg.scheduler.build(offline_optimizer, cfg.online.train_steps_per_iteration) if cfg.scheduler is not None else None
 
     # 为了兼容性，保留 optimizer 和 lr_scheduler 变量（默认使用 offline）
     optimizer = offline_optimizer
@@ -1487,6 +1540,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # Create dataloaders for offline and online datasets
+    # neg_action_config 需要通过 worker_init_fn 注入到每个 worker 的 dataset 副本中
+    _neg_action_cfg = getattr(training_dataset, "neg_action_config", None)
+
+    def _worker_init_fn(worker_id):
+        """在每个 DataLoader worker 进程中注入 neg_action_config。"""
+        if _neg_action_cfg is not None:
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None:
+                worker_info.dataset.neg_action_config = _neg_action_cfg
+
     def create_dataloader(dataset, online=False):
         """创建 DataLoader。
 
@@ -1524,6 +1587,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             pin_memory=device.type == "cuda",
             drop_last=False,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
+            worker_init_fn=_worker_init_fn,
         )
 
     # Create dataloader for offline dataset (if exists)
@@ -1572,6 +1636,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     elif online_dataloader is not None:
         policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler, online_dataloader = prepared
         online_dl_iter = cycle(online_dataloader)
+
     else:
         policy, offline_optimizer, offline_lr_scheduler, online_optimizer, online_lr_scheduler = prepared
 

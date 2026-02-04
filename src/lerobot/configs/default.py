@@ -58,7 +58,7 @@ class EvalConfig:
     use_async_envs: bool = False
     # `max_episodes_rendered` specifies the maximum number of episodes to render into videos.
     # Set to 0 to disable video rendering (faster startup for quick testing).
-    max_episodes_rendered: int = 0
+    max_episodes_rendered: int = 10
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:

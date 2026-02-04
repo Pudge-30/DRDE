@@ -239,6 +239,26 @@ def rollout(
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
     }
+    # Fresh ITM scores: 每次生成新 chunk 时一个值
+    if hasattr(policy, '_itm_scores') and len(policy._itm_scores) > 0:
+        ret["itm_scores"] = torch.stack(policy._itm_scores, dim=1)  # (batch, n_fresh_chunks)
+        print(f"[ITM-fresh] rollout: {len(policy._itm_scores)} fresh scores, shape: {ret['itm_scores'].shape}")
+    # Stale ITM scores: 旧 chunk 的后续段在新 obs 下的 ITM 分数
+    if hasattr(policy, '_stale_itm_scores') and len(policy._stale_itm_scores) > 0:
+        ret["stale_itm_scores"] = torch.stack(policy._stale_itm_scores, dim=1)  # (batch, n_stale_total)
+        ret["stale_itm_chunk_ids"] = policy._stale_itm_chunk_ids    # list[int]
+        ret["stale_itm_segment_ids"] = policy._stale_itm_segment_ids  # list[int]
+        print(f"[ITM-stale] rollout: {len(policy._stale_itm_scores)} stale scores, shape: {ret['stale_itm_scores'].shape}")
+    # Drift scores: ForwardModel 预测 obs 与实际 obs 的 cosine distance
+    if hasattr(policy, '_drift_scores') and len(policy._drift_scores) > 0:
+        ret["drift_scores"] = torch.stack(policy._drift_scores, dim=1)  # (batch, n_drift)
+        ret["drift_chunk_ids"] = policy._drift_chunk_ids    # list[int]
+        ret["drift_segment_ids"] = policy._drift_segment_ids  # list[int]
+        print(f"[Drift] rollout: {len(policy._drift_scores)} drift scores, shape: {ret['drift_scores'].shape}")
+    if hasattr(policy, '_replan_count'):
+        ret["replan_count"] = policy._replan_count
+        if policy._replan_count > 0:
+            print(f"[Replan] rollout: {policy._replan_count} replans triggered")
     if return_observations:
         stacked_observations = {}
         # Only stack keys that start with "observation."
@@ -291,6 +311,9 @@ def eval_policy(
     start = time.time()
     policy.eval()
 
+    # ITM score 收集用的 chunk 步长（predict_action_chunk 每 n_action_steps 步调用一次）
+    chunk_step_size = getattr(getattr(policy, 'config', None), 'n_action_steps', 50)
+
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
@@ -300,6 +323,11 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_episode_itm_scores = []  # per-episode fresh ITM score sequences
+    all_episode_stale_itm = []   # per-episode stale ITM: list of list[dict]
+    all_episode_drift = []       # per-episode drift: list of dict[chunk_id -> [{segment, drift}]]
+    all_ep_steps = []            # per-episode 实际步数 (done_index + 1)
+    all_replan_counts = []       # per-rollout replan 触发次数
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -363,10 +391,78 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        # 收集 per-episode 实际步数
+        all_ep_steps.extend((done_indices + 1).tolist())
+        # 收集 per-rollout replan 次数
+        if hasattr(policy, '_replan_count'):
+            all_replan_counts.append(policy._replan_count)
+
         if seeds:
             all_seeds.extend(seeds)
         else:
             all_seeds.append(None)
+
+        # 收集每个 episode 的 fresh ITM score 序列（每生成新 chunk 一个值）
+        if "itm_scores" in rollout_data:
+            itm_data = rollout_data["itm_scores"]  # (batch, n_fresh_chunks)
+            n_fresh = itm_data.shape[1]
+            for ep_ix in range(itm_data.shape[0]):
+                ep_steps = done_indices[ep_ix].item() + 1
+                # 纯收集模式: chunk_size 步生成一次新 chunk
+                chunk_size = getattr(getattr(policy, 'config', None), 'chunk_size', 50)
+                ep_fresh_chunks = min((ep_steps + chunk_size - 1) // chunk_size, n_fresh) if chunk_size > 0 else n_fresh
+                all_episode_itm_scores.append(itm_data[ep_ix, :ep_fresh_chunks].tolist())
+            print(f"[ITM-fresh] batch {batch_ix}: {itm_data.shape[0]} eps, total: {len(all_episode_itm_scores)}")
+
+        # 收集每个 episode 的 stale ITM（按 chunk 分组）
+        if "stale_itm_scores" in rollout_data:
+            stale_data = rollout_data["stale_itm_scores"]  # (batch, n_stale_total)
+            chunk_ids = rollout_data["stale_itm_chunk_ids"]     # list[int], len=n_stale_total
+            segment_ids = rollout_data["stale_itm_segment_ids"] # list[int], len=n_stale_total
+            n_stale = stale_data.shape[1]
+            chunk_size = getattr(getattr(policy, 'config', None), 'chunk_size', 50)
+            for ep_ix in range(stale_data.shape[0]):
+                ep_steps = done_indices[ep_ix].item() + 1
+                # 按 chunk 分组 stale ITM 分数
+                ep_stale_by_chunk: dict[int, list[dict]] = {}
+                for s_idx in range(n_stale):
+                    # 该 stale 对应的全局 step = chunk_idx * chunk_size + segment_idx * n_action_steps
+                    c_id, seg_id = chunk_ids[s_idx], segment_ids[s_idx]
+                    global_step = c_id * chunk_size + seg_id * chunk_step_size
+                    if global_step >= ep_steps:
+                        break  # 超过 episode 结束步
+                    if c_id not in ep_stale_by_chunk:
+                        ep_stale_by_chunk[c_id] = []
+                    ep_stale_by_chunk[c_id].append({
+                        "segment": seg_id,
+                        "score": stale_data[ep_ix, s_idx].item(),
+                    })
+                all_episode_stale_itm.append(ep_stale_by_chunk)
+            print(f"[ITM-stale] batch {batch_ix}: {stale_data.shape[0]} eps, total: {len(all_episode_stale_itm)}")
+
+        # 收集每个 episode 的 drift（按 chunk 分组，与 stale ITM 结构一致）
+        if "drift_scores" in rollout_data:
+            drift_data = rollout_data["drift_scores"]  # (batch, n_drift)
+            drift_chunk_ids = rollout_data["drift_chunk_ids"]
+            drift_segment_ids = rollout_data["drift_segment_ids"]
+            n_drift = drift_data.shape[1]
+            chunk_size = getattr(getattr(policy, 'config', None), 'chunk_size', 50)
+            for ep_ix in range(drift_data.shape[0]):
+                ep_steps = done_indices[ep_ix].item() + 1
+                ep_drift_by_chunk: dict[int, list[dict]] = {}
+                for d_idx in range(n_drift):
+                    c_id, seg_id = drift_chunk_ids[d_idx], drift_segment_ids[d_idx]
+                    global_step = c_id * chunk_size + seg_id * chunk_step_size
+                    if global_step >= ep_steps:
+                        break
+                    if c_id not in ep_drift_by_chunk:
+                        ep_drift_by_chunk[c_id] = []
+                    ep_drift_by_chunk[c_id].append({
+                        "segment": seg_id,
+                        "drift": drift_data[ep_ix, d_idx].item(),
+                    })
+                all_episode_drift.append(ep_drift_by_chunk)
+            print(f"[Drift] batch {batch_ix}: {drift_data.shape[0]} eps, total: {len(all_episode_drift)}")
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -419,6 +515,48 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
+    has_fresh_itm = len(all_episode_itm_scores) > 0
+    has_stale_itm = len(all_episode_stale_itm) > 0
+    has_drift = len(all_episode_drift) > 0
+    if has_fresh_itm:
+        print(f"[ITM-fresh] Final: {len(all_episode_itm_scores)} eps, mean: {np.mean([np.mean(s) for s in all_episode_itm_scores]):.4f}")
+    if has_stale_itm:
+        all_stale_vals = [r["score"] for ep in all_episode_stale_itm for chunk_records in ep.values() for r in chunk_records]
+        if all_stale_vals:
+            print(f"[ITM-stale] Final: {len(all_episode_stale_itm)} eps, {len(all_stale_vals)} stale scores, mean: {np.mean(all_stale_vals):.4f}")
+    if has_drift:
+        all_drift_vals = [r["drift"] for ep in all_episode_drift for chunk_records in ep.values() for r in chunk_records]
+        if all_drift_vals:
+            print(f"[Drift] Final: {len(all_episode_drift)} eps, {len(all_drift_vals)} drift scores, mean: {np.mean(all_drift_vals):.4f}")
+
+    def _build_episode_metrics(i: int) -> dict:
+        """构建第 i 个 episode 的 ITM + drift 数据字典"""
+        result = {}
+        if has_fresh_itm and i < len(all_episode_itm_scores):
+            result["fresh_itm_scores"] = all_episode_itm_scores[i]
+            result["fresh_itm_mean"] = float(np.mean(all_episode_itm_scores[i]))
+            result["fresh_itm_min"] = float(np.min(all_episode_itm_scores[i]))
+            # 保留旧字段兼容
+            result["itm_scores"] = all_episode_itm_scores[i]
+            result["itm_mean"] = result["fresh_itm_mean"]
+            result["itm_min"] = result["fresh_itm_min"]
+        if has_stale_itm and i < len(all_episode_stale_itm):
+            stale_by_chunk = all_episode_stale_itm[i]
+            # 转为 JSON 友好格式: {chunk_id: [{segment, score}, ...]}
+            result["stale_itm_by_chunk"] = {str(k): v for k, v in stale_by_chunk.items()}
+            all_stale = [r["score"] for records in stale_by_chunk.values() for r in records]
+            if all_stale:
+                result["stale_itm_mean"] = float(np.mean(all_stale))
+                result["stale_itm_min"] = float(np.min(all_stale))
+        if has_drift and i < len(all_episode_drift):
+            drift_by_chunk = all_episode_drift[i]
+            result["drift_by_chunk"] = {str(k): v for k, v in drift_by_chunk.items()}
+            all_d = [r["drift"] for records in drift_by_chunk.values() for r in records]
+            if all_d:
+                result["drift_mean"] = float(np.mean(all_d))
+                result["drift_max"] = float(np.max(all_d))
+        return result
+
     info = {
         "per_episode": [
             {
@@ -427,6 +565,8 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "n_steps": int(all_ep_steps[i]) if i < len(all_ep_steps) else None,
+                **_build_episode_metrics(i),
             }
             for i, (sum_reward, max_reward, success, seed) in enumerate(
                 zip(
@@ -438,6 +578,7 @@ def eval_policy(
                 )
             )
         ],
+        "replan_counts_per_rollout": all_replan_counts if all_replan_counts else None,
         "aggregated": {
             "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
             "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
@@ -579,9 +720,24 @@ class TaskMetrics(TypedDict):
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    ep_steps: list[int]                      # per-episode 实际步数 (done_index + 1)
+    replan_counts: list[int]                 # per-rollout replan 触发次数
+    itm_scores: list[list[float]]           # per-episode fresh ITM score sequences (兼容旧字段)
+    itm_means: list[float]                   # per-episode fresh ITM mean
+    itm_mins: list[float]                    # per-episode fresh ITM min
+    stale_itm_by_chunk: list[dict]           # per-episode stale ITM grouped by chunk
+    stale_itm_means: list[float]             # per-episode stale ITM mean
+    stale_itm_mins: list[float]              # per-episode stale ITM min
+    drift_by_chunk: list[dict]               # per-episode drift grouped by chunk
+    drift_means: list[float]                 # per-episode drift mean (cosine distance)
+    drift_maxs: list[float]                  # per-episode drift max
 
 
-ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
+ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths",
+            "ep_steps", "replan_counts",
+            "itm_scores", "itm_means", "itm_mins",
+            "stale_itm_by_chunk", "stale_itm_means", "stale_itm_mins",
+            "drift_by_chunk", "drift_means", "drift_maxs")
 
 
 def eval_one(
@@ -617,11 +773,52 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
+    # Fresh ITM
+    itm_scores_list = [ep.get("itm_scores", []) for ep in per_episode]
+    itm_means_list = [ep.get("itm_mean", 0.0) for ep in per_episode]
+    itm_mins_list = [ep.get("itm_min", 0.0) for ep in per_episode]
+    # Stale ITM
+    stale_by_chunk_list = [ep.get("stale_itm_by_chunk", {}) for ep in per_episode]
+    stale_means_list = [ep.get("stale_itm_mean", 0.0) for ep in per_episode]
+    stale_mins_list = [ep.get("stale_itm_min", 0.0) for ep in per_episode]
+    # Drift (ForwardModel cosine distance)
+    drift_by_chunk_list = [ep.get("drift_by_chunk", {}) for ep in per_episode]
+    drift_means_list = [ep.get("drift_mean", 0.0) for ep in per_episode]
+    drift_maxs_list = [ep.get("drift_max", 0.0) for ep in per_episode]
+    # Per-episode steps & replan counts
+    ep_steps_list = [ep.get("n_steps", 0) for ep in per_episode]
+    replan_counts_list = task_result.get("replan_counts_per_rollout", []) or []
+
+    has_fresh = any(len(s) > 0 for s in itm_scores_list)
+    has_stale = any(len(s) > 0 for s in stale_by_chunk_list)
+    has_drift = any(len(s) > 0 for s in drift_by_chunk_list)
+    if has_fresh:
+        print(f"[ITM-fresh] eval_one: {len(per_episode)} eps, mean range: [{min(itm_means_list):.4f}, {max(itm_means_list):.4f}]")
+    if has_stale:
+        valid_stale_means = [m for m, s in zip(stale_means_list, stale_by_chunk_list) if len(s) > 0]
+        if valid_stale_means:
+            print(f"[ITM-stale] eval_one: {len(per_episode)} eps, stale mean range: [{min(valid_stale_means):.4f}, {max(valid_stale_means):.4f}]")
+    if has_drift:
+        valid_drift_means = [m for m, s in zip(drift_means_list, drift_by_chunk_list) if len(s) > 0]
+        if valid_drift_means:
+            print(f"[Drift] eval_one: {len(per_episode)} eps, drift mean range: [{min(valid_drift_means):.4f}, {max(valid_drift_means):.4f}]")
+
     return TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
+        ep_steps=ep_steps_list,
+        replan_counts=replan_counts_list,
+        itm_scores=itm_scores_list,
+        itm_means=itm_means_list,
+        itm_mins=itm_mins_list,
+        stale_itm_by_chunk=stale_by_chunk_list,
+        stale_itm_means=stale_means_list,
+        stale_itm_mins=stale_mins_list,
+        drift_by_chunk=drift_by_chunk_list,
+        drift_means=drift_means_list,
+        drift_maxs=drift_maxs_list,
     )
 
 
