@@ -2182,7 +2182,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inter_embeds, _ = self._apply_checkpoint(
                 forward_partial_func, prefix_embs_with_cls, dummy_suffix_embs, att_4d, pos_ids
             )
-            vlm_seq = inter_embeds[0]
+            # vlm_seq = inter_embeds[0]  # 原版：CMP 梯度回传到 VLM front 6 layers
+            vlm_seq = inter_embeds[0].detach()  # 切断 CMP → VLM 梯度，BC 独占 VLM 更新
             z = self.obs_query_bridge(vlm_seq).to(dtype=torch.float32)
             return _clamp_embedding_norm(z, self.config.embedding_max_norm)
 
@@ -2880,6 +2881,7 @@ class PI05Policy(PreTrainedPolicy):
         self._drift_chunk_ids: list[int] = []             # 对应 chunk index
         self._drift_segment_ids: list[int] = []           # 对应 segment index
         self._replan_count: int = 0                        # drift 触发 replan 的次数
+        self._force_replan_next: bool = False                 # 自适应步长：中等 drift 触发的延迟 replan 标志
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -3084,6 +3086,7 @@ class PI05Policy(PreTrainedPolicy):
         n_action_steps = self.config.n_action_steps
         n_segments = self.config.chunk_size // n_action_steps  # 50 // 10 = 5
         drift_threshold = getattr(self.config, 'replan_drift_threshold', 0.0)
+        drift_threshold_mid = getattr(self.config, 'replan_drift_threshold_mid', 0.0)
         replan_mode = getattr(self.config, 'replan_mode', 'drift')
 
         # ── fixed 模式：每 n_action_steps 步固定 replan（等价 baseline 行为） ──
@@ -3103,7 +3106,14 @@ class PI05Policy(PreTrainedPolicy):
                        and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None)
             trigger_replan = False  # drift 触发 replan 标志
 
-            if self._full_action_chunk is not None and self._chunk_segment_index < n_segments:
+            # 检查上一段设置的延迟 replan 标志
+            if self._force_replan_next:
+                trigger_replan = True
+                self._force_replan_next = False
+                self._replan_count += 1
+                print(f"[Replan-deferred] chunk={self._current_chunk_idx}, "
+                      f"seg={self._chunk_segment_index}, replan #{self._replan_count}")
+            elif self._full_action_chunk is not None and self._chunk_segment_index < n_segments:
                 # ---- 旧 chunk 还有剩余段：计算 stale ITM 和 drift ----
                 seg_idx = self._chunk_segment_index
                 start = seg_idx * n_action_steps
@@ -3135,14 +3145,21 @@ class PI05Policy(PreTrainedPolicy):
                         self._drift_chunk_ids.append(self._current_chunk_idx)
                         self._drift_segment_ids.append(seg_idx)
 
-                        # drift-based replan 判断
-                        if drift_threshold > 0 and drift.mean().item() > drift_threshold:
+                        # drift-based replan 判断（三级响应）
+                        drift_val = drift.mean().item()
+                        if drift_threshold > 0 and drift_val > drift_threshold:
+                            # 大 drift → 立即 replan
                             trigger_replan = True
                             self._replan_count += 1
-                            print(f"[Replan] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                                  f"drift={drift.mean().item():.4f} > {drift_threshold:.4f}, "
+                            print(f"[Replan-immediate] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"drift={drift_val:.4f} > high={drift_threshold:.4f}, "
                                   f"replan #{self._replan_count}")
-                        else:
+                        elif drift_threshold_mid > 0 and drift_val > drift_threshold_mid:
+                            # 中 drift → 用完当前段，下次强制 replan
+                            self._force_replan_next = True
+                            print(f"[Replan-scheduled] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"drift={drift_val:.4f} > mid={drift_threshold_mid:.4f}")
+                        if not trigger_replan:
                             # 不 replan 时，为下一段准备 predicted_z3_next
                             if seg_idx + 1 < n_segments:
                                 next_start = (seg_idx + 1) * n_action_steps
