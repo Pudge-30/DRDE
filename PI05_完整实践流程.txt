@@ -1,0 +1,738 @@
+================================================================================
+                    π0.5 (Pi Zero Point Five) 完整实践流程
+                        LeRobot + LIBERO 训练和推理指南
+================================================================================
+
+作者：Claude
+日期：2025-10-25
+路径：/home/kemove/hyp/lerobot
+
+
+目录
+────────────────────────────────────────────────────────────────────────────
+1. 环境准备
+2. 数据集探索
+3. 推理测试（使用预训练模型）
+4. 微调训练
+5. 性能评估
+6. 故障排查
+7. 参考资源
+
+
+================================================================================
+步骤 1：环境准备
+================================================================================
+
+1.1 激活 Conda 环境
+────────────────────────────────────────────────────────────────────────────
+cd /home/kemove/hyp/lerobot
+conda activate lerobot
+
+
+1.2 配置 MuJoCo 渲染后端
+────────────────────────────────────────────────────────────────────────────
+# LIBERO 使用 MuJoCo 仿真，需要设置渲染后端
+export MUJOCO_GL=egl
+
+# 如果 egl 不工作，可以尝试：
+# export MUJOCO_GL=osmesa
+
+# 建议：将这个命令添加到 ~/.bashrc 中，永久生效：
+echo 'export MUJOCO_GL=egl' >> ~/.bashrc
+
+
+1.3 验证安装
+────────────────────────────────────────────────────────────────────────────
+# 验证 π0.5 模块
+python -c "from lerobot.policies.pi05 import PI05Policy; print('✓ π0.5 Policy OK')"
+
+# 验证 LIBERO 环境
+python -c "from lerobot.envs.libero import LiberoEnv; print('✓ LIBERO Environment OK')"
+
+# 验证 MuJoCo
+python -c "import mujoco; print(f'✓ MuJoCo version: {mujoco.__version__}')"
+
+# 验证 GPU（可选但推荐）
+python -c "import torch; print(f'✓ CUDA available: {torch.cuda.is_available()}'); print(f'  Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')"
+
+
+预期输出：
+────────────────────────────────────────────────────────────────────────────
+✓ π0.5 Policy OK
+✓ LIBERO Environment OK
+✓ MuJoCo version: 3.x.x
+✓ CUDA available: True
+  Device: NVIDIA GeForce RTX 4090 (或你的 GPU 型号)
+
+
+================================================================================
+步骤 2：数据集探索
+================================================================================
+
+2.1 查看数据集元信息
+────────────────────────────────────────────────────────────────────────────
+# 创建测试脚本
+cat > explore_libero_dataset.py << 'EOF'
+"""探索 LIBERO 数据集"""
+from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
+
+print("=" * 80)
+print("加载 LIBERO 数据集元数据...")
+print("=" * 80)
+
+# 加载元数据
+metadata = LeRobotDatasetMetadata("HuggingFaceVLA/libero")
+
+# 显示数据集信息
+print(f"\n【数据集基本信息】")
+print(f"  - 总剧集数: {metadata.info['total_episodes']}")
+print(f"  - 总帧数: {metadata.info['total_frames']}")
+print(f"  - 采样率: {metadata.info['fps']} FPS")
+print(f"  - 机器人类型: {metadata.info.get('robot_type', 'N/A')}")
+
+# 显示特征定义
+print(f"\n【数据特征】")
+for key, value in metadata.info['features'].items():
+    print(f"  - {key}: {value}")
+
+# 加载完整数据集
+print(f"\n{'=' * 80}")
+print("加载完整数据集（这可能需要几分钟，会下载数据到本地）...")
+dataset = LeRobotDataset("HuggingFaceVLA/libero")
+
+# 查看第一个样本
+print(f"\n数据集大小: {len(dataset)} 帧")
+sample = dataset[0]
+print(f"\n【第一个样本的数据结构】")
+for key in sorted(sample.keys()):
+    if hasattr(sample[key], 'shape'):
+        print(f"  - {key}: shape={sample[key].shape}, dtype={sample[key].dtype}")
+    else:
+        print(f"  - {key}: {sample[key]}")
+
+print(f"\n{'=' * 80}")
+print("✓ 数据集加载成功！")
+print("=" * 80)
+EOF
+
+# 运行脚本
+python explore_libero_dataset.py
+
+
+2.2 可视化数据集（可选）
+────────────────────────────────────────────────────────────────────────────
+# 使用 Rerun 可视化工具查看数据集
+lerobot-dataset-viz \
+    --repo-id HuggingFaceVLA/libero \
+    --episode-index 0
+
+# 注意：这会打开一个可视化窗口，显示摄像头画面和机器人轨迹
+
+
+预期结果：
+────────────────────────────────────────────────────────────────────────────
+- 数据集信息：1,693 个剧集，273,465 帧，10 FPS
+- 观测特征：observation.state (8维), observation.images.image, observation.images.image2
+- 动作特征：action (7维)
+
+
+================================================================================
+步骤 3：推理测试（使用预训练模型）
+================================================================================
+
+3.1 快速评估（2个剧集，验证环境）
+────────────────────────────────────────────────────────────────────────────
+# 确保渲染后端已设置
+export MUJOCO_GL=egl
+
+# 快速评估预训练的 π0.5 模型
+lerobot-eval \
+  --policy.path=lerobot/pi05_libero_finetuned \
+  --env.type=libero \
+  --env.task=libero_object \
+  --eval.batch_size=1 \
+  --eval.n_episodes=2 \
+  --policy.n_action_steps=10 \
+  --output_dir=./eval_logs/pi05_pretrained_quick_test
+
+# 查看评估结果
+cat eval_logs/pi05_pretrained_quick_test/eval_info.json
+
+
+预期输出：
+────────────────────────────────────────────────────────────────────────────
+Creating LIBERO envs | suites=['libero_object'] | n_envs(per task)=2
+Built vec env | suite=libero_object | task_id=0 | n_envs=2
+...
+Evaluating policy on libero_object tasks...
+Task 0: success_rate=100.0% (2/2)
+Task 1: success_rate=50.0% (1/2)
+...
+Average success rate: 85-95%
+
+
+3.2 用 Python 编写自定义评估脚本
+────────────────────────────────────────────────────────────────────────────
+cat > evaluate_pi05_inference.py << 'EOF'
+"""使用 π0.5 在 LIBERO 环境中推理"""
+import torch
+from lerobot.envs.factory import make_env
+from lerobot.policies.pi05 import PI05Policy
+from lerobot.policies.factory import make_pre_post_processors
+
+# 配置
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model_id = "lerobot/pi05_libero_finetuned"
+
+print(f"Device: {device}")
+print(f"Loading model: {model_id}")
+
+# 1. 加载模型
+policy = PI05Policy.from_pretrained(model_id)
+policy.to(device)
+policy.eval()
+
+# 2. 创建预处理器
+preprocess, postprocess = make_pre_post_processors(
+    policy.config,
+    model_id
+)
+
+# 3. 创建环境
+print("\nCreating LIBERO environment...")
+env = make_env(
+    env_type="libero",
+    task="libero_spatial",
+    n_envs=1,
+)
+
+# 4. 运行评估
+n_episodes = 3
+n_success = 0
+
+for episode in range(n_episodes):
+    print(f"\n{'='*60}")
+    print(f"Episode {episode + 1}/{n_episodes}")
+
+    obs, info = env.reset()
+    done = False
+    step = 0
+    max_steps = 300
+
+    while not done and step < max_steps:
+        # 构建输入
+        obs_dict = {
+            "observation.state": torch.from_numpy(obs["agent_pos"]).float().unsqueeze(0).to(device),
+            "observation.images.image": torch.from_numpy(obs["pixels"]["image"]).float().unsqueeze(0).to(device),
+            "observation.images.image2": torch.from_numpy(obs["pixels"]["image2"]).float().unsqueeze(0).to(device),
+        }
+
+        # 推理
+        obs_processed = preprocess(obs_dict)
+        with torch.no_grad():
+            action = policy.select_action(obs_processed)
+        action = postprocess(action)
+
+        # 执行
+        obs, reward, terminated, truncated, info = env.step(action.cpu().numpy().squeeze(0))
+        done = terminated or truncated
+        step += 1
+
+    success = info.get("is_success", False)
+    n_success += int(success)
+    print(f"  Steps: {step}")
+    print(f"  Success: {success}")
+
+print(f"\n{'='*60}")
+print(f"Success Rate: {n_success}/{n_episodes} = {100*n_success/n_episodes:.1f}%")
+print("✓ Evaluation completed!")
+EOF
+
+# 运行评估
+python evaluate_pi05_inference.py
+
+
+3.3 完整 Benchmark 评估（可选，耗时较长）
+────────────────────────────────────────────────────────────────────────────
+# 在所有 4 个任务套件上评估（每个任务 10 次）
+lerobot-eval \
+  --policy.path=lerobot/pi05_libero_finetuned \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --policy.n_action_steps=10 \
+  --output_dir=./eval_logs/pi05_full_benchmark
+
+# 官方性能（参考）：
+# - LIBERO Spatial: 97.0%
+# - LIBERO Object: 99.0%
+# - LIBERO Goal: 98.0%
+# - LIBERO 10: 96.0%
+# - 平均: 97.5%
+
+
+================================================================================
+步骤 4：微调训练
+================================================================================
+
+4.1 快速训练测试（100步，验证流程）
+────────────────────────────────────────────────────────────────────────────
+# 先用少量步数测试训练流程是否正常
+export MUJOCO_GL=egl
+
+lerobot-train \
+  --policy.type=pi05 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.repo_id=test_pi05_libero_quick \
+  --dataset.repo_id=HuggingFaceVLA/libero \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --output_dir=./outputs/pi05_quick_test \
+  --job_name=pi05_quick_test \
+  --policy.compile_model=false \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --batch_size=4 \
+  --steps=100 \
+  --policy.device=cuda \
+  --eval.batch_size=1 \
+  --eval.n_episodes=1 \
+  --eval_freq=50 \
+  --wandb.enable=false
+
+# 查看训练日志
+ls -lh outputs/pi05_quick_test/
+
+
+预期输出：
+────────────────────────────────────────────────────────────────────────────
+[INFO] Loading dataset: HuggingFaceVLA/libero
+[INFO] Dataset loaded: 273465 frames
+[INFO] Loading pretrained model: lerobot/pi05_base
+[INFO] Model loaded successfully
+Step 1/100 | Loss: 0.523 | LR: 1e-5
+Step 50/100 | Loss: 0.412 | Evaluating...
+Step 100/100 | Loss: 0.398
+✓ Training completed!
+
+
+4.2 完整微调训练（6000步，复现论文结果）
+────────────────────────────────────────────────────────────────────────────
+# 注意：这需要较长时间（数小时）和足够的 GPU 显存
+
+# 根据显存调整 batch_size：
+# - 40GB+ (A100): batch_size=32
+# - 24GB (RTX 3090/4090): batch_size=16
+# - 16GB (RTX 3080): batch_size=8
+
+lerobot-train \
+  --policy.type=pi05 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.repo_id=${HF_USER}/pi05_libero_finetuned \
+  --dataset.repo_id=HuggingFaceVLA/libero \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --output_dir=./outputs/pi05_libero_full \
+  --job_name=pi05_libero_full_training \
+  --policy.compile_model=true \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --batch_size=16 \
+  --steps=6000 \
+  --policy.device=cuda \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --eval_freq=1000 \
+  --wandb.enable=true \
+  --wandb.project=lerobot-pi05-libero
+
+# 训练时间估计：
+# - 单 A100 GPU: ~8-12 小时（batch_size=32）
+# - 单 RTX 4090: ~12-16 小时（batch_size=16）
+
+
+关键参数说明：
+────────────────────────────────────────────────────────────────────────────
+--policy.compile_model=true         # PyTorch 2.0 编译加速（首次编译需要额外时间）
+--policy.gradient_checkpointing=true # 节省显存（3B 模型必须）
+--policy.dtype=bfloat16             # 混合精度训练
+--batch_size=16                     # 根据显存调整
+--steps=6000                        # 官方推荐的微调步数
+--eval_freq=1000                    # 每 1000 步评估一次
+--wandb.enable=true                 # 使用 W&B 记录训练过程
+
+
+4.3 用 Python 自定义训练脚本（可选）
+────────────────────────────────────────────────────────────────────────────
+cat > train_pi05_custom.py << 'EOF'
+"""自定义 π0.5 训练脚本"""
+from pathlib import Path
+import torch
+from torch.utils.data import DataLoader
+from accelerate import Accelerator
+from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.policies.pi05 import PI05Policy
+from lerobot.policies.factory import make_pre_post_processors
+
+# 配置
+output_dir = Path("outputs/pi05_custom")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# 1. 初始化 Accelerator
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=1,
+)
+
+print(f"Device: {accelerator.device}")
+print(f"Process: {accelerator.process_index}/{accelerator.num_processes}")
+
+# 2. 加载数据集
+print("\nLoading LIBERO dataset...")
+dataset = LeRobotDataset("HuggingFaceVLA/libero")
+metadata = LeRobotDatasetMetadata("HuggingFaceVLA/libero")
+print(f"Dataset size: {len(dataset)} frames")
+
+# 3. 加载预训练模型
+print("\nLoading π0.5 model...")
+policy = PI05Policy.from_pretrained("lerobot/pi05_base")
+policy.train()
+
+# 4. 创建处理器
+preprocessor, _ = make_pre_post_processors(policy.config, metadata.stats)
+
+# 5. 优化器
+optimizer = torch.optim.AdamW(
+    policy.parameters(),
+    lr=1e-5,
+    weight_decay=1e-4
+)
+
+# 6. DataLoader
+dataloader = DataLoader(
+    dataset,
+    batch_size=8,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    drop_last=True
+)
+
+# 7. 准备分布式训练
+policy, optimizer, dataloader = accelerator.prepare(
+    policy, optimizer, dataloader
+)
+
+# 8. 训练循环
+print("\nStarting training...")
+total_steps = 1000
+
+for step, batch in enumerate(dataloader):
+    if step >= total_steps:
+        break
+
+    # 预处理
+    batch = preprocessor(batch)
+
+    # 前向传播
+    with accelerator.autocast():
+        loss, output_dict = policy.forward(batch)
+
+    # 反向传播
+    accelerator.backward(loss)
+
+    # 梯度裁剪
+    if accelerator.sync_gradients:
+        accelerator.clip_grad_norm_(policy.parameters(), 1.0)
+
+    # 优化器步骤
+    optimizer.step()
+    optimizer.zero_grad()
+
+    # 日志
+    if step % 100 == 0:
+        print(f"Step {step}/{total_steps} | Loss: {loss.item():.4f}")
+
+    # 保存检查点
+    if step % 500 == 0 and step > 0:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            unwrapped_model = accelerator.unwrap_model(policy)
+            checkpoint_dir = output_dir / f"checkpoint-{step}"
+            unwrapped_model.save_pretrained(checkpoint_dir)
+            print(f"✓ Checkpoint saved: {checkpoint_dir}")
+
+# 9. 保存最终模型
+accelerator.wait_for_everyone()
+if accelerator.is_main_process:
+    unwrapped_model = accelerator.unwrap_model(policy)
+    final_dir = output_dir / "final_model"
+    unwrapped_model.save_pretrained(final_dir)
+    print(f"\n✓ Training completed! Model saved: {final_dir}")
+EOF
+
+# 运行训练
+python train_pi05_custom.py
+
+
+================================================================================
+步骤 5：性能评估
+================================================================================
+
+5.1 评估微调后的模型
+────────────────────────────────────────────────────────────────────────────
+# 评估你自己微调的模型
+lerobot-eval \
+  --policy.path=./outputs/pi05_libero_full \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --policy.n_action_steps=10 \
+  --output_dir=./eval_logs/my_pi05_final
+
+
+5.2 对比官方模型性能
+────────────────────────────────────────────────────────────────────────────
+# 同时评估官方模型作为基准
+lerobot-eval \
+  --policy.path=lerobot/pi05_libero_finetuned \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --policy.n_action_steps=10 \
+  --output_dir=./eval_logs/official_pi05_baseline
+
+
+5.3 查看评估结果
+────────────────────────────────────────────────────────────────────────────
+# 查看详细的 JSON 结果
+cat eval_logs/my_pi05_final/eval_info.json
+cat eval_logs/official_pi05_baseline/eval_info.json
+
+# 对比成功率
+echo "你的模型："
+grep "success_rate" eval_logs/my_pi05_final/eval_info.json
+
+echo "官方模型："
+grep "success_rate" eval_logs/official_pi05_baseline/eval_info.json
+
+
+预期性能对比（官方结果）：
+────────────────────────────────────────────────────────────────────────────
+| 模型         | Spatial | Object | Goal  | 10-Task | 平均  |
+|-------------|---------|--------|-------|---------|-------|
+| 官方 π0.5   | 97.0%   | 99.0%  | 98.0% | 96.0%   | 97.5% |
+| 你的模型    | ?       | ?      | ?     | ?       | ?     |
+
+
+================================================================================
+步骤 6：故障排查
+================================================================================
+
+常见问题 1：MuJoCo 渲染错误
+────────────────────────────────────────────────────────────────────────────
+错误信息：
+  ERROR: GLEW initialization error: Missing GL version
+
+解决方案：
+  export MUJOCO_GL=osmesa
+  # 或者
+  export MUJOCO_GL=egl
+
+
+常见问题 2：显存不足
+────────────────────────────────────────────────────────────────────────────
+错误信息：
+  RuntimeError: CUDA out of memory
+
+解决方案：
+  1. 减小 batch_size：--batch_size=8 或 --batch_size=4
+  2. 确保使用梯度检查点：--policy.gradient_checkpointing=true
+  3. 使用混合精度：--policy.dtype=bfloat16
+
+
+常见问题 3：数据集下载缓慢
+────────────────────────────────────────────────────────────────────────────
+解决方案：
+  # 设置 HuggingFace 镜像（中国大陆）
+  export HF_ENDPOINT=https://hf-mirror.com
+
+  # 或者手动下载数据集后指定本地路径
+  # （具体方法见 LeRobot 文档）
+
+
+常见问题 4：Transformers 版本不兼容
+────────────────────────────────────────────────────────────────────────────
+错误信息：
+  ImportError: cannot import name 'XXX' from 'transformers'
+
+解决方案：
+  # π0.5 需要特定的 Transformers 分支
+  pip uninstall transformers -y
+  pip install -e ".[pi]"
+
+
+常见问题 5：评估时环境卡住不动
+────────────────────────────────────────────────────────────────────────────
+解决方案：
+  1. 检查 MuJoCo 渲染后端：export MUJOCO_GL=egl
+  2. 检查是否有足够的系统资源
+  3. 尝试减少并行环境数：--eval.batch_size=1
+
+
+================================================================================
+步骤 7：参考资源
+================================================================================
+
+官方文档
+────────────────────────────────────────────────────────────────────────────
+- π0.5 文档: /home/kemove/hyp/lerobot/docs/source/pi05.mdx
+- LIBERO 文档: /home/kemove/hyp/lerobot/docs/source/libero.mdx
+- LeRobot README: /home/kemove/hyp/lerobot/README.md
+
+
+代码位置
+────────────────────────────────────────────────────────────────────────────
+- π0.5 实现: /home/kemove/hyp/lerobot/src/lerobot/policies/pi05/
+- LIBERO 环境: /home/kemove/hyp/lerobot/src/lerobot/envs/libero.py
+- 训练脚本: /home/kemove/hyp/lerobot/src/lerobot/scripts/lerobot_train.py
+- 评估脚本: /home/kemove/hyp/lerobot/src/lerobot/scripts/lerobot_eval.py
+
+
+预训练模型
+────────────────────────────────────────────────────────────────────────────
+- lerobot/pi05_base - π0.5 基础模型
+- lerobot/pi05_libero_finetuned - π0.5 LIBERO 微调版
+
+
+数据集
+────────────────────────────────────────────────────────────────────────────
+- HuggingFaceVLA/libero - LIBERO 数据集（1,693集，273,465帧）
+
+
+论文
+────────────────────────────────────────────────────────────────────────────
+- π0.5 论文: https://arxiv.org/abs/2410.06328
+- LIBERO 论文: https://arxiv.org/abs/2306.03310
+
+
+在线资源
+────────────────────────────────────────────────────────────────────────────
+- LeRobot GitHub: https://github.com/huggingface/lerobot
+- OpenPI GitHub: https://github.com/Physical-Intelligence/openpi
+- Hugging Face Hub: https://huggingface.co/lerobot
+
+
+================================================================================
+快速启动命令汇总
+================================================================================
+
+# 环境配置
+export MUJOCO_GL=egl
+conda activate lerobot
+
+# 数据集探索
+python explore_libero_dataset.py
+
+# 快速推理测试（2个剧集）
+lerobot-eval \
+  --policy.path=lerobot/pi05_libero_finetuned \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --eval.n_episodes=2
+
+# 快速训练测试（100步）
+lerobot-train \
+  --policy.type=pi05 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --dataset.repo_id=HuggingFaceVLA/libero \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --batch_size=4 \
+  --steps=100 \
+  --output_dir=./outputs/pi05_quick_test
+
+# 完整训练（6000步）
+lerobot-train \
+  --policy.type=pi05 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --dataset.repo_id=HuggingFaceVLA/libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --batch_size=16 \
+  --steps=6000 \
+  --policy.compile_model=true \
+  --policy.gradient_checkpointing=true \
+  --output_dir=./outputs/pi05_libero_full
+
+
+================================================================================
+建议的执行顺序
+================================================================================
+
+第一次运行（验证环境）：
+  1. 步骤 1.3 - 验证安装
+  2. 步骤 2.1 - 探索数据集
+  3. 步骤 3.1 - 快速推理测试（2个剧集）
+  4. 步骤 4.1 - 快速训练测试（100步）
+
+正式训练（复现结果）：
+  1. 步骤 3.2 - 自定义推理脚本
+  2. 步骤 4.2 - 完整训练（6000步）
+  3. 步骤 5.1 - 评估微调模型
+  4. 步骤 5.2 - 对比官方性能
+
+
+================================================================================
+注意事项
+================================================================================
+
+1. 显存管理
+   - π0.5 是 3B 参数模型，需要较大显存
+   - 建议使用 24GB+ VRAM 的 GPU
+   - 必须启用 gradient_checkpointing
+
+2. 训练时间
+   - 快速测试（100步）：~5-10分钟
+   - 完整训练（6000步）：~8-16小时（取决于GPU）
+
+3. 数据集下载
+   - LIBERO 数据集约 370KB（元数据）+ 数GB（视频）
+   - 首次加载会自动下载到 ~/.cache/huggingface/
+
+4. 评估建议
+   - 先用少量剧集（n_episodes=2）测试
+   - 确认流程正常后再运行完整评估（n_episodes=10）
+
+5. W&B 使用
+   - 建议启用 wandb 记录训练过程
+   - 需要先登录：wandb login
+
+
+================================================================================
+完成标志
+================================================================================
+
+✓ 环境验证通过
+✓ 数据集加载成功
+✓ 预训练模型推理成功
+✓ 快速训练测试完成（Loss 下降）
+✓ 完整训练完成（6000步）
+✓ 评估性能达到预期（>90%）
+
+
+================================================================================
+联系支持
+================================================================================
+
+如果遇到问题：
+1. 查看步骤 6 的故障排查
+2. 查阅官方文档
+3. 在 GitHub Issues 提问：https://github.com/huggingface/lerobot/issues
+4. 回来找 Claude 讨论
+
+
+祝实验顺利！🚀
+================================================================================

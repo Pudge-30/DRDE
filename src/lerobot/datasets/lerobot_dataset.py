@@ -16,6 +16,7 @@
 import concurrent.futures
 import contextlib
 import logging
+import random
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -76,6 +77,8 @@ from lerobot.datasets.video_utils import (
     get_video_info,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+logger = logging.getLogger(__name__)
 
 CODEBASE_VERSION = "v3.0"
 
@@ -1041,6 +1044,112 @@ class LeRobotDataset(torch.utils.data.Dataset):
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
+
+        # Neg action sampling: 同 episode 随机跨 chunk 时序错位 GT action（CMP L1 负样本）
+        neg_action_config = getattr(self, "neg_action_config", None)
+        if neg_action_config is not None and "action" in (self.delta_indices or {}):
+            ep = self.meta.episodes[ep_idx]
+            ep_start = ep["dataset_from_index"]
+            ep_end = ep["dataset_to_index"]
+            ep_len = ep_end - ep_start
+            current_pos = idx - ep_start
+
+            chunk_size = neg_action_config["chunk_size"]
+            att_len = neg_action_config["att_len"]
+            min_neg_pos = current_pos + chunk_size   # 跨 chunk 下限
+            max_neg_pos = ep_len - att_len           # episode 末尾上限
+
+            if max_neg_pos > min_neg_pos:
+                neg_pos = random.randint(min_neg_pos, max_neg_pos)
+                neg_indices = [ep_start + neg_pos + i for i in range(att_len)]
+                neg_result = self._query_hf_dataset({"action": neg_indices})
+                neg_action = neg_result["action"]  # [att_len, action_dim]
+                item["neg_action"] = neg_action
+                item["neg_action_is_valid"] = torch.tensor(True)
+
+                # 计算 current_action 和 neg_action 的 L2 距离（用于 soft label）
+                current_action = item["action"][:att_len]  # [att_len, action_dim]
+                action_distance = torch.norm(current_action - neg_action, p=2).item()
+                item["neg_action_distance"] = torch.tensor(action_distance)
+
+                # Debug logging (每 500 个样本打印一次)
+                if idx % 500 == 0:
+                    temporal_gap = neg_pos - current_pos
+                    logger.info(
+                        f"[Dataset L1 Neg] idx={idx}, ep={ep_idx}, ep_len={ep_len}, "
+                        f"current_pos={current_pos}, neg_pos={neg_pos}, temporal_gap={temporal_gap}, "
+                        f"action_distance={action_distance:.4f}"
+                    )
+            else:
+                # Episode 太短，不够跨 chunk
+                action_dim = item["action"].shape[-1]
+                item["neg_action"] = torch.zeros(att_len, action_dim)
+                item["neg_action_is_valid"] = torch.tensor(False)
+                item["neg_action_distance"] = torch.tensor(0.0)
+
+        # Neg future obs sampling: 同 episode 远离 t+k 的 GT obs（CMP L2 负样本）
+        # 支持 video 和 image 两种存储格式
+        cam_keys = self.meta.camera_keys  # 包含 video 和 image 类型
+        if neg_action_config is not None and len(cam_keys) > 0:
+            ep = self.meta.episodes[ep_idx]
+            ep_start = ep["dataset_from_index"]
+            ep_end = ep["dataset_to_index"]
+            ep_len = ep_end - ep_start
+            current_pos = idx - ep_start
+
+            chunk_size = neg_action_config["chunk_size"]
+            att_len = neg_action_config["att_len"]  # future_obs 在 t+att_len
+
+            # neg_future_offset 要远离 att_len，确保 |offset - att_len| >= chunk_size
+            # 候选区间：[0, att_len - chunk_size] ∪ [att_len + chunk_size, ep_len - 1]
+            candidates_before = list(range(0, max(0, att_len - chunk_size)))
+            candidates_after = list(range(att_len + chunk_size, ep_len))
+            candidates = candidates_before + candidates_after
+
+            if len(candidates) > 0:
+                neg_future_offset = random.choice(candidates)
+                neg_future_idx = ep_start + neg_future_offset
+
+                # 限制在 episode 范围内
+                neg_future_idx = max(ep_start, min(ep_end - 1, neg_future_idx))
+
+                if len(self.meta.video_keys) > 0:
+                    # Video 存储：通过时间戳 decode 视频帧
+                    neg_future_timestamp = self.hf_dataset[neg_future_idx]["timestamp"].item()
+                    query_timestamps = {key: [neg_future_timestamp] for key in self.meta.video_keys}
+                    neg_future_frames = self._query_videos(query_timestamps, ep_idx)
+                    for vid_key in self.meta.video_keys:
+                        item[f"neg_future_{vid_key}"] = neg_future_frames[vid_key]
+                else:
+                    # Image 存储：直接从 HF dataset 读取图像 tensor
+                    neg_row = self.hf_dataset[neg_future_idx]
+                    for cam_key in cam_keys:
+                        if cam_key in neg_row:
+                            item[f"neg_future_{cam_key}"] = neg_row[cam_key]
+
+                item["neg_future_is_valid"] = torch.tensor(True)
+
+                # Debug logging (每 500 个样本打印一次)
+                if idx % 500 == 0:
+                    future_offset = current_pos + att_len
+                    temporal_gap_from_future = abs(neg_future_offset - future_offset)
+                    logger.info(
+                        f"[Dataset L2 Neg] idx={idx}, ep={ep_idx}, ep_len={ep_len}, "
+                        f"current_pos={current_pos}, future_pos={future_offset}, neg_future_offset={neg_future_offset}, "
+                        f"temporal_gap_from_future={temporal_gap_from_future}"
+                    )
+            else:
+                # Episode 太短，无法采样远离 att_len 的时刻
+                # 创建 dummy 帧（全零）
+                for cam_key in cam_keys:
+                    sample_frame = item.get(cam_key)
+                    if sample_frame is not None:
+                        if sample_frame.dim() == 4:  # [T, C, H, W]
+                            dummy_shape = sample_frame.shape[1:]
+                        else:  # [C, H, W]
+                            dummy_shape = sample_frame.shape
+                        item[f"neg_future_{cam_key}"] = torch.zeros(dummy_shape)
+                item["neg_future_is_valid"] = torch.tensor(False)
 
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys

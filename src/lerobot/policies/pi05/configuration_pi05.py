@@ -53,7 +53,7 @@ class PI05Config(PreTrainedConfig):
     image_resolution: tuple[int, int] = (224, 224)  # see openpi `preprocessing_pytorch.py`
 
     # Add empty images. Used to add empty cameras when no image features are present.
-    empty_cameras: int = 0
+    empty_cameras: int = 1
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
@@ -91,6 +91,10 @@ class PI05Config(PreTrainedConfig):
     part_layer_num: int = 6      # PaliGemma 前 N 层用于 CMP
     attn_act_len: int = 10       # SingleHeadContentAttention 的输入长度
     cmp_pretrain: bool = False
+    replan_drift_threshold: float = 0.0  # >0 时启用 drift-based replan（high threshold，立即 replan）
+    replan_drift_threshold_mid: float = 0.0  # >0 时启用自适应步长（mid threshold，延迟一段后 replan）
+    replan_mode: str = "drift"  # "drift": drift-based replan; "fixed": 每 n_action_steps 步固定 replan (同 baseline)
+    embedding_max_norm: float = 0.0  # 0 = 关闭；>0 = 手动指定 clamp norm
 
 
     def __post_init__(self):

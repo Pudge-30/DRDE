@@ -192,6 +192,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
+    if hasattr(cfg.policy, "attn_act_len") and cfg.policy.attn_act_len > 0:
+        dataset.neg_action_config = {
+            "chunk_size": cfg.policy.chunk_size,
+            "att_len": cfg.policy.attn_act_len,
+        }
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.

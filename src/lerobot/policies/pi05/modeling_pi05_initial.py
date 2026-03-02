@@ -338,80 +338,80 @@ def compute_layer_complete(
     return outputs_embeds
 
 
-# def vicreg_loss(
-#         z1: Tensor,
-#         z2: Tensor,
-#         lambda_param: float = 25.0,
-#         mu_param: float = 25.0,
-#         nu_param: float = 1.0,
-#         gamma: float = 0.4,
-#         eps: float = 1e-4,
-# ) -> Tensor:
-#     """VICReg loss with Variance-Invariance-Covariance Regularization (PyTorch version).
+def vicreg_loss(
+        z1: Tensor,
+        z2: Tensor,
+        lambda_param: float = 25.0,
+        mu_param: float = 25.0,
+        nu_param: float = 1.0,
+        gamma: float = 0.4,
+        eps: float = 1e-4,
+) -> Tensor:
+    """VICReg loss with Variance-Invariance-Covariance Regularization (PyTorch version).
 
-#     Args:
-#         z1: First representation [batch, num_tokens, dim] or [batch, dim]
-#         z2: Second representation [batch, num_tokens, dim] or [batch, dim]
-#         lambda_param: Weight for invariance loss (default: 25.0)
-#         mu_param: Weight for variance loss (default: 25.0)
-#         nu_param: Weight for covariance loss (default: 1.0)
-#         gamma: Target standard deviation (default: 1.0)
-#         eps: Small constant for numerical stability
+    Args:
+        z1: First representation [batch, num_tokens, dim] or [batch, dim]
+        z2: Second representation [batch, num_tokens, dim] or [batch, dim]
+        lambda_param: Weight for invariance loss (default: 25.0)
+        mu_param: Weight for variance loss (default: 25.0)
+        nu_param: Weight for covariance loss (default: 1.0)
+        gamma: Target standard deviation (default: 1.0)
+        eps: Small constant for numerical stability
 
-#     Returns:
-#         VICReg loss value (scalar tensor)
-#     """
-#     # Handle both 2D and 3D inputs
-#     if z1.dim() == 2:
-#         z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
-#     if z2.dim() == 2:
-#         z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+    Returns:
+        VICReg loss value (scalar tensor)
+    """
+    # Handle both 2D and 3D inputs
+    if z1.dim() == 2:
+        z1 = z1.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
+    if z2.dim() == 2:
+        z2 = z2.unsqueeze(1)  # [batch, dim] -> [batch, 1, dim]
 
-#     batch_size, num_tokens, dim = z1.shape
+    batch_size, num_tokens, dim = z1.shape
 
-#     # Reshape to (batch*num_tokens, dim)
-#     z1_flat = z1.reshape(-1, dim)  # [batch*num_tokens, dim]
-#     z2_flat = z2.reshape(-1, dim)  # [batch*num_tokens, dim]
-#     n_samples = z1_flat.shape[0]
+    # Reshape to (batch*num_tokens, dim)
+    z1_flat = z1.reshape(-1, dim)  # [batch*num_tokens, dim]
+    z2_flat = z2.reshape(-1, dim)  # [batch*num_tokens, dim]
+    n_samples = z1_flat.shape[0]
 
-#     # Invariance loss: L2 distance between corresponding representations
-#     invariance_loss = torch.mean(torch.square(z1_flat - z2_flat), dim=-1)  # [batch*num_tokens]
-#     invariance_loss = torch.mean(invariance_loss)  # scalar
+    # Invariance loss: L2 distance between corresponding representations
+    invariance_loss = torch.mean(torch.square(z1_flat - z2_flat), dim=-1)  # [batch*num_tokens]
+    invariance_loss = torch.mean(invariance_loss)  # scalar
 
-#     # Variance loss: encourage standard deviation to be close to gamma
-#     std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
-#     std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
-#     variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
+    # Variance loss: encourage standard deviation to be close to gamma
+    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
+    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
+    variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
 
-#     # print(std_z1)
-#     # print(std_z2)
-#     # print("++++++++++")
-#     # Covariance loss: encourage decorrelation of features
-#     z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
-#     z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
+    # print(std_z1)
+    # print(std_z2)
+    # print("++++++++++")
+    # Covariance loss: encourage decorrelation of features
+    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
+    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch*num_tokens, dim]
 
-#     cov_z1 = (z1_centered.T @ z1_centered) / (n_samples - 1)  # [dim, dim]
-#     cov_z2 = (z2_centered.T @ z2_centered) / (n_samples - 1)  # [dim, dim]
+    cov_z1 = (z1_centered.T @ z1_centered) / (n_samples - 1)  # [dim, dim]
+    cov_z2 = (z2_centered.T @ z2_centered) / (n_samples - 1)  # [dim, dim]
 
-#     # Off-diagonal mask
-#     off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)
-#     offdiag_z1 = cov_z1 * off_diagonal_mask
-#     offdiag_z2 = cov_z2 * off_diagonal_mask
+    # Off-diagonal mask
+    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)
+    offdiag_z1 = cov_z1 * off_diagonal_mask
+    offdiag_z2 = cov_z2 * off_diagonal_mask
 
-#     # Covariance loss (normalize by dim, not number of elements)
-#     cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim*dim)
-#     cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim*dim)
-#     covariance_loss = cov_loss_z1 + cov_loss_z2
+    # Covariance loss (normalize by dim, not number of elements)
+    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim*dim)
+    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim*dim)
+    covariance_loss = cov_loss_z1 + cov_loss_z2
 
-#     # Total loss
-#     total_loss = lambda_param * invariance_loss + mu_param * variance_loss + nu_param * covariance_loss
+    # Total loss
+    total_loss = lambda_param * invariance_loss + mu_param * variance_loss + nu_param * covariance_loss
 
-#     # print("----------------")
-#     # print(lambda_param * invariance_loss)
-#     # print(mu_param * variance_loss)
-#     # print(nu_param * covariance_loss)
+    # print("----------------")
+    # print(lambda_param * invariance_loss)
+    # print(mu_param * variance_loss)
+    # print(nu_param * covariance_loss)
 
-#     return total_loss
+    return total_loss
 
 
 # def contrastive_triplet_loss(
@@ -542,476 +542,291 @@ def compute_layer_complete(
 #     return total_loss
 
 
-class ITMHead(nn.Module):
-    """Image-Text Matching Head (ALBEF style).
-
-    对两个独立编码的特征做二分类匹配判断，不依赖 dot product。
-    参考: ALBEF (Li et al., NeurIPS 2021) 的 ITM loss。
-    """
-
-    def __init__(self, hidden_dim: int = 512, proj_dim: int = 256, dropout: float = 0.1):
-        super().__init__()
-        # 融合两个特征后做二分类
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 4, proj_dim),  # concat(z1, z2, z1-z2, z1*z2)
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(proj_dim, proj_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(proj_dim, 1),  # 匹配分数 (logit)
-        )
-        self._init_weights()
-        self._log_counter = 0  # Debug logging counter
-
-    def _init_weights(self):
-        for m in self.classifier:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, z1: Tensor, z2: Tensor) -> Tensor:
-        """计算匹配分数。
-
-        Args:
-            z1: [N, hidden_dim]
-            z2: [N, hidden_dim]
-
-        Returns:
-            logits: [N] 匹配分数（未经 sigmoid）
-        """
-        combined = torch.cat([z1, z2, z1 - z2, z1 * z2], dim=-1)  # [N, 4*hidden]
-        return self.classifier(combined).squeeze(-1)  # [N]
-
-    def compute_loss(
-            self,
-            z1: Tensor,
-            z2: Tensor,
-            action_distances: Tensor = None,
-            soft_label_beta: float = 1.0,
-            neg_z2: Tensor = None,
-            neg_z2_valid: Tensor = None,
-            neg_distance: Tensor = None,  # 新增：neg 距离（用于 soft label）
-    ) -> tuple[Tensor, dict]:
-        """计算 ITM loss。
-
-        使用同 episode GT 时序错位负样本 + action-distance soft label。
-
-        Args:
-            z1: [B, hidden_dim]
-            z2: [B, hidden_dim]
-            action_distances: [B, B] action 空间的 pairwise 距离矩阵，None 时退化为硬标签
-            soft_label_beta: 软标签温度，越小越接近硬标签
-            neg_z2: [B, hidden_dim] 另一侧的负样本编码
-                    - L1 (obs↔action): 同 episode GT 时序错位的 action 编码
-                    - L2 (action↔future_obs): 同 episode 远离 t+k 的 obs 编码
-            neg_z2_valid: [B] bool，标记每个样本的 neg_z2 是否有效
-            neg_distance: [B] float，neg 距离（L1: action L2 距离，L2: obs 嵌入 L2 距离）
-
-        Returns:
-            loss: scalar
-            info: 诊断信息 dict
-        """
-        # 功能总结：基于正样本与时序错位负样本的二分类匹配损失，
-        #         支持软标签（由距离决定）并记录诊断信息。
-        batch_size = z1.shape[0]  # batch 大小
-        device = z1.device  # 当前设备
-
-        # 正样本：(z1_i, z2_i)
-        pos_logits = self.forward(z1, z2)  # [B] 正样本匹配分数
-        pos_labels = torch.ones(batch_size, device=device)  # 正样本标签=1
-
-        if neg_z2 is not None:
-            # ===== GT 时序错位负样本（替换 batch cross-pair）=====
-            # 使用 action-distance soft label：距离近 → 不推太远，距离远 → 推远
-            neg_logits = self.forward(z1, neg_z2)  # [B] 负样本匹配分数
-
-            # 计算 soft label
-            if neg_distance is not None:
-                with torch.no_grad():
-                    # 计算 scale：使用 action_distances 的 median，或 fallback 到固定值
-                    if action_distances is not None:  # L1 使用 action 距离做尺度
-                        eps = 1e-6
-                        eye_mask = torch.eye(batch_size, dtype=torch.bool, device=device)  # 对角线 mask
-                        non_diag = action_distances[~eye_mask]  # 去除自距离
-                        scale = non_diag.median().detach() + eps  # 使用 median 作为尺度
-                    else:
-                        scale = 1.0  # L2 (obs) 没有 action_distances，用固定 scale
-
-                    # soft_label = exp(-distance / (scale × beta))
-                    # distance 小 → label 接近 1（不推远），distance 大 → label 接近 0（推远）
-                    neg_labels = torch.exp(-neg_distance / (scale * soft_label_beta))  # 软负标签，根据负样本距离生成一对距离敏感的标签，用于计算负样本的BCE
-
-                    # Debug logging (每 100 次调用打印一次)
-                    self._log_counter += 1  # 调试计数器累加
-                    if self._log_counter % 100 == 0:
-                        label_type = "L1" if action_distances is not None else "L2"
-                        print(f"[ITMHead {label_type}] call={self._log_counter}, "
-                              f"scale={scale:.4f}, beta={soft_label_beta:.2f}")
-                        print(f"  neg_distance: mean={neg_distance.mean().item():.4f}, "
-                              f"min={neg_distance.min().item():.4f}, "
-                              f"max={neg_distance.max().item():.4f}")
-                        print(f"  soft_label: mean={neg_labels.mean().item():.4f}, "
-                              f"min={neg_labels.min().item():.4f}, "
-                              f"max={neg_labels.max().item():.4f}")
-            else:
-                # 没有 distance 信息，回退到硬标签
-                neg_labels = torch.zeros(batch_size, device=device)  # 硬负标签=0
-
-            # 正样本二分类损失（logit + label=1）
-            pos_loss = F.binary_cross_entropy_with_logits(pos_logits, pos_labels)  # 正样本 BCE
-            # 负样本逐样本损失（logit + soft label）
-            neg_loss_per_sample = F.binary_cross_entropy_with_logits(
-                neg_logits, neg_labels, reduction='none'
-            )  # [B] 逐样本负样本 BCE
-
-            # 按 validity mask 屏蔽 episode 过短的样本
-            if neg_z2_valid is not None:  # 仅使用有效负样本
-                valid_mask = neg_z2_valid.float().to(device)
-                n_valid = valid_mask.sum().clamp(min=1.0)  # 防止除零
-                neg_loss = (neg_loss_per_sample * valid_mask).sum() / n_valid  # masked mean
-            else:
-                neg_loss = neg_loss_per_sample.mean()  # 全量平均
-
-            # 正负样本对等权平均得到 ITM 总损失
-            loss = (pos_loss + neg_loss) / 2.0  # 正负平均
-
-            # 诊断信息
-            with torch.no_grad():
-                pos_acc = (pos_logits > 0).float().mean().item()  # 正样本判真率
-                neg_acc = (neg_logits < 0).float().mean().item()  # 负样本判假率
-                n_valid_int = int(neg_z2_valid.sum().item()) if neg_z2_valid is not None else batch_size  # 有效数
-                avg_neg_soft_label = neg_labels.mean().item() if neg_distance is not None else 0.0  # 软标签均值
-
-            info = {
-                "pos_score": pos_logits.mean().item(),
-                "neg_score_1": neg_logits.mean().item(),
-                "neg_score_2": neg_logits.mean().item(),  # 兼容旧日志格式
-                "pos_acc": pos_acc,
-                "neg_acc": neg_acc,
-                "avg_neg_soft_label": avg_neg_soft_label,
-                "neg_type": "gt_temporal",
-                "neg_valid_ratio": n_valid_int / batch_size,
-            }
-        else:
-            raise ValueError(
-                "neg_z2 must be provided. Batch cross-pair fallback has been removed. "
-                "Both L1 and L2 should use GT temporal offset negatives."
-            )
-
-        return loss, info
-
-
-class ForwardModel(nn.Module):
-    """嵌入空间前向动力学模型：预测执行 action 后的观察嵌入。
-
-    predicted_z3 = z1 + MLP(concat(z1, z2))
-    残差设计：MLP 只学习 delta，z1 作为 baseline。
-    """
-    def __init__(self, hidden_dim: int = 512):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def forward(self, z1: Tensor, z2: Tensor) -> Tensor:
-        # 功能总结：预测 z3（残差式前向动力学），只学习 delta。
-        delta = self.mlp(torch.cat([z1, z2], dim=-1))
-        return z1 + delta
-
-
-def _clamp_embedding_norm(z: Tensor, max_norm: float = 0.0) -> Tensor:
-    """Clamp embedding L2 norm to prevent unbounded growth.
-
-    max_norm <= 0 时直接返回原始 z（MEAN_STD 模式不需要 clamp）。
-    max_norm > 0 时，norm 超过阈值的 embedding 等比缩放到 max_norm（QUANTILES 建议 32.0）。
-    """
-    # 功能总结：限制 embedding 的 L2 范数，避免数值膨胀。
-    if max_norm <= 0:
-        return z
-    z_norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    return z * torch.clamp(max_norm / z_norm, max=1.0)
-
-
 def contrastive_loss_with_structure(
         z1: Tensor,
         z2: Tensor,
         z2_original: Tensor,
-        itm_head: nn.Module = None,  # ITM Head，替代 dot product 跨模态对比
-        z3: Tensor = None,  # obs_{t+k} 特征，三元因果链第三节点
-        z2_neg: Tensor = None,  # L1 负样本：同 episode GT 时序错位编码的 z2
-        z2_neg_valid: Tensor = None,  # [B] bool，L1 neg 是否有效
-        z2_neg_distance: Tensor = None,  # [B] float，L1 neg 的 action L2 距离
-        z3_neg: Tensor = None,  # L2 负样本：同 episode 远离 t+k 的 GT obs 编码的 z3
-        z3_neg_valid: Tensor = None,  # [B] bool，L2 neg 是否有效
-        z3_neg_distance: Tensor = None,  # [B] float，L2 neg 的 obs 嵌入 L2 距离
         temperature: float = 0.07,
         temperature_structure: float = 0.07,
-        temperature_intra: float = 0.2,  # 同模态对比的温度
-        beta_intra: float = 1.0,  # action 软权重的温度
         top_k: int = 16,
-        lambda_intra: float = 1.0,  # 同模态 loss 权重（基础值）
-        lambda_cross: float = 1.0,  # 跨模态 loss 权重（基础值）
+        lambda_align: float = 1.0,
         lambda_structure: float = 1.0,
         lambda_anticollapse: float = 1.0,
         gamma: float = 0.4,
         eps: float = 1e-4,
         log_interval: int = 10,
-        warmup_steps: int = 0,  # gating 提供自然 warmup，不需要显式 warmup
-        decay_steps: int = 1000,
-) -> tuple[Tensor, dict]:
-    """对比学习损失函数。
+) -> Tensor:
+    """对比学习损失函数，包含三个组件：
+    1. InfoNCE 对齐损失：让正样本对 (z1[i], z2[i]) 靠近（使用余弦相似度）
+    2. 结构保持损失：使用 Soft Rank 方法保持 z2 的前 top_k 个最近邻排序一致性
+    3. 防坍缩损失：variance + covariance 防止表示空间坍缩
 
-    损失组成：
-    1. 跨模态损失：ITM 三元因果链 obs_t ↔ action_t ↔ obs_{t+k}
-       - L1: obs_t ↔ action_t，使用 GT 时序错位负样本（z2_neg）
-       - L2: action_t ↔ obs_{t+k}，使用 GT 远离 t+k 的负样本（z3_neg）
-    2. 结构保持损失：保持 z2 的 top_k 邻居排序一致性
-    3. 防坍缩损失：variance + covariance
+    Args:
+        z1: First representation [batch, dim] or [batch, num_tokens, dim]
+        z2: Second representation [batch, dim] or [batch, num_tokens, dim]
+        z2_original: z2 的原始输入，用于计算原始距离排序
+                     例如 actions [batch, attn_act_len, action_dim]
+        temperature: InfoNCE 温度参数
+        temperature_structure: 结构保持损失的温度参数（用于 Softmax 概率分布）
+        top_k: 保持前 k 个最近邻的排序
+        lambda_align: 对齐损失权重
+        lambda_structure: 结构保持损失权重
+        lambda_anticollapse: 防坍缩损失权重
+        gamma: Variance loss 的目标标准差
+        eps: 数值稳定性常数
+        log_interval: 每隔多少步打印一次日志（默认每10步）
 
     Returns:
-        total_loss: 标量损失
-        loss_info: 各子项数值 dict，用于 wandb 日志
+        总损失值（标量张量）
     """
-    # 功能总结：计算 CMP 的三部分损失（跨模态/结构/防坍缩），并返回日志信息。
     # 使用函数属性来跟踪调用次数（静态变量）
     if not hasattr(contrastive_loss_with_structure, 'step_count'):
-        contrastive_loss_with_structure.step_count = 0  # 首次调用初始化计数器
-    contrastive_loss_with_structure.step_count += 1  # 步数递增
-    step = contrastive_loss_with_structure.step_count  # 当前步数
-
-    # 权重调度：intra 逐渐衰减，cross 保持不变
-    if warmup_steps > 0 and step < warmup_steps:
-        cross_progress = step / warmup_steps  # warmup 进度
-        lambda_intra_eff = lambda_intra  # 同模态权重（当前未使用）
-        lambda_cross_eff = lambda_cross * cross_progress  # 跨模态权重线性升温
+        contrastive_loss_with_structure.step_count = 0
+    contrastive_loss_with_structure.step_count += 1
+    # Handle both 2D and 3D inputs
+    if z1.dim() == 2:
+        z1_flat = z1  # [batch, dim]
     else:
-        decay_progress = (step - warmup_steps) / decay_steps  # 衰减进度
-        lambda_intra_eff = lambda_intra * max(0.3, 1.0 - decay_progress)  # 同模态权重衰减
-        lambda_cross_eff = lambda_cross  # 跨模态权重保持
+        z1_flat = z1.reshape(-1, z1.shape[-1])  # [batch*num_tokens, dim]
+    
+    if z2.dim() == 2:
+        z2_flat = z2  # [batch, dim]
+    else:
+        z2_flat = z2.reshape(-1, z2.shape[-1])  # [batch*num_tokens, dim]
+    
+    batch_size = z1_flat.shape[0]
+    dim = z1_flat.shape[-1]
 
-    # Flatten inputs
-    z1_flat = z1 if z1.dim() == 2 else z1.reshape(-1, z1.shape[-1])  # [B, D]
-    z2_flat = z2 if z2.dim() == 2 else z2.reshape(-1, z2.shape[-1])  # [B, D]
-    batch_size = z1_flat.shape[0]  # 扁平后的 batch
-    dim = z1_flat.shape[-1]  # 特征维度
+    # ========== 1. InfoNCE 对齐损失（加权版本，避免与 Structure Loss 冲突）==========
+    # 归一化 embeddings 用于稳定计算
+    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # [batch_size, dim]
+    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # [batch_size, dim]
+    
+    # 计算相似度矩阵（使用余弦相似度）
+    similarity_matrix = torch.matmul(z1_norm, z2_norm.T)  # [batch_size, batch_size]
+    
+    # 对角线是正样本对的相似度
+    pos_similarity = torch.diag(similarity_matrix)  # [batch_size]
+    
+    # ========== 计算原空间距离用于加权 ==========
+    # 从 z2_original 计算原始表示（用于计算原空间距离）
+    if z2_original.dim() == 3:
+        z2_orig_repr = torch.mean(z2_original, dim=1)  # [batch_size, feature_dim]
+    else:
+        z2_orig_repr = z2_original  # [batch_size, feature_dim]
+    
+    # 计算原空间距离矩阵（用于加权负样本）
+    orig_distances_for_weight = torch.cdist(z2_orig_repr, z2_orig_repr, p=2)  # [batch_size, batch_size]
+    
+    # 计算权重：距离远的权重大（需要推远），距离近的权重小（不需要太远）
+    # 这样可以让 InfoNCE 与 Structure Loss 协调：近邻不会被强行推太远
+    # 使用改进版本：median + sigmoid 映射，避免 max 的不稳定性和 inf 值
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
+    dist = orig_distances_for_weight.clone()
+    dist = dist.masked_fill(eye_mask, 0.0)  # 设为 0 而不是 inf，避免数值问题
+    
+    # 使用 median 作为尺度（比 max 更稳定，对 outlier 不敏感）
+    non_diag_distances = dist[~eye_mask]
+    if len(non_diag_distances) > 0:
+        scale = non_diag_distances.median().detach() + eps  # 使用 median 而不是 max
+    else:
+        scale = torch.tensor(1.0, device=z2.device) + eps
+    
+    # 归一化距离：dist / scale
+    dist_normalized = dist / scale  # [0, ~max/scale]
+    
+    # 使用 sigmoid 映射到权重范围 [w_min, w_max]
+    # sigmoid(x - 1.0) 将中心点移到 1.0，使得距离接近 scale 时权重约为 0.5
+    w_min = 0.1  # 最小权重，避免完全忽略近邻（距离很近的样本权重为 0.1）
+    w_max = 1.0  # 最大权重（距离很远的样本权重为 1.0）
+    # 距离近 -> 权重小，距离远 -> 权重大
+    weights = w_min + (w_max - w_min) * torch.sigmoid(dist_normalized - 1.0)  # [batch_size, batch_size]
+    weights[eye_mask] = 1.0  # 正样本权重为 1（不影响正样本）
+    
+    # 应用温度参数
+    pos_similarity_scaled = pos_similarity / temperature  # [batch_size]
+    
+    # 加权 InfoNCE Loss: 正样本权重为 1（不加权），负样本加权
+    # 数学形式: -log(exp(pos_sim/T) / (exp(pos_sim/T) + sum(w_ij * exp(neg_sim/T))))
+    # 正样本参与计算但权重为 1，保持标准 InfoNCE 形式
+    logits = similarity_matrix / temperature  # [batch_size, batch_size]
+    with torch.no_grad():
+        B = similarity_matrix.size(0)
+        pos = pos_similarity.mean().item()
+        neg = (similarity_matrix.sum() - pos_similarity.sum()) / (B * (B - 1))
+        print("pos:", pos, "neg:", neg, "gap:", pos - neg)
+    # 对所有样本应用权重：logits_ij = logits_ij + log(weights_ij)
+    # 正样本权重为 1，所以 log(1) = 0，正样本 logits 不变
+    # 负样本权重 < 1，所以 log(weights) < 0，负样本 logits 减小
+    weighted_logits = logits + torch.log(weights + eps)  # [batch_size, batch_size]
+    
+    # 对所有样本（包括正样本）计算 logsumexp
+    log_sum_exp = torch.logsumexp(weighted_logits, dim=-1)  # [batch_size]
+    
+    # 损失 = -pos_sim/T + log(exp(pos_sim/T) + sum(weighted_neg))
+    align_loss = -pos_similarity_scaled + log_sum_exp  # [batch_size]
+    align_loss = torch.mean(align_loss)  # scalar
 
-    # Action 距离矩阵
-    actions_flat = z2_original.reshape(batch_size, -1) if z2_original.dim() == 3 else z2_original  # 展平动作
-    action_distances = torch.cdist(actions_flat, actions_flat, p=2)  # 动作 L2 距离矩阵
-    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)  # 对角线 mask
-
-    # 计算 z1/z2 内部相似度（用于监控）
-    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # z1 归一化
-    z1_sim = torch.matmul(z1_norm, z1_norm.T)  # 余弦相似度矩阵
-    z1_internal_sim = z1_sim[~eye_mask].mean().item()  # 去除对角线平均
-
-    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # z2 归一化
-    z2_sim = torch.matmul(z2_norm, z2_norm.T)  # 余弦相似度矩阵
-    z2_internal_sim = z2_sim[~eye_mask].mean().item()  # 去除对角线平均
-
-    # ========== 1. 跨模态损失 (z1 vs z2) — ITM 三元因果链 ==========
-    if itm_head is not None:
-        # Flatten z3 for L2
-        z3_flat = None  # L2 正样本（obs_{t+k}）
-        if z3 is not None:
-            z3_flat = z3 if z3.dim() == 2 else z3.reshape(-1, z3.shape[-1])
-
-        # Flatten z2_neg for L1 GT 时序错位负样本
-        z2_neg_flat = None  # L1 负样本（action 时序错位）
-        if z2_neg is not None:
-            z2_neg_flat = z2_neg if z2_neg.dim() == 2 else z2_neg.reshape(-1, z2_neg.shape[-1])
-
-        # Flatten z3_neg for L2 GT 远离 t+k 的负样本
-        z3_neg_flat = None  # L2 负样本（远离的未来观测）
-        if z3_neg is not None:
-            z3_neg_flat = z3_neg if z3_neg.dim() == 2 else z3_neg.reshape(-1, z3_neg.shape[-1])
-
-        # L1: obs_t ↔ action_t — GT 时序错位负样本（同 episode 跨 chunk）
-        cross_loss_L1, itm_info = itm_head.compute_loss(
-            z1_flat, z2_flat, action_distances=action_distances,
-            neg_z2=z2_neg_flat, neg_z2_valid=z2_neg_valid,
-            neg_distance=z2_neg_distance,  # L1 action 距离
-        )
-
-        # L2: action_t ↔ obs_{t+k} — GT 远离 t+k 的负样本
-        cross_loss_L2 = torch.tensor(0.0, device=z2.device)  # 默认无 L2
-        itm_info_2 = None  # L2 诊断信息
-        if z3_flat is not None:
-            cross_loss_L2, itm_info_2 = itm_head.compute_loss(
-                z2_flat, z3_flat,
-                neg_z2=z3_neg_flat, neg_z2_valid=z3_neg_valid,
-                neg_distance=z3_neg_distance,  # L2 obs 嵌入距离
-            )
-
-        # 汇总跨模态损失（L1+L2）
-        cross_loss = cross_loss_L1 + cross_loss_L2
-
-        # 诊断用：从 ITM info 提取 gap 信息
-        with torch.no_grad():
-            pos_mean = itm_info['pos_score']  # 正样本分数均值
-            neg_mean = (itm_info['neg_score_1'] + itm_info['neg_score_2']) / 2  # 负样本分数均值
-            cross_gap = pos_mean - neg_mean  # 正负差距
-
-    # ========== 2. 结构保持损失 ==========
-    orig_distances = action_distances.clone()  # 原始动作距离
-    orig_distances[eye_mask] = float('inf')  # 屏蔽自距离
-    max_k = min(top_k, batch_size - 1)  # 实际 k
-    total_pairs = 0  # 统计总对数
-    violated_pairs = 0  # 统计不一致对数
-
+    # ========== 2. 结构保持损失（前 k 个排序） ==========
+    # 复用 InfoNCE 部分已计算的原空间距离
+    # 使用 InfoNCE 部分计算的 orig_distances_for_weight（但需要重新处理对角线）
+    orig_distances = orig_distances_for_weight.clone()  # [batch_size, batch_size]
+    
+    # 排除对角线（自己到自己的距离）
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
+    orig_distances[eye_mask] = float('inf')
+    
+    # 确保 top_k 不超过可用的样本数量
+    max_k = min(top_k, batch_size - 1)
+    
+    # 初始化统计变量
+    total_pairs = 0
+    violated_pairs = 0
+    
     if max_k <= 0:
         structure_loss = torch.tensor(0.0, device=z2.device, dtype=z2.dtype)
     else:
-        _, orig_knn_indices = torch.topk(orig_distances, k=max_k, dim=-1, largest=False)  # 原始 KNN
-        learned_distances = torch.cdist(z2_flat, z2_flat, p=2)  # 学到的距离
-        structure_losses = []  # 每样本结构损失
+        # 对每个样本，找到前 k 个最近邻的索引（在原始空间中）
+        _, orig_knn_indices = torch.topk(orig_distances, k=max_k, dim=-1, largest=False)  # [batch_size, max_k]
+        
+        # 计算学习后的距离矩阵（使用余弦距离，与 InfoNCE 对齐损失保持一致）
+        # 重用 InfoNCE 部分已计算的 z2_norm
+        # 计算余弦相似度矩阵
+        learned_similarity = torch.matmul(z2_norm, z2_norm.T)  # [batch_size, batch_size]
+        # 转换为余弦距离：distance = 1 - similarity（距离越小，相似度越大）
+        learned_distances = 1.0 - learned_similarity  # [batch_size, batch_size]
+        
+        # 对于每个样本，使用 Soft Rank 方法保持排序一致性
+        # Soft Rank: 通过可微排序直接优化排序一致性，比 KL 散度更直接有效
+        structure_losses = []
         for i in range(batch_size):
-            knn_indices = orig_knn_indices[i]  # 第 i 个样本的邻居
-            orig_knn_dists = orig_distances[i, knn_indices]  # 原始邻居距离
-            learned_knn_dists = learned_distances[i, knn_indices]  # 学到的邻居距离
+            knn_indices = orig_knn_indices[i]  # [max_k]
+            
+            # 原始空间中这 k 个邻居的距离
+            orig_knn_dists = orig_distances[i, knn_indices]  # [max_k]
+            
+            # 学习后空间中这 k 个邻居的距离（余弦距离）
+            learned_knn_dists = learned_distances[i, knn_indices]  # [max_k]
+            
+            # ========== Soft Rank 方法 ==========
+            # Soft Rank: 通过可微排序直接优化排序一致性
+            # 对于距离 d，soft rank[i] = sum_j sigmoid((d_j - d_i) / tau)
+            # 这给出了每个元素在所有元素中的"软排名"（有多少个元素比它大）
+            # 距离越小，rank 越小（排名越靠前，rank 接近 0）
+            
+            # 计算原始距离的 soft rank
+            # 构建距离差值矩阵：diff[i,j] = d[j] - d[i]
+            # 如果 d[j] > d[i]，sigmoid 接近 1；如果 d[j] < d[i]，sigmoid 接近 0
+            orig_dists_expanded = orig_knn_dists.unsqueeze(0)  # [1, max_k]
+            orig_dists_expanded_T = orig_knn_dists.unsqueeze(1)  # [max_k, 1]
+            orig_diff = orig_dists_expanded_T - orig_dists_expanded  # [max_k, max_k]
+            # soft rank = sum_j sigmoid((d_j - d_i) / tau)
+            orig_soft_ranks = torch.sigmoid(orig_diff / temperature_structure).sum(dim=1)  # [max_k]
+            
+            # 计算学习后距离的 soft rank
+            learned_dists_expanded = learned_knn_dists.unsqueeze(0)  # [1, max_k]
+            learned_dists_expanded_T = learned_knn_dists.unsqueeze(1)  # [max_k, 1]
+            learned_diff = learned_dists_expanded_T - learned_dists_expanded  # [max_k, max_k]
+            learned_soft_ranks = torch.sigmoid(learned_diff / temperature_structure).sum(dim=1)  # [max_k]
+            
+            # 使用 L1 损失匹配 soft ranks（直接优化排序一致性）
+            # 这比 KL 散度更直接，因为直接优化排序位置而不是概率分布
+            rank_loss = F.l1_loss(learned_soft_ranks/ (max_k - 1), orig_soft_ranks/ (max_k - 1))
+            
+            # ========== Pairwise Sign Loss ==========
+            # 轻量级成对排序符号一致性损失
+            # 直接优化距离差值的符号一致性，比 soft rank 更直接
+            # 只关心相对大小关系（d[j] > d[i] 还是 d[j] < d[i]），不关心具体数值
+            pair_loss = torch.mean(
+                (learned_diff.sign() - orig_diff.sign()).abs()
+            )
+            
+            # 结合 soft rank loss 和 pairwise sign loss
+            # pair_loss 权重较小（0.1），避免过度影响，但能有效惩罚排序错误
+            combined_loss = rank_loss + 0.1 * pair_loss
+            structure_losses.append(combined_loss)
+            
+            # 统计信息：计算排序一致性（通过比较硬排序）
+            # 原始排序（按距离从小到大）
+            orig_ranks = torch.argsort(orig_knn_dists)  # [max_k]
+            # 学习后排序（按距离从小到大）
+            learned_ranks = torch.argsort(learned_knn_dists)  # [max_k]
+            # 计算排序一致的邻居数量
+            rank_matches = (orig_ranks == learned_ranks).sum().item()
+            total_pairs += max_k
+            violated_pairs += (max_k - rank_matches)  # 不一致的数量
+        
+        structure_loss = torch.mean(torch.stack(structure_losses))  # scalar
+        violation_rate = violated_pairs / total_pairs if total_pairs > 0 else 0.0
 
-            # Soft Rank
-            orig_dists_expanded = orig_knn_dists.unsqueeze(0)  # [1, k]
-            orig_dists_expanded_T = orig_knn_dists.unsqueeze(1)  # [k, 1]
-            orig_diff = orig_dists_expanded_T - orig_dists_expanded  # 成对差值
-            orig_soft_ranks = torch.sigmoid(orig_diff / temperature_structure).sum(dim=1)  # 软排序
-
-            learned_dists_expanded = learned_knn_dists.unsqueeze(0)  # [1, k]
-            learned_dists_expanded_T = learned_knn_dists.unsqueeze(1)  # [k, 1]
-            learned_diff = learned_dists_expanded_T - learned_dists_expanded  # 成对差值
-            learned_soft_ranks = torch.sigmoid(learned_diff / temperature_structure).sum(dim=1)  # 软排序
-
-            rank_loss = F.l1_loss(learned_soft_ranks / (max_k - 1), orig_soft_ranks / (max_k - 1))  # 排名损失
-            pair_loss = torch.mean((learned_diff.sign() - orig_diff.sign()).abs())  # 相对顺序一致性
-            combined_loss = rank_loss + 0.1 * pair_loss  # 组合结构损失
-            structure_losses.append(combined_loss)  # 收集
-
-            # 统计排序一致性
-            orig_ranks = torch.argsort(orig_knn_dists)  # 原始排序
-            learned_ranks = torch.argsort(learned_knn_dists)  # 学到排序
-            rank_matches = (orig_ranks == learned_ranks).sum().item()  # 排序一致数
-            total_pairs += max_k  # 累计总对数
-            violated_pairs += (max_k - rank_matches)  # 统计不一致对
-
-        # 聚合结构损失（batch 平均）
-        structure_loss = torch.mean(torch.stack(structure_losses))
-        violation_rate = violated_pairs / total_pairs if total_pairs > 0 else 0.0  # 一致性比例
-
-    # ========== 4. 防坍缩损失 ==========
-    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # z1 标准差
-    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # z2 标准差
-    # 方差项：鼓励各维度方差不小于 gamma
+    # ========== 3. 防坍缩损失（Variance + Covariance） ==========
+    # Variance loss: 鼓励每个特征维度的标准差接近 gamma
+    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # [dim]
+    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # [dim]
     variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
-
-    # 协方差项：惩罚特征维度间相关性（去掉对角线）
-    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # 去均值
-    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # 去均值
-    cov_z1 = (z1_centered.T @ z1_centered) / (batch_size - 1)  # 协方差
-    cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)  # 协方差
-
-    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)  # 非对角 mask
-    offdiag_z1 = cov_z1 * off_diagonal_mask  # 去对角线
-    offdiag_z2 = cov_z2 * off_diagonal_mask  # 去对角线
-    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim * dim)  # z1 协方差损失
-    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim * dim)  # z2 协方差损失
-    covariance_loss = cov_loss_z1 + cov_loss_z2  # 协方差总损失
-
-    # 防坍缩损失 = 方差项 + 协方差项
+    
+    # Covariance loss: 鼓励特征维度之间去相关
+    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # [batch_size, dim]
+    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # [batch_size, dim]
+    
+    cov_z1 = (z1_centered.T @ z1_centered) / (batch_size - 1)  # [dim, dim]
+    cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)  # [dim, dim]
+    
+    # Off-diagonal mask
+    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)
+    offdiag_z1 = cov_z1 * off_diagonal_mask
+    offdiag_z2 = cov_z2 * off_diagonal_mask
+    
+    # Covariance loss (normalize by dim)
+    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim*dim)
+    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim*dim)
+    covariance_loss = cov_loss_z1 + cov_loss_z2
+    
     anticollapse_loss = variance_loss + covariance_loss
 
-    # ========== 总损失（使用动态权重）==========
-    # intra_loss 已移除（不再使用同模态 RS-CL），仅保留 cross/structure/anticollapse
-    weighted_cross_loss = lambda_cross_eff * cross_loss  # 跨模态加权
-    weighted_structure_loss = lambda_structure * structure_loss  # 结构加权
-    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss  # 防坍缩加权
-
-    # 三项损失线性加权得到 CMP 总损失
-    total_loss = weighted_cross_loss + weighted_structure_loss + weighted_anticollapse_loss
-
+    # ========== 总损失 ==========
+    weighted_align_loss = lambda_align * align_loss
+    weighted_structure_loss = lambda_structure * structure_loss
+    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss
+    
+    total_loss = weighted_align_loss + weighted_structure_loss + weighted_anticollapse_loss
+    
     # ========== 日志输出 ==========
-    step = contrastive_loss_with_structure.step_count  # 当前步数
-    cross_mode = "ITM" if itm_head is not None else "dot"  # 跨模态类型
-    logger = logging.getLogger(__name__)  # 日志器
-
-    # 提取 soft label 信息
-    soft_label_val = itm_info.get('avg_neg_soft_label', 0.0) if itm_info is not None else 0.0  # 软负标签均值
-
-    # 每 10 步：简洁一行日志
+    step = contrastive_loss_with_structure.step_count
     if step % log_interval == 0:
-        total_val = total_loss.item()  # 当前总损失
-        if itm_head is not None:
-            logger.info(f"[CMP|{step:4d}] "
-                  f"z1:{z1_internal_sim:.3f} z2:{z2_internal_sim:.3f} | "
-                  f"gap:{cross_gap:+.3f}(ITM) soft_neg:{soft_label_val:.3f} | "
-                  f"L:{total_val:.4f}")
-        else:
-            logger.info(f"[CMP|{step:4d}] "
-                  f"z1:{z1_internal_sim:.3f} z2:{z2_internal_sim:.3f} | "
-                  f"gap:{cross_gap:+.3f}(dot) | "
-                  f"L:{total_val:.4f}")
-
-    # 每 100 步：详细损失分解
-    if step % 100 == 0:
-        cross_val = cross_loss.item()  # 跨模态值
-        structure_val = structure_loss.item()  # 结构值
-        anticollapse_val = anticollapse_loss.item()  # 防坍缩值
-        total_val = total_loss.item()  # 总损失
-
-        detail_log = (
-            f"\n{'='*70}\n"
-            f"[Step {step}] CMP Loss Breakdown (cross: {cross_mode})\n"
-            f"{'='*70}\n"
-            f"  Cross-Modal ({cross_mode}): {cross_val:.4f} × {lambda_cross_eff:.2f} = {cross_val * lambda_cross_eff:.4f}\n"
-        )
-        if itm_info is not None:
-            detail_log += (
-                f"    L1 (obs_t↔act_t): pos_score={itm_info['pos_score']:.4f}, "
-                f"neg_score={itm_info['neg_score_1']:.4f}/{itm_info['neg_score_2']:.4f}, "
-                f"pos_acc={itm_info['pos_acc']:.3f}, soft_neg_label={itm_info.get('avg_neg_soft_label', 0):.3f}\n"
-            )
-            if itm_info_2 is not None:
-                detail_log += (
-                    f"    L2 (act_t↔obs_t+k): pos_score={itm_info_2['pos_score']:.4f}, "
-                    f"neg_score={itm_info_2['neg_score_1']:.4f}/{itm_info_2['neg_score_2']:.4f}, "
-                    f"pos_acc={itm_info_2['pos_acc']:.3f}\n"
-                )
-            if itm_info.get('neg_type') == 'gt_temporal':
-                detail_log += (
-                    f"    L1 Neg: GT temporal offset, "
-                    f"valid_ratio={itm_info.get('neg_valid_ratio', 0):.2f}\n"
-                )
-        else:
-            temp_val = temperature.item() if hasattr(temperature, 'item') else temperature
-            detail_log += f"    pos: {pos_mean:.4f}, neg: {neg_mean:.4f}, gap: {cross_gap:+.4f}, T: {temp_val:.4f}\n"
-        detail_log += f"  Structure (top-{top_k}):   {structure_val:.4f} × {lambda_structure:.2f} = {structure_val * lambda_structure:.4f}\n"
+        # 将 tensor 转换为 Python 数值用于打印
+        align_val = align_loss.item()
+        structure_val = structure_loss.item()
+        variance_val = variance_loss.item()
+        covariance_val = covariance_loss.item()
+        anticollapse_val = anticollapse_loss.item()
+        total_val = total_loss.item()
+        weighted_align_val = weighted_align_loss.item()
+        weighted_structure_val = weighted_structure_loss.item()
+        weighted_anticollapse_val = weighted_anticollapse_loss.item()
+        
+        # 计算正样本余弦相似度平均值
+        pos_sim_mean = pos_similarity.mean().item()
+        
+        print(f"\n[Step {step}] Contrastive Loss Breakdown:")
+        print(f"  ├─ Align Loss (InfoNCE):")
+        print(f"  │   raw: {align_val:.6f}, weighted (×{lambda_align:.2f}): {weighted_align_val:.6f}")
+        print(f"  │   └─ Positive similarity (avg): {pos_sim_mean:.4f}")
+        print(f"  ├─ Structure Loss (top-{top_k} ranking, soft-rank L1):")
+        print(f"  │   raw: {structure_val:.6f}, weighted (×{lambda_structure:.2f}): {weighted_structure_val:.6f}")
+        print(f"  │   temperature: {temperature_structure:.3f}")
         if max_k > 0 and total_pairs > 0:
-            consistent_rate = ((total_pairs - violated_pairs) / total_pairs) * 100  # 排序一致率
-            detail_log += f"    ranking consistency: {consistent_rate:.1f}%\n"
-        detail_log += (
-            f"  Anti-collapse:        {anticollapse_val:.4f} × {lambda_anticollapse:.2f} = {anticollapse_val * lambda_anticollapse:.4f}\n"
-            f"  Total Loss:           {total_val:.4f}\n"
-            f"  Feature Stats:        z1_sim={z1_internal_sim:.4f} | z2_sim={z2_internal_sim:.4f}\n"
-            f"{'='*70}"
-        )
-        logger.info(detail_log)
-
-    # ========== 返回 loss + 子项 dict（供 wandb 日志） ==========
-    loss_info = {
-        "cmp/structure_loss": structure_loss.item(),
-    }
-    if itm_head is not None:
-        loss_info["cmp/z1_z2_cross_loss"] = cross_loss_L1.item()
-        loss_info["cmp/z2_z3_cross_loss"] = cross_loss_L2.item()
-        loss_info["cmp/total_cross_loss"] = cross_loss.item()
-        if itm_info.get('neg_type') == 'gt_temporal':
-            loss_info["cmp/L1_neg_valid_ratio"] = itm_info.get('neg_valid_ratio', 0)
-    else:
-        loss_info["cmp/total_cross_loss"] = cross_loss.item()
-
-    return total_loss, loss_info
+            consistent_pairs = total_pairs - violated_pairs
+            consistent_rate = (consistent_pairs / total_pairs) * 100
+            print(f"  │   └─ Ranking consistency: {consistent_pairs}/{total_pairs} ({consistent_rate:.1f}%)")
+        print(f"  ├─ Anti-collapse Loss:")
+        print(f"  │   ├─ Variance: {variance_val:.6f}")
+        print(f"  │   ├─ Covariance: {covariance_val:.6f}")
+        print(f"  │   └─ Total: {anticollapse_val:.6f}, weighted (×{lambda_anticollapse:.2f}): {weighted_anticollapse_val:.6f}")
+        print(f"  └─ Total Loss: {total_val:.6f}")
+        print("-" * 70)
+    
+    return total_loss
 
 
 def compute_vicreg_similarity(
@@ -1569,189 +1384,6 @@ class SingleHeadContentAttention(nn.Module):
         return output
 
 
-class CrossModalAttention(nn.Module):
-    """跨模态注意力模块，让一个模态"看到"另一个模态。
-
-    核心思想：z1 和 z2 来自不同模态，直接比较难以建立配对关系。
-    通过 cross-attention，让 z1 基于 batch 内所有 z2 生成 attended 表示，
-    正样本对 (z1[i], z2[i]) 的 attention 应该更强。
-    """
-
-    def __init__(self, hidden_dim: int = 1024, num_heads: int = 8, dropout: float = 0.1):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-
-        # Q 来自一个模态，K/V 来自另一个模态
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        self.layer_norm_q = nn.LayerNorm(hidden_dim)
-        self.layer_norm_kv = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, query: Tensor, key_value: Tensor) -> Tensor:
-        """
-        Args:
-            query: [batch, hidden_dim] - 查询模态（如观察 z1）
-            key_value: [batch, hidden_dim] - 键值模态（如动作 z2）
-        Returns:
-            attended: [batch, hidden_dim] - query 基于 key_value 的表示
-        """
-        batch_size = query.size(0)
-
-        # LayerNorm
-        q = self.layer_norm_q(query)  # [batch, hidden_dim]
-        kv = self.layer_norm_kv(key_value)  # [batch, hidden_dim]
-
-        # 投影
-        Q = self.q_proj(q)  # [batch, hidden_dim]
-        K = self.k_proj(kv)  # [batch, hidden_dim]
-        V = self.v_proj(kv)  # [batch, hidden_dim]
-
-        # 重塑为多头格式 [batch, num_heads, head_dim]
-        Q = Q.view(batch_size, self.num_heads, self.head_dim)
-        K = K.view(batch_size, self.num_heads, self.head_dim)
-        V = V.view(batch_size, self.num_heads, self.head_dim)
-
-        # 注意力计算：每个 query i 与 batch 内所有 key j 计算
-        # Q: [batch_q, num_heads, head_dim]
-        # K: [batch_k, num_heads, head_dim]
-        # attn[i, h, j] = Q[i, h, :] @ K[j, h, :] / sqrt(head_dim)
-        # 使用 einsum: 'bnh,cnh->bnc' 表示 batch_q x num_heads x batch_k
-        attn_weights = torch.einsum('bnh,cnh->bnc', Q, K) / (self.head_dim ** 0.5)
-        attn_weights = F.softmax(attn_weights, dim=-1)  # 对 batch_k 维度 softmax
-        attn_weights = self.dropout(attn_weights)
-
-        # 加权求和：output[i, h, :] = sum_j attn[i, h, j] * V[j, h, :]
-        # attn: [batch_q, num_heads, batch_k]
-        # V: [batch_k, num_heads, head_dim]
-        # 使用 einsum: 'bnc,cnh->bnh'
-        attended = torch.einsum('bnc,cnh->bnh', attn_weights, V)
-
-        # 重塑回 [batch, hidden_dim]
-        attended = attended.reshape(batch_size, self.hidden_dim)
-        attended = self.out_proj(attended)
-
-        # 残差连接
-        return query + attended
-
-
-class ObsQueryBridge(nn.Module):
-    """使用可学习的 Query tokens 从 VLM 序列中提取观测特征，生成 z1 (obs embedding)。"""
-
-    def __init__(
-        self,
-        input_dim: int = 2048,
-        output_dim: int = 512,
-        num_queries: int = 64,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.num_queries = num_queries
-        self.num_heads = num_heads
-        self.head_dim = output_dim // num_heads
-
-        self.queries = nn.Parameter(torch.randn(num_queries, output_dim) * 0.02)
-        self.input_proj = nn.Linear(input_dim, output_dim)
-        self.q_proj = nn.Linear(output_dim, output_dim)
-        self.k_proj = nn.Linear(output_dim, output_dim)
-        self.v_proj = nn.Linear(output_dim, output_dim)
-        self.o_proj = nn.Linear(output_dim, output_dim)
-        self.gating_factor = nn.Parameter(torch.zeros(1))  # 初始为 0，逐渐学习
-        self.attn_dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(output_dim)
-        self.output_proj = nn.Sequential(
-            nn.Linear(output_dim, output_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(output_dim * 2, output_dim),
-        )
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(output_dim),
-            nn.Linear(output_dim, output_dim),
-            nn.GELU(),
-        )
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.zeros_(self.q_proj.bias)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.zeros_(self.k_proj.bias)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.zeros_(self.v_proj.bias)
-        nn.init.xavier_uniform_(self.o_proj.weight)
-        nn.init.zeros_(self.o_proj.bias)
-        for module in self.output_proj:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-
-    def forward(self, vlm_features: Tensor) -> Tensor:
-        """vlm_features: [batch, seq_len, input_dim] -> [batch, output_dim]
-
-        VLA-Adapter 风格的 gating（参照 MLPResNetBlock_Pro）：
-        - VLM attention (queries → VLM)：无 gating，始终有效，提供输入依赖
-        - Query refinement (queries → queries)：有 gating，可学习的 refinement
-        - gating=0 时：z1 仍依赖 VLM features，可区分样本
-        - gating 增大时：query 间交互增强，学习更复杂的模式
-        """
-        batch_size = vlm_features.size(0)
-        seq_len = vlm_features.size(1)
-
-        vlm_proj = self.input_proj(vlm_features)
-        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
-
-        ratio_g = torch.tanh(self.gating_factor)
-
-        # Q, K, V 投影
-        Q = self.q_proj(queries)
-        K_vlm = self.k_proj(vlm_proj)    # VLM attention K
-        V_vlm = self.v_proj(vlm_proj)    # VLM attention V
-        K_query = self.k_proj(queries)   # query refinement K
-        V_query = self.v_proj(queries)   # query refinement V
-
-        # 重塑为多头格式
-        Q = Q.view(batch_size, self.num_queries, self.num_heads, self.head_dim).transpose(1, 2)
-        K_vlm = K_vlm.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V_vlm = V_vlm.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K_query = K_query.view(batch_size, self.num_queries, self.num_heads, self.head_dim).transpose(1, 2)
-        V_query = V_query.view(batch_size, self.num_queries, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # VLA-Adapter 风格：VLM attention 无 gating，query refinement 有 gating
-        attn_scores_vlm = torch.matmul(Q, K_vlm.transpose(-2, -1))  # 无 gating，始终有效
-        attn_scores_query = torch.matmul(Q, K_query.transpose(-2, -1)) * ratio_g  # 有 gating
-
-        # 合并并 softmax
-        attn_scores = torch.cat([attn_scores_vlm, attn_scores_query], dim=-1) / (self.head_dim ** 0.5)
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # 合并 V 并计算输出
-        V_combined = torch.cat([V_vlm, V_query], dim=2)
-        attn_out = torch.matmul(attn_weights, V_combined)
-
-        attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, self.num_queries, self.output_dim)
-        attn_out = self.o_proj(attn_out)
-
-        # 残差 + FFN
-        out = self.ffn(attn_out + queries)
-        out = self.norm(out)
-        out = out.mean(dim=1)
-        out = self.output_proj(out)
-
-        return out
-
-
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
@@ -1800,55 +1432,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.part_layer_num = None
         self.cmp_step = 0
 
-        # 投影层
-        self.proj_z1 = nn.Sequential(
+        # 投影头：将 paligemma 的 hidden_dim (2048) 投影到 action_expert 的 hidden_dim (1024)
+        # 用于对比学习中的维度匹配
+        self.cmp_projection = nn.Sequential(
             nn.Linear(paligemma_config.width, paligemma_config.width),
+            # nn.LayerNorm(paligemma_config.width),
             nn.GELU(),
-            nn.Linear(paligemma_config.width, 512),
+            nn.Linear(paligemma_config.width, action_expert_config.width),
         )
-        self.proj_z2 = nn.Sequential(
-            nn.Linear(action_expert_config.width, action_expert_config.width),
+        self.share_projection = nn.Sequential(
+            nn.Linear(action_expert_config.width, paligemma_config.width),
             nn.GELU(),
-            nn.Linear(action_expert_config.width, 512),
+            nn.Linear(paligemma_config.width, action_expert_config.width),
         )
 
-        # ObsQueryBridge: 从 VLM 序列提取动作相关特征
-        self.obs_query_bridge = ObsQueryBridge(
-            input_dim=paligemma_config.width,
-            output_dim=512,
-            num_queries=64,
-            num_heads=8,
-            dropout=0.1,
-        )
-
-        self.cmp_projection = self.proj_z1
-
-        # ITM Head (ALBEF style) — 替代 dot product 做跨模态匹配
-        self.itm_head = ITMHead(hidden_dim=512, proj_dim=256, dropout=0.1)
-
-        # ForwardModel: 嵌入空间前向动力学（服务 replan 检测）
-        self.forward_model = ForwardModel(hidden_dim=512)
-
-        self.infonce_log_inv_temp = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
-
-        self.cross_modal_attention = CrossModalAttention(
-            hidden_dim=512,
-            num_heads=8,
-            dropout=0.1,
-        )
-
-        # z1 → z2 predictor：将 z1 映射到 z2 空间
-        self.z1_to_z2_predictor = nn.Sequential(
-            nn.Linear(512, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 512),
-        )
-
-        self._cross_modal_attention_deprecated = CrossModalAttention(
-            hidden_dim=512,
-            num_heads=8,
-            dropout=0.1,
-        )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -2097,36 +1694,34 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             img_masks,
             tokens,
             masks,
-            future_images=None,
-            future_img_masks=None,
-            neg_gt_actions=None,
-            neg_action_valid=None,
-            neg_future_images=None,
-            neg_future_img_masks=None,
-            neg_future_valid=None,
-            neg_action_distance=None,  # L1 负样本 action 距离
+            lambda_param: float = 25.0,
+            mu_param: float = 25.0,
+            nu_param: float = 1.0,
+            gamma: float = 0.4,
     ) -> Tensor:
-        """三元因果链对比学习: obs_t ↔ action_t ↔ obs_{t+k}
-
-        使用 ALBEF ITM (Image-Text Matching) 做匹配判断，不依赖 dot product。
+        """对比学习前向传播，使用基于正负样本对的 Triplet Loss。
 
         Args:
-            images: 当前帧图像列表 (obs_t)
-            img_masks: 当前帧图像掩码列表
+            images: 图像列表
+            img_masks: 图像掩码列表
             tokens: 语言 tokens
             masks: 语言 token 掩码
-            future_images: 未来帧图像列表 (obs_{t+k})，None 时退化为二元
-            future_img_masks: 未来帧图像掩码列表
-            neg_gt_actions: [B, att_len, action_dim] 同 episode GT 时序错位动作（L1 负样本）
-            neg_action_valid: [B] bool，每个样本 neg 是否有效
-            neg_future_images: 同 episode 远离 t+k 的 GT obs 图像列表（L2 负样本）
-            neg_future_img_masks: neg_future 图像掩码列表
-            neg_future_valid: [B] bool，每个样本 neg_future 是否有效
+            lambda_param: 保留参数（兼容性，当前未使用）
+            mu_param: 保留参数（兼容性，当前未使用）
+            nu_param: 保留参数（兼容性，当前未使用）
+            gamma: 保留参数（兼容性，当前未使用）
 
         Returns:
-            对比学习损失 (expanded to [batch_size, 1, action_dim])
+            对比学习损失 (scalar tensor)
+            
+        Note:
+            当前使用 contrastive_triplet_loss，参数固定为：
+            - lambda_param=1.0 (主损失权重)
+            - mu_param=0.0 (正样本对拉近损失权重)
+            - nu_param=0.0 (正则化项权重)
+            - gamma=0.5 (Triplet Loss 的 margin)
+            - use_triplet=True (使用 Triplet Loss 模式)
         """
-        # 功能总结：构造 z1/z2/z3 及其负样本，计算 CMP 各子项损失，并附加前向动力学损失。
         if self.cls_head_prefix is None:
             raise ValueError(
                 "cls_head_prefix is not initialized. Please set part_layer_num in config."
@@ -2140,19 +1735,41 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 "part_layer_num is not set in config."
             )
 
-        batch_size = tokens.shape[0]  # batch 大小
-        device = tokens.device  # 设备
+        batch_size = tokens.shape[0]
+        device = tokens.device
 
-        # ========== VLM 前向（共用辅助函数） ==========
-        action_expert_config = get_gemma_config(self.config.action_expert_variant)  # expert 配置
-        cls_head = self.cls_head_prefix.expand(batch_size, -1, -1)  # 复制 CLS token
-        cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)  # CLS pad mask
-        cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)  # CLS attention mask
+        # 第一步：准备 prefix embeddings，并将 cls_head_prefix 添加到前面
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+
+        # 将 cls_head_prefix 添加到 prefix_embs 的前面
+        # 确保数据类型匹配
+        cls_head = self.cls_head_prefix.expand(batch_size, -1, -1)  # [batch_size, 1, hidden_dim]
+        cls_head = cls_head.to(dtype=prefix_embs.dtype)  # 确保数据类型匹配
+        prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1)  # [batch_size, 1 + seq_len, hidden_dim]
+
+        # 更新 pad_masks 和 att_masks，为 cls_head 添加对应的掩码
+        cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        prefix_pad_masks_with_cls = torch.cat([cls_pad_mask, prefix_pad_masks], dim=1)
+
+        cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)  # cls_head 可以 attend 到所有之前的内容
+        prefix_att_masks_with_cls = torch.cat([cls_att_mask.unsqueeze(0).expand(batch_size, -1), prefix_att_masks],
+                                              dim=1)
+
+        # 准备一个 dummy suffix_embs（forward_partial 需要两个输入）
+        action_expert_config = get_gemma_config(self.config.action_expert_variant)
         dummy_suffix_embs = torch.zeros(
-            batch_size, 1, action_expert_config.width, dtype=cls_head.dtype, device=device
+            batch_size, 1, action_expert_config.width, dtype=prefix_embs_with_cls.dtype, device=device
         )
-        dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)  # 虚拟 suffix pad
-        dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)  # 虚拟 suffix att
+        dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
+
+        # 合并 masks
+        pad_masks = torch.cat([prefix_pad_masks_with_cls, dummy_suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks_with_cls, dummy_suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_partial_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids):
             intermediate_embeds, intermediate_state = self.paligemma_with_expert.forward_partial(
@@ -2165,73 +1782,32 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
             return intermediate_embeds, intermediate_state
 
-        def encode_obs(imgs, img_msks):
-            """将一组图像通过 VLM + ObsQueryBridge 编码为 z [B, 512]"""
-            # 1) 取前缀 embedding（图像+语言）
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                imgs, img_msks, tokens, masks
-            )
-            # 2) 拼接 cls token，形成用于 CMP 的序列输入
-            prefix_embs_with_cls = torch.cat(
-                [cls_head.to(dtype=prefix_embs.dtype), prefix_embs], dim=1
-            )
-            prefix_pad_masks_with_cls = torch.cat([cls_pad_mask, prefix_pad_masks], dim=1)
-            prefix_att_masks_with_cls = torch.cat(
-                [cls_att_mask.unsqueeze(0).expand(batch_size, -1), prefix_att_masks], dim=1
-            )
-            # 3) 构造 attention mask
-            pad_msks = torch.cat([prefix_pad_masks_with_cls, dummy_suffix_pad_masks], dim=1)
-            att_msks = torch.cat([prefix_att_masks_with_cls, dummy_suffix_att_masks], dim=1)
-            att_2d = make_att_2d_masks(pad_msks, att_msks)
-            pos_ids = torch.cumsum(pad_msks, dim=1) - 1
-            att_4d = self._prepare_attention_masks_4d(att_2d)
+        intermediate_embeds, intermediate_state = self._apply_checkpoint(
+            forward_partial_func, prefix_embs_with_cls, dummy_suffix_embs, att_2d_masks_4d, position_ids
+        )
 
-            # 4) 仅前向到 part_layer_num，得到中间特征
-            inter_embeds, _ = self._apply_checkpoint(
-                forward_partial_func, prefix_embs_with_cls, dummy_suffix_embs, att_4d, pos_ids
-            )
-            # vlm_seq = inter_embeds[0]  # 原版：CMP 梯度回传到 VLM front 6 layers
-            # 5) 关键：CMP 梯度在此处截断，VLM 仅由 BC 更新
-            vlm_seq = inter_embeds[0].detach()  # 切断 CMP → VLM 梯度，BC 独占 VLM 更新
-            # 6) 通过 ObsQueryBridge 得到 z 表示
-            z = self.obs_query_bridge(vlm_seq).to(dtype=torch.float32)
-            # 7) 可选的 embedding 范数裁剪
-            return _clamp_embedding_norm(z, self.config.embedding_max_norm)
+        # 从中间输出中提取分类头对应的输出（第一个 token）
+        cmp_vec_0 = intermediate_embeds[0][:, 0, :]  # [batch_size, paligemma_hidden_dim]
+        # 通过投影头将 cmp_vec_0 从 paligemma 的维度投影到 action_expert 的维度
+        cmp_vec_0 = self.cmp_projection(cmp_vec_0)  # [batch_size, action_expert_hidden_dim]
+        cmp_vec_0 = cmp_vec_0.to(dtype=torch.float32)  # 转换为 float32 用于损失计算
 
-        # ========== z1: obs_t ==========
-        cmp_vec_0 = encode_obs(images, img_masks)  # [B, 512]
+        # 确保维度正确
         if cmp_vec_0.dim() != 2:
-            raise ValueError(f"Expected cmp_vec_0 to be 2D, got shape {cmp_vec_0.shape}")
+            raise ValueError(f"Expected cmp_vec_0 to be 2D [batch_size, hidden_dim], got shape {cmp_vec_0.shape}")
 
-        # ========== z2: action_t → ContentAttention → proj_z2 ==========
-        attn_act_len = self.content_attention.attn_act_len  # 取前几步动作
-        actions = self.sample_actions(images, img_masks, tokens, masks)  # 采样动作序列
-        origin_action_dim = self.config.output_features[ACTION].shape[0]  # 原始动作维度
-        selected_actions = actions[:, :attn_act_len, :origin_action_dim]  # 选取用于 CMP 的动作
-        cmp_vec_1_raw = self.content_attention(selected_actions)  # 动作聚合表征
-        # action 表征投影到 CMP 共享空间，并进行可选范数裁剪
-        cmp_vec_1 = _clamp_embedding_norm(self.proj_z2(cmp_vec_1_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
+        # 第二步：将 actions 输入到 SingleHeadContentAttention 中
+        # 首先需要将 actions 投影到 hidden_dim，然后组织成 [batch_size, attn_act_len, hidden_dim] 的格式
+        attn_act_len = self.content_attention.attn_act_len
 
-        # ========== z2_neg: 同 episode GT 时序错位负样本 ==========
-        cmp_vec_1_neg = None  # L1 负样本表征
-        neg_valid = None  # L1 负样本有效标记
-        if neg_gt_actions is not None and neg_action_valid is not None:
-            # neg_gt_actions: [B, att_len, action_dim]
-            cmp_vec_1_neg_raw = self.content_attention(neg_gt_actions)
-            cmp_vec_1_neg = _clamp_embedding_norm(self.proj_z2(cmp_vec_1_neg_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
-            neg_valid = neg_action_valid  # [B] bool
+        actions = self.sample_actions(images, img_masks, tokens, masks)
+        origin_action_dim = self.config.output_features[ACTION].shape[0]
+        # 选择前 attn_act_len 个 action steps
+        selected_actions = actions[:, :attn_act_len, :origin_action_dim]  # [batch_size, attn_act_len, max_action_dim]
 
-        # ========== z3: obs_{t+k} ==========
-        cmp_vec_2 = None  # z3：未来观测表征
-        if future_images is not None and future_img_masks is not None:
-            cmp_vec_2 = encode_obs(future_images, future_img_masks)
-
-        # ========== z3_neg: 同 episode 远离 t+k 的 GT obs（L2 负样本）==========
-        cmp_vec_2_neg = None  # z3_neg：远离未来观测
-        neg_future_valid_flag = None  # L2 负样本有效标记
-        if neg_future_images is not None and neg_future_img_masks is not None:
-            cmp_vec_2_neg = encode_obs(neg_future_images, neg_future_img_masks)
-            neg_future_valid_flag = neg_future_valid  # [B] bool
+        # 通过 SingleHeadContentAttention 得到 cmp_vec_1
+        cmp_vec_1 = self.content_attention(selected_actions)  # [batch_size, hidden_dim]
+        cmp_vec_1 = cmp_vec_1.to(dtype=torch.float32)  # 转换为 float32 用于损失计算
 
         # 确保维度匹配
         if cmp_vec_0.shape != cmp_vec_1.shape:
@@ -2239,86 +1815,43 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"Dimension mismatch: cmp_vec_0 shape {cmp_vec_0.shape} != cmp_vec_1 shape {cmp_vec_1.shape}"
             )
 
-        # ========== 计算 L2 负样本距离（obs 嵌入 L2 距离）==========
-        neg_future_distance = None  # L2 负样本距离
-        if cmp_vec_2 is not None and cmp_vec_2_neg is not None:
-            # [B] 每个样本的 obs 嵌入 L2 距离
-            neg_future_distance = torch.norm(cmp_vec_2 - cmp_vec_2_neg, p=2, dim=-1)
+        # 第三步：使用对比学习损失计算（基于正负样本对的 Triplet Loss）
+        # 原来的 VICReg loss（已注释）
+        # loss_scalar = vicreg_loss(
+        #     cmp_vec_0,
+        #     cmp_vec_1,
+        #     lambda_param=lambda_param,
+        #     mu_param=mu_param,
+        #     nu_param=nu_param,
+        #     gamma=gamma,
+        # )
 
-            # Debug logging for L2 embedding distance
-            if hasattr(self, 'cmp_step') and self.cmp_step % 100 == 0:
-                print(f"[forward_cmp L2] step={self.cmp_step}, "
-                      f"neg_future_distance mean={neg_future_distance.mean().item():.4f}, "
-                      f"min={neg_future_distance.min().item():.4f}, "
-                      f"max={neg_future_distance.max().item():.4f}")
-                if neg_action_distance is not None:
-                    print(f"[forward_cmp L1] step={self.cmp_step}, "
-                          f"neg_action_distance mean={neg_action_distance.mean().item():.4f}, "
-                          f"min={neg_action_distance.min().item():.4f}, "
-                          f"max={neg_action_distance.max().item():.4f}")
-
-        # ========== 调用 contrastive_loss_with_structure ==========
-        loss_scalar, cmp_loss_info = contrastive_loss_with_structure(  # CMP 主损失
-            z1=cmp_vec_0,
-            z2=cmp_vec_1,
-            z2_original=selected_actions,
-            itm_head=self.itm_head,
-            z3=cmp_vec_2,
-            z2_neg=cmp_vec_1_neg,
-            z2_neg_valid=neg_valid,
-            z2_neg_distance=neg_action_distance,  # L1 负样本 action 距离
-            z3_neg=cmp_vec_2_neg,
-            z3_neg_valid=neg_future_valid_flag,
-            z3_neg_distance=neg_future_distance,  # L2 负样本 obs 嵌入距离
-        )
-
-        # ========== L_forward: 前向动力学预测 loss（cosine loss）==========
-        # 用 cosine loss 而非 MSE：只关注方向预测，不受 embedding norm 膨胀影响
-        if cmp_vec_2 is not None:  # z3 存在时才计算
-            # 仅更新 forward_model：输入与目标均 detach
-            predicted_z3 = self.forward_model(cmp_vec_0.detach(), cmp_vec_1.detach())
-            cos_sim = F.cosine_similarity(predicted_z3, cmp_vec_2.detach(), dim=-1)
-            l_forward = (1.0 - cos_sim).mean()
-            # 将前向动力学损失叠加到 CMP 总损失
-            loss_scalar = loss_scalar + l_forward
-
-            with torch.no_grad():
-                forward_l2 = torch.norm(predicted_z3 - cmp_vec_2.detach(), dim=-1).mean()
-                z1_norm = torch.norm(cmp_vec_0.detach(), dim=-1).mean()
-                z3_norm = torch.norm(cmp_vec_2.detach(), dim=-1).mean()
-                pred_z3_norm = torch.norm(predicted_z3, dim=-1).mean()
-            cmp_loss_info["cmp/l_forward"] = l_forward.item()
-            cmp_loss_info["cmp/forward_cos_sim"] = cos_sim.mean().item()
-            cmp_loss_info["cmp/forward_l2"] = forward_l2.item()
-            cmp_loss_info["cmp/z1_norm"] = z1_norm.item()
-            cmp_loss_info["cmp/z3_norm"] = z3_norm.item()
-            cmp_loss_info["cmp/pred_z3_norm"] = pred_z3_norm.item()
-
-            # 每 10 步打印诊断
-            if self.cmp_step % 10 == 0:
-                _fwd_logger = logging.getLogger(__name__)
-                if self.cmp_step % 100 == 0:
-                    _fwd_logger.info(
-                        f"  L_forward (cosine):   {l_forward.item():.4f}\n"
-                        f"  cos_sim(pred,z3):     {cos_sim.mean().item():.4f}\n"
-                        f"  Forward L2 distance:  {forward_l2.item():.4f}\n"
-                        f"  ‖z1‖={z1_norm.item():.2f}  ‖z3‖={z3_norm.item():.2f}  ‖pred_z3‖={pred_z3_norm.item():.2f}\n"
-                        f"  Total+Forward:        {loss_scalar.item():.4f}"
-                    )
-                else:
-                    _fwd_logger.info(
-                        f"[ForwardModel|{self.cmp_step:4d}] "
-                        f"l_fwd:{l_forward.item():.4f} cos:{cos_sim.mean().item():.4f} "
-                        f"‖z1‖:{z1_norm.item():.2f} ‖z3‖:{z3_norm.item():.2f} ‖pred‖:{pred_z3_norm.item():.2f}"
+        cmp_vec_0 = self.share_projection(cmp_vec_0)
+        cmp_vec_1 = self.share_projection(cmp_vec_1)
+        # 使用基于正负样本对的对比学习损失（Listwise Ranking with KL divergence）
+        loss_scalar = contrastive_loss_with_structure(
+                        z1=cmp_vec_0,                    # [batch, hidden_dim]
+                        z2=cmp_vec_1,                    # [batch, hidden_dim]
+                        z2_original=selected_actions,     # [batch, attn_act_len, action_dim]
+                        temperature=0.07,                # InfoNCE 温度
+                        temperature_structure=0.07,        # 结构保持损失温度（用于 Softmax）
+                        top_k=16,                         # 保持前 k 个排序
+                        lambda_align=5.0,                # 对齐损失权重
+                        lambda_structure=5.0,            # 结构保持损失权重
+                        lambda_anticollapse=1.0,         # 防坍缩损失权重
+                        gamma=0.4,                      # variance 目标标准差
                     )
 
-        # 扩展为 [batch_size, 1, action_dim] 以匹配 forward 返回格式
+        # 将标量损失扩展为 [batch_size, 1, action_dim] 以匹配 forward 的返回格式
+        # 损失函数返回的是标量（0维），没有 batch 维度，需要扩展
+        batch_size = cmp_vec_0.shape[0]
         action_dim = self.config.max_action_dim
-        losses = loss_scalar.view(1, 1, 1).expand(batch_size, 1, action_dim)  # 扩展形状
 
-        # 递增 CMP 步数计数器（用于日志/调度）
+        # 将标量损失扩展为 [batch_size, 1, action_dim]
+        losses = loss_scalar.view(1, 1, 1).expand(batch_size, 1, action_dim)
+
         self.cmp_step += 1
-        return losses, cmp_loss_info
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -2809,28 +2342,15 @@ class PI05Policy(PreTrainedPolicy):
         if self.model.content_attention is not None:
             params.extend(self.model.content_attention.parameters())
 
-        # 投影层
-        if self.model.proj_z1 is not None:
-            params.extend(self.model.proj_z1.parameters())
+        if self.model.cmp_projection is not None:
+            params.extend(self.model.cmp_projection.parameters())
 
-        if self.model.proj_z2 is not None:
-            params.extend(self.model.proj_z2.parameters())
-
-        # ObsQueryBridge
-        if hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None:
-            params.extend(self.model.obs_query_bridge.parameters())
-
-        # ITM Head (ALBEF style)
-        if hasattr(self.model, 'itm_head') and self.model.itm_head is not None:
-            params.extend(self.model.itm_head.parameters())
+        if self.model.share_projection is not None:
+            params.extend(self.model.share_projection.parameters())
 
         # cls_head_prefix 参数
         if self.model.cls_head_prefix is not None:
             params.append(self.model.cls_head_prefix)
-
-        # ForwardModel（嵌入空间前向动力学）
-        if hasattr(self.model, 'forward_model') and self.model.forward_model is not None:
-            params.extend(self.model.forward_model.parameters())
 
         addition_ids = {id(p) for p in params}
         for p in self.parameters():
@@ -2879,23 +2399,10 @@ class PI05Policy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
-        # ITM score 记录（用于离线分析）
-        self._itm_scores: list[Tensor] = []           # fresh ITM（每次生成新 chunk 时）
-        self._stale_itm_scores: list[Tensor] = []     # stale ITM（用旧 chunk 的后续段）
-        self._stale_itm_chunk_ids: list[int] = []     # 每个 stale score 对应的 chunk index
-        self._stale_itm_segment_ids: list[int] = []   # 每个 stale score 对应的 segment index (1-4)
-        self._full_action_chunk: Tensor | None = None  # 保存完整 chunk_size 的 action chunk
-        self._chunk_segment_index: int = 0             # 当前 chunk 内已使用到第几段 (0=fresh刚生成, 1-4=stale)
-        self._current_chunk_idx: int = -1              # 当前 chunk 编号
-        self._select_action_count = 0
-
-        # ForwardModel drift 跟踪
-        self._predicted_z3: Tensor | None = None          # 上一步 ForwardModel 的预测
-        self._drift_scores: list[Tensor] = []              # drift cosine distance [batch_size] per segment
-        self._drift_chunk_ids: list[int] = []             # 对应 chunk index
-        self._drift_segment_ids: list[int] = []           # 对应 segment index
-        self._replan_count: int = 0                        # drift 触发 replan 的次数
-        self._force_replan_next: bool = False                 # 自适应步长：中等 drift 触发的延迟 replan 标志
+        # 动作上下文追踪：每个样本在当前 chunk 中已执行的步数
+        self.step_num_in_chunk: Tensor | None = None
+        self._predicted_actions_buffer: Tensor | None = None
+        self._last_actions_list: Tensor | None = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -2913,39 +2420,16 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    def _preprocess_single_image(self, img: Tensor, device: torch.device) -> Tensor:
-        """预处理单张图像: device, dtype, resize, normalize."""
-        if img.device != device:
-            img = img.to(device)
-        if img.dtype != torch.float32:
-            img = img.to(torch.float32)
-
-        is_channels_first = img.shape[1] == 3
-        if is_channels_first:
-            img = img.permute(0, 2, 3, 1)
-
-        if img.shape[1:3] != self.config.image_resolution:
-            img = resize_with_pad_torch(img, *self.config.image_resolution)
-
-        img = img * 2.0 - 1.0
-
-        if is_channels_first:
-            img = img.permute(0, 3, 1, 2)
-
-        return img
-
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
-
-        当 observation_delta_indices 启用时，images 为 [B, T, C, H, W]。
-        此方法只返回 t=0 的当前帧。未来帧通过 _preprocess_future_images 获取。
         """
         images = []
         img_masks = []
 
+        # Get device from model parameters
         device = next(self.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
@@ -2957,127 +2441,50 @@ class PI05Policy(PreTrainedPolicy):
                 f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
             )
 
+        # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key]
 
-            # 处理多时间步: [B, T, C, H, W] → 取 t=0 → [B, C, H, W]
-            if img.dim() == 5:
-                img = img[:, 0]
+            # Ensure tensor is on the same device as the model
+            if img.device != device:
+                img = img.to(device)
 
-            img = self._preprocess_single_image(img, device)
+            # Ensure float32 dtype for consistency
+            if img.dtype != torch.float32:
+                img = img.to(torch.float32)
+
+            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
+            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+
+            if is_channels_first:
+                # Convert [B, C, H, W] to [B, H, W, C] for processing
+                img = img.permute(0, 2, 3, 1)
+
+            # from openpi preprocess_observation_pytorch: Resize with padding if needed
+            if img.shape[1:3] != self.config.image_resolution:
+                img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+            # Normalize from [0,1] to [-1,1] as expected by siglip
+            img = img * 2.0 - 1.0
+
+            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+            if is_channels_first:
+                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+
             images.append(img)
-
+            # Create mask (all ones for real images)
             bsize = img.shape[0]
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
             img_masks.append(mask)
 
+        # Create image features not present in the batch as fully 0 padded images
         for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1
-            mask = torch.zeros_like(mask)
+            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
+            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
 
         return images, img_masks
-
-    def _preprocess_future_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]] | None:
-        """提取 t+k 未来帧图像（三元因果链用）。
-
-        当 observation_delta_indices = [0, k] 时，images 为 [B, 2, C, H, W]，
-        此方法返回 t=1（即 obs_{t+k}）的图像。
-        如果没有多时间步，返回 None。
-        """
-        device = next(self.parameters()).device
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-
-        # 检查是否有多时间步
-        first_key = present_img_keys[0] if present_img_keys else None
-        if first_key is None or batch[first_key].dim() != 5:
-            return None
-
-        future_images = []
-        future_img_masks = []
-
-        for key in present_img_keys:
-            img = batch[key]
-            # [B, T, C, H, W] → 取 t=1 → [B, C, H, W]
-            img = img[:, 1]
-
-            # 检查 padding: obs_{t+k} 可能越界（episode 末尾）
-            pad_key = f"{key}_is_pad"
-            if pad_key in batch:
-                is_pad = batch[pad_key][:, 1]  # [B], True = 越界
-            else:
-                is_pad = torch.zeros(img.shape[0], dtype=torch.bool, device=device)
-
-            img = self._preprocess_single_image(img, device)
-            future_images.append(img)
-
-            # 有效帧 mask：非 padding 的为 True
-            mask = (~is_pad).to(device)
-            future_img_masks.append(mask)
-
-        # 如果有缺失相机，补 padding
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
-        for _ in range(len(missing_img_keys)):
-            img = torch.ones_like(future_images[-1]) * -1
-            mask = torch.zeros(img.shape[0], dtype=torch.bool, device=device)
-            future_images.append(img)
-            future_img_masks.append(mask)
-
-        return future_images, future_img_masks
-
-    def _preprocess_neg_future_images(
-        self, batch: dict[str, Tensor]
-    ) -> tuple[list[Tensor], list[Tensor], Tensor] | None:
-        """提取 L2 负样本：同 episode 远离 t+k 的 GT obs（CMP L2 负样本）。
-
-        Dataset 已在 __getitem__ 中采样 neg_future_{video_key}，格式 [B, C, H, W]。
-        此方法将其处理为模型输入格式。
-
-        Returns:
-            (neg_future_images, neg_future_img_masks, neg_future_valid) or None
-            - neg_future_images: list of [B, C, H, W]
-            - neg_future_img_masks: list of [B] bool
-            - neg_future_valid: [B] bool, 标记每个样本 neg 是否有效
-        """
-        device = next(self.parameters()).device
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-
-        # 检查是否有 neg_future 数据
-        neg_future_keys = [f"neg_future_{key}" for key in present_img_keys]
-        if not any(key in batch for key in neg_future_keys):
-            return None
-
-        neg_future_images = []
-        neg_future_img_masks = []
-
-        for key in present_img_keys:
-            neg_key = f"neg_future_{key}"
-            if neg_key in batch:
-                img = batch[neg_key]  # [B, C, H, W]
-                img = self._preprocess_single_image(img, device)
-                neg_future_images.append(img)
-
-                # mask: 所有 neg_future 共享一个 is_valid 标记
-                if "neg_future_is_valid" in batch:
-                    is_valid = batch["neg_future_is_valid"]  # [B] bool
-                else:
-                    is_valid = torch.ones(img.shape[0], dtype=torch.bool, device=device)
-                neg_future_img_masks.append(is_valid)
-            else:
-                # 如果某个视角缺失，创建 dummy
-                bsize = batch[present_img_keys[0]].shape[0] if present_img_keys else 1
-                img = torch.ones(bsize, 3, 224, 224, device=device) * -1
-                mask = torch.zeros(bsize, dtype=torch.bool, device=device)
-                neg_future_images.append(img)
-                neg_future_img_masks.append(mask)
-
-        # 提取全局 valid 标记
-        neg_future_valid = batch.get(
-            "neg_future_is_valid",
-            torch.ones(batch[present_img_keys[0]].shape[0], dtype=torch.bool, device=device)
-        )
-        return neg_future_images, neg_future_img_masks, neg_future_valid
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -3086,165 +2493,105 @@ class PI05Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select a single action given environment observations.
-
-        replan_drift_threshold > 0 时：drift 超过阈值触发 replan；
-        replan_drift_threshold == 0 时：纯收集模式，用满旧 chunk 全部步。
-        """
+        """Select a single action given environment observations."""
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
         )
 
         self.eval()
-        self._select_action_count += 1
-        n_action_steps = self.config.n_action_steps
-        n_segments = self.config.chunk_size // n_action_steps  # 50 // 10 = 5
-        drift_threshold = getattr(self.config, 'replan_drift_threshold', 0.0)
-        drift_threshold_mid = getattr(self.config, 'replan_drift_threshold_mid', 0.0)
-        replan_mode = getattr(self.config, 'replan_mode', 'drift')
 
-        # ── fixed 模式：每 n_action_steps 步固定 replan（等价 baseline 行为） ──
-        if replan_mode == "fixed":
-            if len(self._action_queue) == 0:
-                self._current_chunk_idx += 1
-                actions = self.predict_action_chunk(batch)
-                segment = actions[:, :n_action_steps]
-                self._action_queue.extend(segment.transpose(0, 1))
-                if self._current_chunk_idx <= 2 or self._current_chunk_idx % 5 == 0:
-                    print(f"[Fixed-replan] chunk={self._current_chunk_idx}")
-            return self._action_queue.popleft()
-
-        # ── drift / 收集模式（原有逻辑不变） ──────────────────────────
+        # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            has_itm = (hasattr(self.model, 'itm_head') and self.model.itm_head is not None
-                       and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None)
-            trigger_replan = False  # drift 触发 replan 标志
+            actions = self.predict_action_chunk(batch)
+            # Transpose to get shape (n_action_steps, batch_size, action_dim)
+            self._action_queue.extend(actions.transpose(0, 1))
 
-            # 检查上一段设置的延迟 replan 标志
-            if self._force_replan_next:
-                trigger_replan = True
-                self._force_replan_next = False
-                self._replan_count += 1
-                print(f"[Replan-deferred] chunk={self._current_chunk_idx}, "
-                      f"seg={self._chunk_segment_index}, replan #{self._replan_count}")
-            elif self._full_action_chunk is not None and self._chunk_segment_index < n_segments:
-                # ---- 旧 chunk 还有剩余段：计算 stale ITM 和 drift ----
-                seg_idx = self._chunk_segment_index
-                start = seg_idx * n_action_steps
-                end = start + n_action_steps
-                segment = self._full_action_chunk[:, start:end]
-
-                if has_itm:
-                    images, img_masks = self._preprocess_images(batch)
-                    tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
-                    masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-                    attn_act_len = self.config.attn_act_len
-                    _, stale_score, actual_z3 = self._should_replan(
-                        images, img_masks, tokens, masks, segment[:, :attn_act_len, :],
-                    )
-                    self._stale_itm_scores.append(stale_score.detach().cpu())
-                    self._stale_itm_chunk_ids.append(self._current_chunk_idx)
-                    self._stale_itm_segment_ids.append(seg_idx)
-                    if len(self._stale_itm_scores) % 10 == 1:
-                        print(f"[ITM-stale] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                              f"score={stale_score.mean().item():.4f}")
-
-                    # ForwardModel drift 计算（cosine distance，与训练 loss 一致）
-                    if (self._predicted_z3 is not None and actual_z3 is not None
-                            and hasattr(self.model, 'forward_model') and self.model.forward_model is not None):
-                        drift = 1.0 - F.cosine_similarity(
-                            self._predicted_z3.to(actual_z3.device), actual_z3, dim=-1
-                        )
-                        self._drift_scores.append(drift.detach().cpu())
-                        self._drift_chunk_ids.append(self._current_chunk_idx)
-                        self._drift_segment_ids.append(seg_idx)
-
-                        # drift-based replan 判断（三级响应）
-                        drift_val = drift.mean().item()
-                        if drift_threshold > 0 and drift_val > drift_threshold:
-                            # 大 drift → 立即 replan
-                            trigger_replan = True
-                            self._replan_count += 1
-                            print(f"[Replan-immediate] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                                  f"drift={drift_val:.4f} > high={drift_threshold:.4f}, "
-                                  f"replan #{self._replan_count}")
-                        elif drift_threshold_mid > 0 and drift_val > drift_threshold_mid:
-                            # 中 drift → 用完当前段，下次强制 replan
-                            self._force_replan_next = True
-                            print(f"[Replan-scheduled] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                                  f"drift={drift_val:.4f} > mid={drift_threshold_mid:.4f}")
-                        if not trigger_replan:
-                            # 不 replan 时，为下一段准备 predicted_z3_next
-                            if seg_idx + 1 < n_segments:
-                                next_start = (seg_idx + 1) * n_action_steps
-                                next_end = next_start + n_action_steps
-                                next_segment = self._full_action_chunk[:, next_start:next_end]
-                                origin_action_dim = self.config.output_features[ACTION].shape[0]
-                                z2_next_raw = self.model.content_attention(next_segment[:, :attn_act_len, :origin_action_dim])
-                                z2_next = _clamp_embedding_norm(self.model.proj_z2(z2_next_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
-                                self._predicted_z3 = self.model.forward_model(actual_z3, z2_next).detach()
-
-                        if len(self._drift_scores) % 10 == 1:
-                            print(f"[Drift] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                                  f"drift={drift.mean().item():.4f}")
-
-                if not trigger_replan:
-                    # 正常使用旧 segment
-                    self._action_queue.extend(segment.transpose(0, 1))
-                    self._chunk_segment_index += 1
-                # trigger_replan=True 时 fall through 到下面生成新 chunk
-
-            if trigger_replan or self._full_action_chunk is None or self._chunk_segment_index >= n_segments:
-                # ---- 需要新 chunk：生成动作，计算 fresh ITM ----
-                self._current_chunk_idx += 1
-                actions = self.predict_action_chunk(batch)  # 内部计算 fresh ITM + ForwardModel predicted_z3
-                self._full_action_chunk = actions.detach().clone()
-
-                # 取第一段放入 queue
-                segment = actions[:, :n_action_steps]
-                self._action_queue.extend(segment.transpose(0, 1))
-                self._chunk_segment_index = 1  # 下次用 segment 1 (stale)
-
-                if self._current_chunk_idx <= 2 or self._current_chunk_idx % 5 == 0:
-                    print(f"[ITM-fresh] chunk={self._current_chunk_idx}, "
-                          f"fresh_count={len(self._itm_scores)}, stale_count={len(self._stale_itm_scores)}, "
-                          f"replan_count={self._replan_count}")
-
+        self.step_num_in_chunk += 1
         return self._action_queue.popleft()
 
-    @torch.no_grad()
-    def _encode_obs(self, images, img_masks, tokens, masks) -> Tensor:
-        """将 obs 编码为 z [B, 512]，与训练时 encode_obs 路径一致。"""
+    def _should_replan(
+            self,
+            images,
+            img_masks,
+            tokens,
+            masks,
+            predict_actions: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Check if replanning is needed based on VICReg similarity comparison.
+
+        Args:
+            images: Current images (list of tensors)
+            img_masks: Current image masks (list of tensors)
+            tokens: Current language tokens [batch_size, seq_len]
+            masks: Current language token masks [batch_size, seq_len]
+            predict_actions: Previously predicted actions [batch_size, delta_replan, action_dim]
+
+        Returns:
+            tuple: (should_replan: Tensor [batch_size], similarity: Tensor [batch_size])
+        """
+        delta_replan = getattr(self.config, "attn_act_len", 0)
+        device = tokens.device
+        batch_size = tokens.shape[0]
+        if delta_replan <= 0:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size,
+                                                                                         dtype=torch.float32,
+                                                                                         device=device)
+
+        if self.model.cls_head_prefix is None or self.model.part_layer_num is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size,
+                                                                                         dtype=torch.float32,
+                                                                                         device=device)
+
+        if self.model.content_attention is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device), torch.zeros(batch_size,
+                                                                                         dtype=torch.float32,
+                                                                                         device=device)
+
         device = tokens.device
         batch_size = tokens.shape[0]
 
+        # Step 1: Get cmp_vec_0 from current visual-language information
+        # Prepare prefix embeddings with cls_head_prefix
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
             images, img_masks, tokens, masks
         )
-        cls_head = self.model.cls_head_prefix.expand(batch_size, -1, -1).to(dtype=prefix_embs.dtype)
+
+        cls_head = self.model.cls_head_prefix.expand(batch_size, -1, -1).to(
+            dtype=prefix_embs.dtype
+        )
         prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1)
 
+        # Update masks
         cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
         prefix_pad_masks_with_cls = torch.cat([cls_pad_mask, prefix_pad_masks], dim=1)
+
         cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)
         prefix_att_masks_with_cls = torch.cat(
             [cls_att_mask.unsqueeze(0).expand(batch_size, -1), prefix_att_masks], dim=1
         )
 
+        # Prepare dummy suffix
         action_expert_config = get_gemma_config(self.config.action_expert_variant)
         dummy_suffix_embs = torch.zeros(
-            batch_size, 1, action_expert_config.width,
-            dtype=prefix_embs_with_cls.dtype, device=device,
+            batch_size,
+            1,
+            action_expert_config.width,
+            dtype=prefix_embs_with_cls.dtype,
+            device=device,
         )
         dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
         dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
 
+        # Merge masks
         pad_masks = torch.cat([prefix_pad_masks_with_cls, dummy_suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks_with_cls, dummy_suffix_att_masks], dim=1)
+
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self.model._prepare_attention_masks_4d(att_2d_masks)
 
+        # Execute forward_partial
         intermediate_embeds, _ = self.model.paligemma_with_expert.forward_partial(
             attention_mask=att_2d_masks_4d,
             position_ids=position_ids,
@@ -3254,114 +2601,111 @@ class PI05Policy(PreTrainedPolicy):
             part_layer_num=self.model.part_layer_num,
         )
 
-        vlm_seq = intermediate_embeds[0]  # [batch_size, seq_len, 2048]
-        z1 = self.model.obs_query_bridge(vlm_seq).to(dtype=torch.float32)  # [batch_size, 512]
-        return _clamp_embedding_norm(z1, self.config.embedding_max_norm)
+        # Extract cls head output
+        cmp_vec_0 = intermediate_embeds[0][:, 0, :]  # [batch_size, paligemma_hidden_dim]
+        cmp_vec_0 = self.model.cmp_projection(cmp_vec_0)  # [batch_size, action_expert_hidden_dim]
+        cmp_vec_0 = cmp_vec_0.to(dtype=torch.float32)
 
-    def _should_replan(
-            self,
-            images,
-            img_masks,
-            tokens,
-            masks,
-            predict_actions: Tensor,
-            z1: Tensor = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """
-        Check if replanning is needed based on ITM Head matching score.
-
-        使用训练时相同的编码路径：ObsQueryBridge 提取 z1，ContentAttention + proj_z2 提取 z2，
-        ITM Head 判断 (obs, action) 是否匹配。匹配分数低于阈值时触发 replan。
-
-        Args:
-            images: Current images (list of tensors)
-            img_masks: Current image masks (list of tensors)
-            tokens: Current language tokens [batch_size, seq_len]
-            masks: Current language token masks [batch_size, seq_len]
-            predict_actions: Previously predicted actions [batch_size, seq_len, action_dim]
-            z1: 预计算的 obs 嵌入 [batch_size, 512]，如果为 None 则内部编码
-
-        Returns:
-            tuple: (should_replan: Tensor [batch_size], itm_score: Tensor [batch_size], z1: Tensor [batch_size, 512])
-                   itm_score 是 sigmoid 后的匹配概率，越高表示越匹配
-        """
-        delta_replan = getattr(self.config, "attn_act_len", 0)
-        device = tokens.device
-        batch_size = tokens.shape[0]
-        no_replan = (
-            torch.zeros(batch_size, dtype=torch.bool, device=device),
-            torch.ones(batch_size, dtype=torch.float32, device=device),
-            None,
-        )
-
-        if delta_replan <= 0:
-            return no_replan
-        if self.model.cls_head_prefix is None or self.model.part_layer_num is None:
-            return no_replan
-        if self.model.content_attention is None:
-            return no_replan
-        if not hasattr(self.model, 'obs_query_bridge') or self.model.obs_query_bridge is None:
-            return no_replan
-        if not hasattr(self.model, 'itm_head') or self.model.itm_head is None:
-            return no_replan
-
-        # ========== z1: obs_t → VLM 前 6 层 → ObsQueryBridge ==========
-        if z1 is None:
-            z1 = self._encode_obs(images, img_masks, tokens, masks)
-
-        # ========== z2: action → ContentAttention → proj_z2 ==========
+        # Step 2: Get cmp_vec_1 from predicted actions
         attn_act_len = self.model.content_attention.attn_act_len
+
         origin_action_dim = self.config.output_features[ACTION].shape[0]
-        selected_actions = predict_actions[:, :attn_act_len, :origin_action_dim]
-        z2_raw = self.model.content_attention(selected_actions)
-        z2 = _clamp_embedding_norm(self.model.proj_z2(z2_raw).to(dtype=torch.float32), self.config.embedding_max_norm)  # [batch_size, 512]
+        # Select first attn_act_len actions
+        predict_actions = predict_actions[:, :attn_act_len, :origin_action_dim]
 
-        # ========== ITM Head 打分 ==========
-        itm_logits = self.model.itm_head(z1, z2)  # [batch_size] raw logits
-        itm_score = torch.sigmoid(itm_logits)      # [batch_size] 匹配概率，越高越匹配
+        # Get cmp_vec_1
+        cmp_vec_1 = self.model.content_attention(predict_actions).to(dtype=torch.float32)
 
-        # 分数低于阈值 → 观测与动作不匹配 → 需要 replan
-        threshold = getattr(self, '_replan_threshold', 0.5)
-        should_replan = itm_score < threshold  # [batch_size] bool
-        return should_replan, itm_score, z1
+        # Step 3: Compute similarity
+        similarity = compute_vicreg_similarity(cmp_vec_0, cmp_vec_1)  # [batch_size]
+
+        # Decide if replanning is needed (higher similarity = more different = need replan)
+        should_replan = similarity > self._replan_threshold  # [batch_size] bool tensor
+        return should_replan, similarity
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+        """Predict a chunk of actions given environment observations with replanning support.
+
+        Replanning logic:
+        - Initially: directly predict actions
+        - After that: every delta_replan steps, compare current observation with predicted actions
+        - If similarity > threshold (0.1): replan (generate new actions)
+        - If similarity <= threshold: continue using previous predictions
+        """
         self.eval()
 
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Sample actions using the model
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        delta_replan = self.config.attn_act_len
 
-        # Unpad actions to actual action dimension
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        actions = actions[:, :, :original_action_dim]
+        # Initialize replanning state if not exists
+        if delta_replan > 0:
+            if not hasattr(self, "_replan_step_counter"):
+                self._replan_step_counter = 0
+            if not hasattr(self, "_predicted_actions_buffer"):
+                self._predicted_actions_buffer = None
+            if not hasattr(self, "_replan_threshold"):
+                self._replan_threshold = 0.25
 
-        # 旁路计算 ITM score 用于离线分析（不影响动作生成）
-        if (hasattr(self.model, 'itm_head') and self.model.itm_head is not None
-                and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None):
-            attn_act_len = self.config.attn_act_len
-            _, itm_score, z1 = self._should_replan(
-                images, img_masks, tokens, masks, actions[:, :attn_act_len, :],
+        batch_size = tokens.shape[0]
+        device = tokens.device
+
+        # Initialize should_replan as all True (default: always plan initially or when buffer is empty)
+        should_replan = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        # Check if we need to replan based on similarity comparison
+        if delta_replan > 0 and self._predicted_actions_buffer is not None:
+            # Check every delta_replan steps
+            should_replan, similarity = self._should_replan(
+                images, img_masks, tokens, masks, self._predicted_actions_buffer[:, :delta_replan, :],
             )
-            self._itm_scores.append(itm_score.detach().cpu())
-            # 每 10 次打印一次 ITM score 信息
-            if len(self._itm_scores) % 10 == 1:
-                print(f"[ITM] chunk #{len(self._itm_scores)}, score: {itm_score.mean().item():.4f} (batch mean)")
+            should_replan = should_replan | (self.step_num_in_chunk >= self.config.chunk_size)
 
-            # ForwardModel: 预测执行 action[0:k] 后的 obs 嵌入
-            if (hasattr(self.model, 'forward_model') and self.model.forward_model is not None
-                    and z1 is not None):
-                origin_action_dim = self.config.output_features[ACTION].shape[0]
-                z2_raw = self.model.content_attention(actions[:, :attn_act_len, :origin_action_dim])
-                z2 = _clamp_embedding_norm(self.model.proj_z2(z2_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
-                self._predicted_z3 = self.model.forward_model(z1, z2).detach()
+        # If replanning is needed, generate new actions
+        # Handle list indexing for images and img_masks
+        if should_replan.all():
+            # All samples need replanning, use all inputs
+            filtered_images = images
+            filtered_img_masks = img_masks
+            filtered_tokens = tokens
+            filtered_masks = masks
+        elif should_replan.any():
+            # Some samples need replanning
+            # Filter images and img_masks (they are lists)
+            filtered_images = [img[should_replan] for img in images]
+            filtered_img_masks = [mask[should_replan] for mask in img_masks]
+            filtered_tokens = tokens[should_replan]
+            filtered_masks = masks[should_replan]
 
-        return actions
+        # Generate actions only for samples that need replanning
+        if should_replan.any():
+            actions = self.model.sample_actions(filtered_images, filtered_img_masks, filtered_tokens, filtered_masks,
+                                                **kwargs)
+            # Update buffer for samples that were replanned
+            if self._predicted_actions_buffer is not None:
+                # print(self._predicted_actions_buffer[should_replan].shape)
+                # print(self._predicted_actions_buffer.shape)
+                # print(actions.shape)
+                # print("22222222")
+                self._predicted_actions_buffer[should_replan] = actions
+
+                self.step_num_in_chunk[should_replan] = 0
+            else:
+                self._predicted_actions_buffer = actions
+                self.step_num_in_chunk = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        ret = self._predicted_actions_buffer[:, :delta_replan, :original_action_dim]
+        self._last_actions_list = self._predicted_actions_buffer[:, :delta_replan, :original_action_dim]
+
+        max_action_len = self._predicted_actions_buffer.shape[-1]
+        self._predicted_actions_buffer = torch.cat((self._predicted_actions_buffer[:, delta_replan:, :],
+                                                    torch.zeros((batch_size, delta_replan, max_action_len)).to(device)),
+                                                   dim=1)
+        return ret
 
     def forward(self, batch: dict[str, Tensor], online=False) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
@@ -3372,10 +2716,8 @@ class PI05Policy(PreTrainedPolicy):
             online: 是否为在线训练模式
                     如果为 True，使用 prev_actions 作为条件，生成动作并计算与 pred_action 的特征距离
         """
-        # 功能总结：根据 online 标志计算在线 loss 或离线 BC+CMP 组合 loss，并返回日志字典。
         original_action_dim = self.config.output_features[ACTION].shape[0]
         if online:
-            # 在线训练：仅更新与动作生成相关的子模块
             if self.offline_mode is True:
                 self._apply_online_params()
 
@@ -3386,7 +2728,6 @@ class PI05Policy(PreTrainedPolicy):
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-            # 1) prev_actions 经过 content_attention 得到条件 token
             condition_token = self.model.content_attention(prev_actions)  # [batch, hidden_dim]
 
             # 2. 使用 condition_token 生成动作（可微分）
@@ -3426,83 +2767,34 @@ class PI05Policy(PreTrainedPolicy):
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-            # 提取未来帧（三元因果链用）
-            future_result = self._preprocess_future_images(batch)
-            future_images = future_result[0] if future_result is not None else None
-            future_img_masks = future_result[1] if future_result is not None else None
-
-            # 提取同 episode GT 时序错位负样本（CMP L1 用）
-            neg_gt_actions = batch.get("neg_action", None)
-            neg_action_valid = batch.get("neg_action_is_valid", None)
-            neg_action_distance = batch.get("neg_action_distance", None)
-
-            # Debug: 检查 batch 中是否包含负样本 key
-            if not hasattr(self, '_batch_debug_printed'):
-                self._batch_debug_printed = True
-                neg_keys = [k for k in batch.keys() if 'neg' in k.lower()]
-                all_keys = sorted(batch.keys())
-                print(f"[forward DEBUG] batch keys: {all_keys}")
-                print(f"[forward DEBUG] neg-related keys: {neg_keys}")
-                print(f"[forward DEBUG] neg_gt_actions is None: {neg_gt_actions is None}")
-                print(f"[forward DEBUG] neg_action_valid is None: {neg_action_valid is None}")
-
-            # 提取同 episode 远离 t+k 的 GT obs（CMP L2 用）
-            neg_future_result = self._preprocess_neg_future_images(batch)
-            if neg_future_result is not None:
-                neg_future_images, neg_future_img_masks, neg_future_valid = neg_future_result
-            else:
-                neg_future_images, neg_future_img_masks, neg_future_valid = None, None, None
-
             if self.config.cmp_pretrain:
-                # CMP 预训练：仅使用 CMP loss（含前向动力学项）
                 if self.offline_mode is False:
                     self._apply_param_cmp()
 
-                cmp_losses, cmp_loss_info = self.model.forward_cmp(
-                    images, img_masks, tokens, masks,
-                    future_images=future_images, future_img_masks=future_img_masks,
-                    neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
-                    neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
-                    neg_future_valid=neg_future_valid,
-                    neg_action_distance=neg_action_distance,
-                )
-                # CMP loss 缩放（与外部实验设置一致）
+                cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
                 losses = 0.01 * cmp_losses.mean()
 
                 loss_dict = {
                     "loss": losses.item(),
                     "bc_loss": 0.,
-                    "cmp_loss": losses.item(),
+                    "cmp_loss": 0.,
                 }
-                loss_dict.update(cmp_loss_info)
             else:
-                # 离线联合训练：BC loss + CMP loss
                 if self.offline_mode is False:
                     self._apply_offline_params()
-                # 1) BC：动作去噪回归损失
                 actions = self.prepare_action(batch)
                 bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
                 bc_loss = bc_losses[:, :, :original_action_dim].mean()
 
-                # 2) CMP：三元因果链对比损失 + 前向动力学项
-                cmp_losses, cmp_loss_info = self.model.forward_cmp(
-                    images, img_masks, tokens, masks,
-                    future_images=future_images, future_img_masks=future_img_masks,
-                    neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
-                    neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
-                    neg_future_valid=neg_future_valid,
-                    neg_action_distance=neg_action_distance,
-                )
-                cmp_loss = 0.1 * cmp_losses.mean()
-                # 3) 总损失：BC + 缩放后的 CMP
+                cmp_losses = self.model.forward_cmp(images, img_masks, tokens, masks)
+                cmp_loss = 0.01 * cmp_losses.mean()
                 losses = bc_loss + cmp_loss
 
                 loss_dict = {
                     "loss": losses.item(),
                     "bc_loss": bc_loss.item(),
-                    "cmp_loss": cmp_loss.item(),
+                    "cmp_loss": cmp_loss.item()
                 }
-                loss_dict.update(cmp_loss_info)
 
             return losses, loss_dict
 

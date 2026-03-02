@@ -1,0 +1,905 @@
+export https_proxy="http://10.181.94.69:7890"
+  改动内容                                                                                
+  在特征空间上不用余弦相似度，改用l2距离对齐                                                                                        
+  # 当前（余弦距离）                                                                      
+  learned_similarity = torch.matmul(z2_norm, z2_norm.T)                                   
+  learned_distances = 1.0 - learned_similarity                                            
+                                                                                          
+  # 改为（L2 距离，用 z2_flat 而不是 z2_norm）                                            
+  learned_distances = torch.cdist(z2_flat, z2_flat, p=2)
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_train.py --policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval --policy.push_to_hub=false --dataset.repo_id=HuggingFaceVLA/libero --dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero --batch_size=32 --steps=5000 --log_freq=10  --save_freq=1000 --output_dir=outputs/test_l2_structure_loss --wandb.enable=true  --wandb.project=lerobot-cmp-test > outputs/test_l2_structure_loss.log 2>&1 &
+
+
+
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \
+--policy.push_to_hub=false \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--steps=1000 \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/test_l2_structure_loss \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--wandb.enable=true \
+--wandb.project=lerobot-cmp-test > /home/kemove/hyp/lhm-heritage/outputs/test_l2_structure_loss.log 2>&1 &
+
+cmp loss一点也不收敛，修改温度参数重试。
+仍然不收敛
+
+再看到z1和z2的共享projection，两个模态用完全相同的变换。CLIP对应不同模态是分离投影头，考虑修改这个。
+修改之后structure loss收敛，但是infoNCE一点不收敛。
+
+降维了projection的维度（infoNCE对比的向量），但是没啥效果
+
+1.20
+之前降低了projection两个模态的维度，但是没对低维的infoNCE上添加防止坍缩的约束。加上也没啥用
+根本问题                                                                                                                                  
+  这是跨模态对比学习（观察 z1 vs 动作 z2）：                                          
+  - 两个独立投影层随机初始化                                                          
+  - 投影到的 256d 空间本来就不对齐                                                    
+  - InfoNCE 假设"正样本应该相似"，但两个空间根本没有共同基础
+
+InfoNCE 为什么不能对齐？InfoNCE 优化的是 softmax 概率分布：它只关心 相对大小，不关心绝对值
+pos 和 neg 一起涨/跌时，softmax 比例不变，loss 不变，没有梯度
+
+MSE 是 绝对约束：直接要求正样本对在 256d 空间中的 位置重合，强迫两个投影层学习 
+兼容的映射：对于匹配的 (观察, 动作) 对，输出相同的 256d 向量
+
+总结原因：之前方案失败的根本原因                                               
+                                                                                 
+  1. 当前架构的信息流                                                            
+                                                                                 
+  观察侧 (z1):                                                                   
+  VLM输出 → cmp_projection → [batch, 1024] → proj_z1 → [batch, 1024] →           
+  infonce_proj_z1 → [batch, 256]                                                 
+                                                                                 
+               ↓                                                                 
+                                                                                 
+       cosine similarity                                                         
+                                                                                 
+               ↑                                                                 
+  动作侧 (z2):                                                                   
+  动作序列 → SingleHeadContentAttention → [batch, 1024] → proj_z2 → [batch, 1024]
+   → infonce_proj_z2 → [batch, 256]                                              
+                                                                                 
+  2. 核心失败原因：两个独立随机空间的对齐问题                                    
+                                                                                 
+  2.1 初始状态：两个不相干的空间                                                 
+                                                                                 
+  - proj_z1 和 proj_z2 是随机初始化的独立网络                                    
+  - 它们把两个语义完全不同的输入（VLM视觉特征 vs                                 
+  动作序列特征）映射到"同一个"1024维空间                                         
+  - 但这两个映射没有任何先验关联                                                 
+                                                                                 
+  类比：这就像两个翻译员，一个把中文翻译成"某种语言A"，另一个把日语翻译成"某种语 
+  言B"，然后期望 A 和 B 是同一种语言——这是不可能的。                             
+                                                                                 
+  2.2 InfoNCE 为什么不能自举对齐？                                               
+                                                                                 
+  InfoNCE 的数学形式：                                                           
+  L = -log(exp(sim(z1[i], z2[i])/τ) / Σ_j exp(sim(z1[i], z2[j])/τ))              
+                                                                                 
+  关键问题：InfoNCE 是相对损失，只优化"正样本相似度 > 负样本相似度"。            
+                                                                                 
+  当两个空间初始不对齐时：                                                       
+  - sim(z1[i], z2[i]) ≈ sim(z1[i], z2[j]) ≈ 随机值（因为投影层随机）             
+  - 梯度会同时影响所有相似度，导致 pos 和 neg 一起涨或一起跌                     
+  - 没有"锚点"告诉模型哪个方向是正确的                                           
+                                                                                 
+  实验现象：pos: 0.85, neg: 0.85, gap: 0.00                                      
+                                                                                 
+  2.3 MSE 为什么导致坍缩？                                                       
+                                                                                 
+  MSE 是绝对损失：直接最小化 ||z1[i] - z2[i]||²                                  
+                                                                                 
+  看似解决：强制拉近正样本对，建立对齐。                                         
+                                                                                 
+  实际问题：MSE 找到的"最优解"是所有向量都相同！                                 
+  - 如果 z1[i] = z2[i] = c（常向量），MSE = 0                                    
+  - 模型会学到 proj_z1(任何输入) → c，proj_z2(任何输入) → c                      
+  - 这就是表示坍缩                                                               
+                                                                                 
+  实验现象：pos: 0.85 → 0.99, neg: 0.85 → 0.99（所有相似度都变成1）              
+                                                                                 
+  2.4 Margin Loss 为什么也不行？                                                 
+                                                                                 
+  Margin Loss：max(0, margin - (pos - hardest_neg))                              
+                                                                                 
+  问题：                                                                         
+  - Margin 只约束 pos - neg > margin，但不提供对齐信号                           
+  - 当两个空间完全不对齐时，模型可以通过让所有向量都相似来满足约束               
+  - 或者让所有向量都很远（pos 和 neg 都是负值，满足 margin）                     
+                                                                                 
+  3. 失败方案总结表                                                              
+  ┌────────────┬──────────────────────┬────────────────────┬──────────────┐      
+  │    方案    │       数学目标       │      失败模式      │     根因     │      
+  ├────────────┼──────────────────────┼────────────────────┼──────────────┤      
+  │ 纯 InfoNCE │ pos > neg (相对)     │ pos ≈ neg 同涨同跌 │ 无对齐锚点   │      
+  ├────────────┼──────────────────────┼────────────────────┼──────────────┤      
+  │ + MSE (强) │ z1[i] = z2[i] (绝对) │ 全坍缩             │ 常数解最优   │      
+  ├────────────┼──────────────────────┼────────────────────┼──────────────┤      
+  │ + MSE (弱) │ 同上但弱化           │ 慢坍缩             │ 同上，只是慢 │      
+  ├────────────┼──────────────────────┼────────────────────┼──────────────┤      
+  │ + Margin   │ pos - neg > m        │ pos ≈ neg          │ 无对齐信号   │      
+  ├────────────┼──────────────────────┼────────────────────┼──────────────┤      
+  │ 共享投影   │ 减少参数             │ 仍坍缩             │ 仍无交互     │      
+  └────────────┴──────────────────────┴────────────────────┴──────────────┘      
+  4. 根本矛盾                                                                    
+                                                                                 
+  问题本质：我们希望学习一个跨模态对应关系，但：                                 
+                                                                                 
+  1. InfoNCE 需要已有的对应关系才能优化（鸡生蛋）                                
+  2. MSE 可以建立对应关系，但会导致坍缩（杀死鸡）                                
+  3. 防坍缩损失只能减缓坍缩，不能解决对齐问题                                    
+                                                                                 
+  ---                                                                            
+  新方案思路：Cross-Attention 建立内在关联                                       
+                                                                                 
+  核心洞察                                                                       
+                                                                                 
+  之前的方案都是：先独立处理两个模态，再比较。                                   
+                                                                                 
+  问题是"比较"的基础不存在。                                                     
+                                                                                 
+  新思路：先让两个模态交互，再比较。                                             
+                                                                                 
+  之前（失败）：                                                                 
+  z1 → proj_z1 → z1_proj ─┐                                                      
+                          ├─ compare（无共同基础）                               
+  z2 → proj_z2 → z2_proj ─┘                                                      
+                                                                                 
+  新方案：                                                                       
+  z1 ─────────────────────┐                                                      
+                          ├─ CrossAttn(Q=z1, K=z2, V=z2) → z1_attended           
+  z2 ─────────────────────┘                                                      
+                          ↓                                                      
+  z1_attended 与 z2 有了内在关联 → 再做对比学习                                  
+                                                                                 
+  为什么 Cross-Attention 能解决问题？                                            
+                                                                                 
+  1. 建立关联的机制：                                                            
+    - z1_attended[i] = Σ_j softmax(z1[i] · z2[j] / √d) * z2[j]                   
+    - z1_attended 是 z1 对 z2 的加权表示                                         
+    - 正样本对：z1[i] 和 z2[i] 来自同一个 episode，应该有高 attention            
+  2. 自然的对齐信号：                                                            
+    - Cross-Attention 本身就在学习"哪个 z2 与当前 z1 最相关"                     
+    - 这是对比学习需要的先验信息                                                 
+  3. 避免坍缩：                                                                  
+    - 不是强制 z1 = z2，而是让 z1 "看到" z2                                      
+    - 结果 z1_attended 仍然保留 z1 的信息（通过残差连接）                        
+    - 但获得了与 z2 对齐的能力
+
+1.21
+梯度流诊断
+
+CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \
+--policy.push_to_hub=false \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=1000 \
+--online.online_collect=false \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/fulrscl_z1_infra_z2_cross \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--wandb.enable=false > /home/kemove/hyp/lhm-heritage/outputs/fulrscl_z1_infra_z2_cross.log 2>&1 &
+梯度诊断结果分析                                                          
+                                                                            
+  1. 梯度流正常                                                             
+                                                                            
+  所有参数的 requires_grad=True，说明梯度可以正常流动：                     
+  - bilinear_U.weight: ✓                                                    
+  - bilinear_V.weight: ✓                                                    
+  - infonce_log_inv_temp: ✓                                                 
+  - content_attention: ✓                                                    
+  - cmp_projection: ✓                                                       
+                                                                            
+  2. 关键问题发现：z1 特征坍缩                                              
+                                                                            
+  [5] Intra-modality similarity (off-diagonal mean):                        
+    z1 (obs) internal sim:        0.9802  ← 极高！几乎坍缩                  
+    z2 (action) internal sim:     0.6045  ← 正常                            
+                                                                            
+  z1 (VLM 观察特征) 内部相似度高达 0.9802，这意味着 batch 内所有 z1         
+  向量几乎相同。这是对比学习失败的根本原因：                                
+  - 如果所有 z1 都一样，模型无法区分哪个 z1 应该和哪个 z2 配对              
+  - pos 和 neg 分数必然相近                                                 
+                                                                            
+  3. 训练趋势观察                                                           
+  ┌──────┬───────┬───────┬────────┬───────────┐                             
+  │ Step │  pos  │  neg  │  gap   │ Score std │                             
+  ├──────┼───────┼───────┼────────┼───────────┤                             
+  │ 10   │ 1.29  │ 1.27  │ +0.023 │ 0.35      │                             
+  ├──────┼───────┼───────┼────────┼───────────┤                             
+  │ 40   │ 0.01  │ 0.00  │ +0.007 │ 0.17      │                             
+  ├──────┼───────┼───────┼────────┼───────────┤                             
+  │ 100  │ -0.14 │ -0.13 │ -0.004 │ 0.08      │                             
+  └──────┴───────┴───────┴────────┴───────────┘                             
+  - 分数在下降并趋近 0（bilinear 权重在收缩）                               
+  - gap 始终接近 0，无法区分正负样本                                        
+  - Score std 在减小 (0.35 → 0.08)，分数越来越集中                          
+                                                                            
+  4. 特征统计异常                                                           
+                                                                            
+  cmp_vec_0 (z1): mean=0.2631, std=7.5072, min=-30.0857, max=32.4929        
+  cmp_vec_1 (z2): mean=-0.0024, std=0.1046, min=-0.3789, max=0.3822         
+                                                                            
+  z1 和 z2 的尺度差异巨大（std: 7.5 vs 0.1），这可能导致 bilinear 交互困难。
+                                                                            
+  根本问题和解决方向                                                        
+                                                                            
+  问题: VLM 输出的 z1 特征区分度太低（internal sim = 0.98）VLM 的 embedding 层
+  VLM 将不同的图像映射到了几乎相同的 embedding 空间，导致 z1没有区分度。对比学习无法区分正负样本。
+
+
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \
+--policy.push_to_hub=false \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=6000 \
+--online.online_collect=false \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/z1_infra_z2_cross_cmp \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--wandb.enable=true \
+--wandb.project=lerobot-cmp-test > /home/kemove/hyp/lhm-heritage/outputs/z1_infra_z2_cross_cmp.log 2>&1 &
+
+
+
+1.27
+CUDA_VISIBLE_DEVICES=0 nohup  python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \
+--policy.push_to_hub=false \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=1000 \
+--online.online_collect=false \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/adapter_z1_infra_z2_cross \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--wandb.enable=true \
+--wandb.project=adapter-cmp-test > /home/kemove/hyp/lhm-heritage/outputs/adapter_z1_infra_z2_cross.log 2>&1 &
+
+
+
+改默认值，跑完再改回来。                                          
+                                                                                      
+● Update(src/lerobot/configs/default.py)                                              
+  ⎿  Added 1 line, removed 1 line                                                     
+      58      use_async_envs: bool = False                                            
+      59      # `max_episodes_rendered` specifies the maximum number of episode       
+          s to render into videos.                                                    
+      60      # Set to 0 to disable video rendering (faster startup for quick t       
+          esting).                                                                    
+      61 -    max_episodes_rendered: int = 0                                          
+      61 +    max_episodes_rendered: int = 10                                         
+      62                                                                              
+      63      def __post_init__(self) -> None:                                        
+      64          if self.batch_size > self.n_episodes:
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src python -m lerobot.scripts.lerobot_eval \
+    --policy.path=/home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/checkpoints/006000/pretrained_model \
+    --env.type=libero \
+    --env.task=libero_10 \
+    --eval.n_episodes=50 \
+    --eval.batch_size=10 \
+    --eval.max_episodes_rendered=10 \
+    --output_dir=/home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/eval_6000
+效果还不错，91.6%（baseline 94%）
+
+1.28
+
+层次 1：BC 成功率对比（已有，但需补充）                                             
+                                                                                      
+  已有数据可用，但可以补充：                                                          
+  - 不同 CMP 权重（0.05, 0.1, 0.2）的消融实验                                         
+  - 不同训练步数的成功率曲线（不只看 6000 步终点）                                    
+                                                                                      
+
+层次 2：CMP 离线匹配质量（未做）                                                    
+                                                                                      
+  用训练好的模型对 rollout 数据做离线评估：                                           
+  1. 收集 baseline 和 v19 的 rollout（obs, action 对）                                
+  2. 计算 ITM 匹配分数分布：成功 episode vs 失败 episode                              
+  3. 论证：失败 episode 中 ITM 分数显著低于成功 episode → CMP 能检测出策略漂移        
+                                                                                      
+  这需要修改 eval 脚本收集 rollout 数据。 
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src python -m lerobot.scripts.lerobot_eval \
+      --policy.path=/home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/checkpoints/006000/pretrained_model \
+      --env.type=libero \
+      --env.task=libero_10 \
+      --eval.n_episodes=50 \
+      --eval.batch_size=10 \
+      --output_dir=/home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/eval_6000_itm \
+  > /home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/eval_6000_itm.log 2>&1 &
+
+  层次 3：在线漂移检测 + Replan（未做）                                               
+                                                                                      
+  用改写后的 _should_replan：                                                         
+  1. 开启 replan 机制，跑 eval                                                        
+  2. 对比：无 replan（91.6%）vs 有 replan（?%）                                       
+  3. 论证：CMP 检测漂移 + replan 能恢复甚至超过 baseline                              
+                                                                                      
+  这是最有说服力的实验，但需要先完成层次 2 来标定 threshold。 
+
+
+1.30
+
+Section 9: ForwardModel — 嵌入空间前向动力学
+
+=== 问题背景 ===
+专家数据没有漂移场景 → 没有负样本 → ITM 无法训练漂移检测能力。
+Eval 时 ITM 分数在成功/失败 episode 中无显著差异，验证了这一判断。
+
+=== 核心思路 ===
+"在状态 z1 下执行动作 z2，预期到达状态 predicted_z3" —— 嵌入空间中的前向动力学模型。
+ForwardModel 是回归任务，不需要负样本，只需专家的 (obs_t, action, obs_{t+k}) 三元组。
+漂移信号在 eval 时自然产生：actual_z3 偏离 predicted_z3 → drift。
+
+=== 代码改动（modeling_pi05.py） ===
+
+1. ForwardModel 类 (line ~683)
+   残差 MLP: predicted_z3 = z1 + MLP(concat(z1, z2))
+   MLP 只学 delta，z1 作为 baseline，连续观察变化小更容易学。
+
+2. PI05Pytorch.__init__ (line ~1831)
+   self.forward_model = ForwardModel(hidden_dim=512)
+
+3. forward_cmp 中 L_forward (line ~2230)
+   if cmp_vec_2 is not None:
+       predicted_z3 = self.forward_model(z1, z2)
+       l_forward = MSE(predicted_z3, z3.detach())
+       loss_scalar += l_forward
+   z3.detach()：不让 L_forward 梯度回传到 ObsQueryBridge 的 z3 编码路径。
+   日志字段：cmp/l_forward, cmp/forward_l2
+
+4. reset() 中 drift 跟踪字段 (line ~2814)
+   _predicted_z3, _drift_scores, _drift_chunk_ids, _drift_segment_ids
+
+5. _encode_obs 辅助方法 (line ~3038)
+   提取 VLM 编码逻辑为独立 @torch.no_grad() 方法，避免重复代码。
+
+6. _should_replan 重构 (line ~3063)
+   - 接收可选 z1 参数（已预计算时跳过 VLM 编码）
+   - 内部调用 _encode_obs
+   - 返回 3-tuple: (should_replan, itm_score, z1)
+
+7. predict_action_chunk (line ~3176)
+   生成 chunk 后，用 ForwardModel(z1, z2) 预测首段 predicted_z3 并存储。
+
+8. select_action stale path (line ~2986)
+   - _should_replan 返回 actual_z3
+   - drift = ||predicted_z3 - actual_z3||
+   - 为下一段用 ForwardModel(actual_z3, z2_next) 生成新的 predicted_z3
+
+=== Eval 时 drift 检测流程 ===
+chunk 生成(obs_t) → z1, z2 → predicted_z3 = FM(z1, z2)
+执行 10 步 → obs_{t+10} → actual_z3 = encode(obs_{t+10})
+drift = ||predicted_z3 - actual_z3||
+drift < 阈值 → 继续用旧 chunk segment
+drift > 阈值 → replan
+
+=== 关于 ITM 负样本的讨论 ===
+当前 ITM 负样本是 batch 内 cross-pair（别的 sample 的 action），语义上不正确：
+- 同任务不同 episode：obs 相似，action 也相似，被当负样本不合理
+- 不同任务：区分太简单，学不到有意义的东西
+- 真正的负样本应该是"当前 obs 下不合适的动作"
+
+考虑的改进方向：同 episode 时序错位构造负样本
+- 正样本：(obs_t, model_action[0:att_len]) — z2 来自模型生成（设计意图不变）
+- 负样本：(obs_t, GT_action[offset:offset+att_len]) — GT 时序错位
+  语义：obs_t 不该执行 30 步以后才该做的动作
+
+
+
+
+当前 Loss 完整实现总结（含 L2 方案 A）                                                                     
+                                                                                                             
+  ---                                                                                                        
+  顶层结构                                                                                                   
+                                                                                                             
+  Total Loss = bc_loss + 0.1 × cmp_loss                                                                      
+                                                                                                             
+  - bc_loss：MSE，VLA 全 18 层生成动作 vs GT action                                                          
+  - cmp_loss：对比匹配预测，包含 4 个子项                                                                    
+                                                                                                             
+  ---                                                                                                        
+  CMP Loss 详细组成                                                                                          
+                                                                                                             
+  cmp_loss = cross_loss + structure_loss + anticollapse_loss + l_forward                                     
+           = (L1 + L2) + structure + (variance + covariance) + l_forward                                     
+                                                                                                             
+  ---                                                                                                        
+  1. 跨模态匹配 — Cross Loss（ITM）                                                                          
+                                                                                                             
+  基于 ALBEF 的 ITM Head：concat(z1, z2, z1-z2, z1*z2) → MLP → 二分类 logit                                  
+                                                                                                             
+  L1：obs_t ↔ action_t（L1 改进后）                                                                          
+  Column 1: 正样本                                                                                           
+  来源: (z1, z2) — obs_t 配模型生成的 action[0:att_len]                                                      
+  标签: 1                                                                                                    
+  数据流: z2 = model_action → ContentAttn → proj_z2                                                          
+  ────────────────────────────────────────                                                                   
+  Column 1: 负样本                                                                                           
+  来源: (z1, z2_neg) — obs_t 配同 episode 跨 chunk GT 时序错位 action                                        
+  标签: 0                                                                                                    
+  数据流: z2_neg = GT_action[offset:offset+att_len] → 同路径编码                                             
+  - offset 范围：[current_pos + chunk_size, ep_len - att_len]，随机，至少跨 chunk                            
+  - validity：episode 太短无法跨 chunk 时标记 invalid，不参与 loss                                           
+  - loss：(BCE(pos,1) + masked_BCE(neg,0)) / 2                                                               
+  - 语义：obs_t 不该执行 30+ 步以后才该做的动作                                                              
+                                                                                                             
+  L2：action_t ↔ obs_{t+k}（L2 改进后 — 方案 A）                                                             
+  Column 1: 正样本                                                                                           
+  来源: (z2, z3) — action_t 配未来 obs_{t+k}                                                                 
+  标签: 1                                                                                                    
+  数据流: z3 = obs_{t+k} → VLM 前 6 层 → ObsQueryBridge                                                      
+  ────────────────────────────────────────                                                                   
+  Column 1: 负样本                                                                                           
+  来源: (z2, z3_neg) — action_t 配同 episode 远离 t+k 的 GT obs                                              
+  标签: 0                                                                                                    
+  数据流: z3_neg = obs_{t+m} → 同路径编码（额外 VLM forward）                                                
+  - offset 范围：[0, k - chunk_size] ∪ [k + chunk_size, ep_len - 1]，随机，确保 |m - k| >= chunk_size        
+  - validity：episode 太短无法采样远离 k 的时刻时标记 invalid                                                
+  - 成本：额外一次 VLM 前 6 层 forward，训练时间 +19%，显存 +25-30%                                          
+  - loss：(BCE(pos,1) + masked_BCE(neg,0)) / 2                                                               
+  - 语义：执行 action_t 后到达 obs_{t+k}，不是远处的 obs_{t+m}                                               
+                                                                                                             
+  ---                                                                                                        
+  2. 结构保持 — Structure Loss                                                                               
+                                                                                                             
+  保持 z2 嵌入空间中 top-k 邻居的排序和原始 action 空间一致：                                                
+                                                                                                             
+  # 取 action 空间 L2 距离矩阵的 top-k 最近邻                                                                
+  orig_knn_dists = action_distances[i, top_k_indices]                                                        
+  # 计算 z2 空间对应的 learned distance                                                                      
+  learned_knn_dists = z2_distances[i, top_k_indices]                                                         
+  # Soft Rank Loss + Pair-order Loss                                                                         
+  loss = rank_loss + 0.1 × pair_loss                                                                         
+                                                                                                             
+  功能：防止对比学习破坏 action 之间的相对距离关系                                                           
+                                                                                                             
+  ---                                                                                                        
+  3. 防坍缩 — Anti-collapse Loss（VICReg 风格）                                                              
+                                                                                                             
+  # Variance Loss: 各维度标准差不低于 γ=0.4                                                                  
+  variance_loss = mean(relu(γ - std(z1))) + mean(relu(γ - std(z2)))                                          
+                                                                                                             
+  # Covariance Loss: 协方差矩阵非对角元素趋零                                                                
+  cov_z1 = (z1_centered.T @ z1_centered) / (B - 1)                                                           
+  covariance_loss = sum(cov_z1[off_diag]²) / dim²                                                            
+                                                                                                             
+  功能：                                                                                                     
+  - Variance：防止维度坍缩（所有样本在某维度上值相同）                                                       
+  - Covariance：促进维度去相关（不同维度学习独立特征）                                                       
+                                                                                                             
+  ---                                                                                                        
+  4. 前向动力学 — L_forward（ForwardModel）                                                                  
+                                                                                                             
+  predicted_z3 = z1 + MLP(concat(z1, z2))   # 残差结构                                                       
+  l_forward = MSE(predicted_z3, z3.detach())                                                                 
+                                                                                                             
+  训练功能：学习 (obs_t, action_t) → obs_{t+k} 的嵌入空间映射                                                
+                                                                                                             
+  Eval 功能：                                                                                                
+  drift = ||predicted_z3 - actual_z3||₂                                                                      
+  if drift > threshold:                                                                                      
+      trigger_replan()  # 检测执行偏移，触发重规划                                                           
+                                                                                                             
+  ---                                                                                                        
+  数据编码路径                                                                                               
+  ┌─────────────────┬──────────────────────────────────────────────────────────┬──────────┐                  
+  │      特征       │                         编码路径                         │   维度   │                  
+  ├─────────────────┼──────────────────────────────────────────────────────────┼──────────┤                  
+  │ z1 (obs_t)      │ obs → VLM 前 6 层 → ObsQueryBridge (64 queries)          │ [B, 512] │                  
+  ├─────────────────┼──────────────────────────────────────────────────────────┼──────────┤                  
+  │ z2 (action_t)   │ model_action[0:10] → ContentAttention → proj_z2          │ [B, 512] │                  
+  ├─────────────────┼──────────────────────────────────────────────────────────┼──────────┤                  
+  │ z3 (obs_{t+k})  │ future_obs → VLM 前 6 层 → ObsQueryBridge                │ [B, 512] │                  
+  ├─────────────────┼──────────────────────────────────────────────────────────┼──────────┤                  
+  │ z2_neg (L1 neg) │ GT_action[offset:offset+10] → ContentAttention → proj_z2 │ [B, 512] │                  
+  ├─────────────────┼──────────────────────────────────────────────────────────┼──────────┤                  
+  │ z3_neg (L2 neg) │ obs_{t+m} → VLM 前 6 层 → ObsQueryBridge                 │ [B, 512] │                  
+  └─────────────────┴──────────────────────────────────────────────────────────┴──────────┘                  
+  ---                                                                                                        
+  梯度回传范围                                                                                               
+                                                                                                             
+  bc_loss 梯度:                                                                                              
+    ├─ VLM 全 18 层                                                                                          
+    ├─ Expert 全 18 层                                                                                       
+    ├─ action_in/out_proj                                                                                    
+    └─ time_mlp                                                                                              
+                                                                                                             
+  cmp_loss 梯度:                                                                                             
+    ├─ VLM 前 6 层 (forward_partial)                                                                         
+    ├─ cls_head_prefix                                                                                       
+    ├─ ObsQueryBridge (z1, z3, z3_neg 编码器)                                                                
+    ├─ ContentAttention (z2, z2_neg 编码器)                                                                  
+    ├─ proj_z2                                                                                               
+    ├─ ITMHead                                                                                               
+    └─ ForwardModel                                                                                          
+                                                                                                             
+  ---                                                                                                        
+  功能总结表                                                                                                 
+  ┌──────────────┬────────────────────────────┬────────────────────┬───────────────────────────────┐         
+  │  Loss 子项   │          主要功能          │      服务目标      │          负样本策略           │         
+  ├──────────────┼────────────────────────────┼────────────────────┼───────────────────────────────┤         
+  │ bc_loss      │ 学习生成正确动作           │ 动作质量（主任务） │ N/A                           │         
+  ├──────────────┼────────────────────────────┼────────────────────┼───────────────────────────────┤         
+  │ L1 (ITM)     │ obs↔action 匹配判断        │ eval 时 ITM replan │ 同 episode GT 时序错位 action │         
+  ├──────────────┼────────────────────────────┼────────────────────┼───────────────────────────────┤         
+  │ L2 (ITM)     │ action↔future_obs          │ 三元链完整性       │ 同 episode 远离 t+k 的 GT obs │         
+  │              │ 因果关联                   │                    │                               │         
+  ├──────────────┼────────────────────────────┼────────────────────┼───────────────────────────────┤         
+  │ structure    │ 保持 action 邻居排序       │ 嵌入空间结构一致性 │ N/A                           │         
+  ├──────────────┼────────────────────────────┼────────────────────┼───────────────────────────────┤         
+  │ anticollapse │ 防止表征坍缩               │ 训练稳定性         │ N/A                           │         
+  ├──────────────┼────────────────────────────┼────────────────────┼───────────────────────────────┤         
+  │ l_forward    │ 预测执行后的状态嵌入       │ eval 时 drift 检测 │ N/A                           │         
+  └──────────────┴────────────────────────────┴────────────────────┴───────────────────────────────┘         
+  ---                                                                                                        
+  负样本改进前后对比                                                                                         
+  Column 1: 负样本来源                                                                                       
+  L1 旧方案: batch cross-pair                                                                                
+  L1 新方案: 同 episode GT 时序错位                                                                          
+  L2 旧方案: batch cross-pair                                                                                
+  L2 新方案: 同 episode GT 远离 t+k                                                                          
+  ────────────────────────────────────────                                                                   
+  Column 1: 语义问题                                                                                         
+  L1 旧方案: instance discrimination                                                                         
+  L1 新方案: ✅ 时序因果约束                                                                                 
+  L2 旧方案: instance discrimination                                                                         
+  L2 新方案: ✅ 时序因果约束                                                                                 
+  ────────────────────────────────────────                                                                   
+  Column 1: 额外成本                                                                                         
+  L1 旧方案: 0                                                                                               
+  L1 新方案: 0（复用 GT action）                                                                             
+  L2 旧方案: 0                                                                                               
+  L2 新方案: +19% 训练时间（VLM forward）                                                                    
+  ────────────────────────────────────────                                                                   
+  Column 1: 自动适应                                                                                         
+  L1 旧方案: N/A                                                                                             
+  L1 新方案: ✅ 随机 offset，自适应 episode 长度                                                             
+  L2 旧方案: N/A                                                                                             
+  L2 新方案: ✅ 随机 offset，自适应 episode 长度                                                             
+  ---                                                                                                        
+  关键设计特点                                                                                               
+                                                                                                             
+  1. 同 episode 约束：L1/L2 负样本均从同 episode 采样，保证相同任务语境                                      
+  2. 跨 chunk 约束：offset 至少 >= chunk_size (50)，确保足够时序距离                                         
+  3. 随机 offset：每个样本随机采样，无需手动调参                                                             
+  4. validity masking：短 episode 自动标记 invalid，per-sample masked BCE                                    
+  5. 零手工负样本池：完全依赖 episode 长度自动确定候选区间 
+
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \
+--policy.push_to_hub=false \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=8 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=1000 \
+--online.online_collect=false \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/neg_imprv \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--wandb.enable=true \
+--wandb.project=neg-imprv-test > /home/kemove/hyp/lhm-heritage/outputs/neg_imprv.log 2>&1 &
+
+
+
+1.31
+  当前 Pipeline 总结                                                                       
+                                                                                           
+  编码器                                                                                   
+                                                                                           
+                          ┌─ obs_query_bridge ─→ z1 [B,512]  (obs_t)                       
+  obs 图像 → VLM 前6层 ──┤                                                                 
+                          └─ obs_query_bridge ─→ z3 [B,512]  (obs_{t+k})                   
+                                                 z3_neg [B,512] (obs_far)                  
+                                                                                           
+  action → ContentAttention → proj_z2 ─→ z2 [B,512]  (action_t)                            
+                                          z2_neg [B,512] (action_neg)                      
+                                                                                           
+  z1/z3/z3_neg 共享同一个 VLM + obs_query_bridge；z2/z2_neg 共享 ContentAttention +        
+  proj_z2。                                                                                
+                                                                                           
+  Loss 组成                                                                                
+                                                                                           
+  当前模式 cmp_pretrain=False，总 loss：                                                   
+                                                                                           
+  total = bc_loss + 0.1 × cmp_loss                                                         
+                                                                                           
+  其中 cmp_loss 内部：                                                                     
+                                                                                           
+  cmp_loss = cross_modal + structure + anticollapse + l_forward                            
+  Loss: L_cross_L1                                                                         
+  公式: ITMHead(z1, z2) pos/neg BCE                                                        
+  梯度流向: → ITMHead, obs_query_bridge, ContentAttention, proj_z2, VLM                    
+  作用: z1↔z2 跨模态匹配                                                                   
+  ────────────────────────────────────────                                                 
+  Loss: L_cross_L2                                                                         
+  公式: ITMHead(z2, z3) pos/neg BCE                                                        
+  梯度流向: → ITMHead, obs_query_bridge, ContentAttention, proj_z2, VLM                    
+  作用: z2↔z3 因果链匹配                                                                   
+  ────────────────────────────────────────                                                 
+  Loss: L_structure                                                                        
+  公式: soft rank consistency on z2 neighbors                                              
+  梯度流向: → ContentAttention, proj_z2                                                    
+  作用: 保持 z2 空间中 action 邻居排序                                                     
+  ────────────────────────────────────────                                                 
+  Loss: L_anticollapse                                                                     
+  公式: variance + covariance on z1, z2                                                    
+  梯度流向: → obs_query_bridge, ContentAttention, proj_z2, VLM                             
+  作用: 防止 z1/z2 坍缩                                                                    
+  ────────────────────────────────────────                                                 
+  Loss: L_forward                                                                          
+  公式: 1 - cos_sim(ForwardModel(z1.detach(), z2.detach()), z3.detach())                   
+  梯度流向: → 仅 ForwardModel                                                              
+  作用: 前向动力学方向预测                                                                 
+  梯度流详细图                                                                             
+                                                                                           
+  bc_loss ──────────────────────────→ 整个模型（VLM全部层 + action expert + ...）          
+                                                                                           
+  L_cross_L1 (z1↔z2) ──┬──→ ITMHead                                                        
+                        ├──→ obs_query_bridge ──→ VLM 前6层                                
+                        └──→ ContentAttention + proj_z2                                    
+                                                                                           
+  L_cross_L2 (z2↔z3) ──┬──→ ITMHead                                                        
+                        ├──→ obs_query_bridge ──→ VLM 前6层  (通过 z3)                     
+                        └──→ ContentAttention + proj_z2      (通过 z2)                     
+                                                                                           
+  L_structure ──────────→ ContentAttention + proj_z2  (只涉及 z2)                          
+                                                                                           
+  L_anticollapse ───────┬──→ obs_query_bridge ──→ VLM 前6层  (通过 z1)                     
+                        └──→ ContentAttention + proj_z2      (通过 z2)                     
+                                                                                           
+  L_forward ────────────→ ForwardModel 仅此一个  (输入 z1,z2 全 detach, 目标 z3 也 detach) 
+                                                                                           
+  L_forward 的隔离设计                                                                     
+                                                                                           
+  predicted_z3 = ForwardModel(z1.detach(), z2.detach())                                    
+  l_forward = (1 - cosine_similarity(predicted_z3, z3.detach())).mean()                    
+                                                                                           
+  三个 detach 保证 l_forward 的梯度只更新 ForwardModel 自身（2层                           
+  MLP，~0.5M参数），不影响任何编码器。Cosine loss 使其对 norm 膨胀免疫。                   
+                                                                                           
+  Eval 时 ForwardModel 用途                                                                
+                                                                                           
+  chunk 开始: z1 = encode(obs_t), z2 = encode(action)                                      
+              predicted_z3 = ForwardModel(z1, z2)                                          
+                                                                                           
+  每段执行后: actual_z3 = encode(actual_obs)                                               
+              drift = 1 - cosine_similarity(predicted_z3, actual_z3)                       
+              如果 drift 大 → 触发 replan                                                  
+                                                                                           
+  下一段预测: predicted_z3_next = ForwardModel(actual_z3, z2_next)                         
+                                                                                           
+  训练和 eval 统一使用 cosine distance。
+
+2.2 bcloss对齐
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \
+--policy.push_to_hub=false \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=6000 \
+--online.online_collect=false \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/idea \     
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--wandb.enable=true \
+--wandb.project=neg-imprv-test > /home/kemove/hyp/lhm-heritage/outputs/idea.log 2>&1 &
+
+
+（见 eval_record.txt 中 2×2 消融矩阵）
+
+
+
+
+
+
+2.3
+● MEAN_STD（用 pi05_libero_base_eval，norm 自然稳定，不需要 clamp）:                          
+                                                                                              
+  nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \       
+    --policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero_base_eval \          
+    --policy.push_to_hub=false \                                                              
+    --dataset.repo_id=HuggingFaceVLA/libero \                                                 
+    --dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \                         
+    --env.type=libero \                                                                       
+    --batch_size=32 \                                                                         
+    --online.n_iterations=1 \                                                                 
+    --online.train_steps_per_iteration=6000 \                                                 
+    --online.online_collect=false \                                                           
+    --online.train_interval=999999999 \                                                       
+    --log_freq=10 \                                                                           
+    --save_freq=1000 \                                                                        
+    --output_dir=/home/kemove/hyp/lhm-heritage/outputs/<NAME> \                               
+    --wandb.enable=true \                                                                     
+    --wandb.project=<NAME> \                                                                  
+    > /home/kemove/hyp/lhm-heritage/outputs/<NAME>.log 2>&1 &                                 
+                                                                                              
+  QUANTILES（用 pi05_libero，加 embedding_max_norm=32 防止 norm 爆炸）:                       
+                                                                                              
+  nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \       
+    --policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero \                    
+    --policy.device=cuda \                                                                    
+    --policy.gradient_checkpointing=true \                                                    
+    --policy.embedding_max_norm=32 \                                                          
+    --policy.push_to_hub=false \                                                              
+    --dataset.repo_id=HuggingFaceVLA/libero \                                                 
+    --dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \                         
+    --env.type=libero \                                                                       
+    --batch_size=32 \                                                                         
+    --online.n_iterations=1 \                                                                 
+    --online.train_steps_per_iteration=6000 \                                                 
+    --online.online_collect=false \                                                           
+    --online.train_interval=999999999 \                                                       
+    --log_freq=10 \                                                                           
+    --save_freq=1000 \                                                                        
+    --output_dir=/home/kemove/hyp/lhm-heritage/outputs/<NAME> \                               
+    --wandb.enable=true \                                                                     
+    --wandb.project=<NAME> \                                                                  
+    > /home/kemove/hyp/lhm-heritage/outputs/<NAME>.log 2>&1 &                                 
+                                                                                              
+  唯一实质区别：                                                                              
+  ┌────────────────────┬───────────────────────┬─────────────┐                                
+  │                    │       MEAN_STD        │  QUANTILES  │                                
+  ├────────────────────┼───────────────────────┼─────────────┤                                
+  │ policy path        │ pi05_libero_base_eval │ pi05_libero │                                
+  ├────────────────────┼───────────────────────┼─────────────┤                                
+  │ embedding_max_norm │ 不需要（默认 0）      │ 32          │                                
+  └────────────────────┴───────────────────────┴─────────────┘                                
+  两个模型权重完全相同，区别仅在 config.json 里的 normalization_mapping。
+
+
+
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero \
+--policy.device=cuda \
+--policy.push_to_hub=false \
+--policy.gradient_checkpointing=true \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=6000 \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/comparasion1 \
+--wandb.enable=true \
+--wandb.project=comparasion1 \
+> /home/kemove/hyp/lhm-heritage/outputs/comparasion1.log 2>&1 &
+
+
+
+
+
+
+
+2.5 结果分析
+
+nohup env CUDA_VISIBLE_DEVICES=1 python src/lerobot/scripts/lerobot_online_train.py \
+--policy.path=/home/kemove/hyp/lerobot/pretrained_models/pi05_libero \
+--policy.device=cuda \
+--policy.push_to_hub=false \
+--policy.gradient_checkpointing=true \
+--dataset.repo_id=HuggingFaceVLA/libero \
+--dataset.root=$HOME/.cache/huggingface/smolvla_datasets/libero \
+--env.type=libero \
+--batch_size=32 \
+--online.n_iterations=1 \
+--online.train_steps_per_iteration=6000 \
+--online.online_collect=false \
+--online.train_interval=999999999 \
+--log_freq=10 \
+--save_freq=1000 \
+--output_dir=/home/kemove/hyp/lhm-heritage/outputs/comparasion1 \
+--wandb.enable=true \
+--wandb.project=comparasion1 \
+> /home/kemove/hyp/lhm-heritage/outputs/comparasion1.log 2>&1 &
+
+save_freq: 5000
+
+
+
+
+
+
+=== 参考论文 ===
+A2C2: Action-Aware Contrastive Correction (arXiv:2509.23224, Sep 2025, University of Tokyo)
+核心方法：冻结 base policy，训练轻量 correction head，每步用最新 obs 修正 action chunk
+公式：a_exec = a_base + Δa, 其中 Δa = π_a2c2(obs_latest, a_base, τ_k, z_base, l)
+LIBERO Spatial 结果：72.2%→81.6% (e=50,d=0), 64.4%→84.2% (e=40,d=10)
+
+=== 与当前 Online Training 实现的对应关系 ===
+
+┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
+│      设计点      │         A2C2                │     当前 Online Training    │
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ 条件输入         │ (obs_latest, a_base,        │ prev_actions → content_     │
+│                  │  τ_k, z_base, l)            │  attention → condition_token │
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ 冻结策略         │ 冻结 base policy,           │ 冻结 VLM, 只训练 gemma_    │
+│                  │ 只训练 correction head       │  expert + action projections│
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Loss 设计        │ 直接残差监督                │ feature_loss (embedding     │
+│                  │ ||Δa_pred - Δa_gt||         │  空间距离) + L2 action loss │
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ 训练数据来源     │ offline dataset +           │ online rollout 收集         │
+│                  │ base policy inference        │                             │
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ 作用粒度         │ 每步修正 (step-level)       │ chunk 级别                  │
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ 修正方式         │ 加性残差 a_base + Δa        │ 重新生成 (differentiable    │
+│                  │                             │  sampling conditioned on    │
+│                  │                             │  prev_actions)              │
+└──────────────────┴─────────────────────────────┴─────────────────────────────┘
+
+=== A2C2 可借鉴改进当前 Online Training 的三个方向 ===
+
+方向 1: 残差监督替代/补充 feature loss
+  当前: feature_loss = relu(||gen_feature - pred_feature||² - 0.1) — 间接监督
+  借鉴: 加入直接残差项 ||generated_action - gt_action||
+  理由: A2C2 证明直接残差监督收敛更快，feature distance 作为辅助正则化保留
+
+方向 2: Step-level 细化
+  当前: online loss 在 chunk 级别计算
+  借鉴: 对 chunk 中每个 action step 分别计算与实际执行效果的偏差
+  实现: 利用 rollout 中逐步收集的 obs 序列，对 chunk 中的每个位置
+        计算 step-wise loss，权重可按时间步衰减（近步权重大）
+
+方向 3: Offline 数据预构造
+  当前: 必须等 online rollout 数据积累才能开始 online training
+  借鉴: A2C2 先对 offline dataset 跑一遍 base policy inference 得到 a_base，
+        用 a_gt - a_base 构造训练目标
+  实现: 在 online training 启动前，先用 base checkpoint 对 offline dataset
+        做一遍 inference，收集 (obs, a_base, a_gt) 三元组，
+        这样无需等 online 数据积累就能开始训练 correction 能力
+  注意: 额外计算成本（需要对整个 dataset 跑 inference），但只需做一次
+
+=== 与 CMP + ForwardModel 的关系 ===
+
+A2C2 和 CMP 是互补而非替代关系：
+- CMP 解决 "何时需要修正"（drift 检测 → replan 决策）
+- A2C2 风格的 correction 解决 "如何修正"（直接调整 action）
+- 当前系统的修正方式是 replan（重新跑完整 inference），代价较大
+- 如果后续实现 Direction B（action correction），A2C2 的 correction head
+  设计是最直接的参考
+
+=== 论文引用价值 ===
+- Related work: action chunk correction 方向的代表工作
+- Baseline 对比: LIBERO 上的实验数据可直接对比
+- 方法区分: 我们的方法在嵌入空间做对比学习 + drift 检测 + replan，
+  A2C2 在动作空间做残差修正，技术路线不同但问题动机相同

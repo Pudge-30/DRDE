@@ -177,7 +177,10 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         if key in batch:
             action_context_keys[key] = batch[key]
 
-    return {**pad_keys, **task_key, **index_key, **task_index_key, **action_context_keys}
+    # Extract CMP contrastive learning neg sample fields (neg_action, neg_future_*, etc.)
+    neg_keys = {k: v for k, v in batch.items() if k.startswith("neg_")}
+
+    return {**pad_keys, **task_key, **index_key, **task_index_key, **action_context_keys, **neg_keys}
 
 
 def create_transition(

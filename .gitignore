@@ -166,6 +166,13 @@ wandb/
 # Data folders
 data/
 outputs/
+pretrained_models/
+
+# Large model artifacts
+*.safetensors
+
+# Local research/reference papers
+src/lerobot/policies/pi05/*.pdf
 
 # Translations
 *.mo
