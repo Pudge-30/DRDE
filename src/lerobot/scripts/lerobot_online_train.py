@@ -1393,15 +1393,6 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # The online dataset will be used for collecting new episodes
     training_dataset = offline_dataset if offline_dataset is not None else online_dataset
 
-    # 为在线数据集设置 delta_timestamps（BC 训练需要 action chunks）
-    if online_dataset is not None and getattr(online_dataset, 'delta_timestamps', None) is None:
-        delta_ts = resolve_delta_timestamps(cfg.policy, online_dataset.meta)
-        if delta_ts is not None:
-            online_dataset.delta_timestamps = delta_ts
-            online_dataset.delta_indices = get_delta_indices(delta_ts, online_dataset.fps)
-            if is_main_process:
-                logging.info(f"Online dataset delta_timestamps set: {list(delta_ts.keys())}")
-
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
     _attn_val = getattr(cfg.policy, "attn_act_len", None)
     if _attn_val is not None and _attn_val > 0:
@@ -1448,15 +1439,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"  attn_act_len:          {policy.config.attn_act_len}")
         logging.info(f"  part_layer_num:        {policy.config.part_layer_num}")
         logging.info(f"  cmp_pretrain:          {policy.config.cmp_pretrain}")
-        logging.info(f"  anchor_weight:         {getattr(policy.config, 'anchor_weight', 0.0)}")
         logging.info("=" * 60)
-
-    # Initialize anchor Expert for velocity distillation (before accelerator.prepare)
-    anchor_weight_val = getattr(policy.config, 'anchor_weight', 0.0)
-    if anchor_weight_val > 0:
-        policy.init_anchor_expert()
-        if is_main_process:
-            logging.info(f"[Anchor] Velocity distillation enabled (weight={anchor_weight_val})")
 
     # Create processors
     processor_kwargs = {}
@@ -1630,14 +1613,14 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # neg_action_config 需要通过 worker_init_fn 注入到每个 worker 的 dataset 副本中
     _neg_action_cfg = getattr(training_dataset, "neg_action_config", None)
 
-    def _offline_worker_init_fn(worker_id):
-        """在离线 DataLoader worker 进程中注入 neg_action_config。"""
+    def _worker_init_fn(worker_id):
+        """在每个 DataLoader worker 进程中注入 neg_action_config。"""
         if _neg_action_cfg is not None:
             worker_info = torch.utils.data.get_worker_info()
             if worker_info is not None:
                 worker_info.dataset.neg_action_config = _neg_action_cfg
 
-    def create_dataloader(dataset, online=False, success_only=False, min_episode_index=None):
+    def create_dataloader(dataset, online=False):
         """创建 DataLoader。
 
         Args:
@@ -1680,7 +1663,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             pin_memory=device.type == "cuda",
             drop_last=False,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
-            worker_init_fn=init_fn,
+            worker_init_fn=_worker_init_fn,
         )
 
     # Create dataloader for offline dataset (if exists)
