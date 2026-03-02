@@ -97,31 +97,6 @@ class PI05Config(PreTrainedConfig):
     replan_mode: str = "drift"  # "drift": drift-based replan; "fixed": 每 n_action_steps 步固定 replan (同 baseline)
     embedding_max_norm: float = 0.0  # 0 = 关闭；>0 = 手动指定 clamp norm
 
-    # Online training: success-weighted feature loss
-    online_success_decay_power: float = 1.0  # 失败帧权重衰减幂次（1.0=线性, 2.0=二次衰减）
-
-    # Velocity distillation: anchor loss weight (0=disabled)
-    # L_total = L_bc + feature_weight*L_feature + anchor_weight*L_anchor
-    # L_anchor = MSE(v_current, v_offline) prevents Expert mode collapse
-    anchor_weight: float = 0.0
-
-    # Feature-only online training: remove bc_loss, every step = feature_loss + anchor_loss
-    # Only success episodes from current iteration are used
-    feature_only_online: bool = False
-
-    # EMA decay for anchor update (1.0 = fixed anchor, no update)
-    anchor_ema_decay: float = 0.995
-
-    # Maximum successful episodes in replay pool (0 = unlimited)
-    max_replay_episodes: int = 50
-
-    # RECAP fusion: directional feature_loss
-    feature_margin_neg: float = 0.3    # negative loss margin: ReLU(margin - MSE)
-    feature_neg_weight: float = 0.0    # negative loss weight in combined feature_loss (0=off)
-    quality_embed_dim: int = 128       # quality embedding dimension for RECAP conditioning
-    quality_lr: float = 1e-3           # separate lr for quality conditioning params (0=use same as expert)
-    max_failure_episodes: int = 20     # maximum failure episodes in replay pool
-
 
     def __post_init__(self):
         super().__post_init__()
