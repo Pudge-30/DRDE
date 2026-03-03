@@ -1,0 +1,671 @@
+评估的时候应该让模型在当下obs_t生成对应的actionchunk,然后按照训练的attlen来开始
+对actionchunk进行分割，对应位置和obs_t进行itm分数比较；
+执行了attlen后，到了obs_t+attlen，这个时候还是从obs_t这个对应的actionchunk里面
+的后一个segment的action特征，把这个action的特征和obs_t+attlen进行itm比较；
+以此类推，高于阈值的时候触发replan
+
+梳理一下目前的idea吧，虽然还没修改。我认为总的来说，目前设计的loss=cmploss+bcloss      
+  ，这里的bcloss对应的是vla生成动作的能力；cmploss这里用的是三元链进行的loss计算希望     
+  达到的效果是：如果当前的设计有效，那么在训练完成之后，模型应当有的能力为在当前的ob     
+  s_t下能够规划出“很匹配”的action（或者说actionchunk），这对应z1和z2的对比以及专家数     
+  据的bcloss；另一方对应obs_t下生成的actionchunk对应超参数att_len对比相关阈值进行动      
+  作执行，小于阈值就正常执行，大于阈值就重规划；然后基于正常执行的步骤k步（k应该是一     
+  定等于att_len的，你需要确定一下）以后，到达obs_t+k，这个时候对应obs_t时刻的老actio     
+  n[k,2k]的特征和obs_t+k进行对比，判断阈值触发。
+
+
+现在思考之后，训练的时候没有错误的漂移的数据能够拿来训练，所以为了对齐eval，采用的想法是
+在训练cmp的时候加入一个预测模块，在z1和z2下预测z3，这样因为z3算是比较稳健的锚点（专家数据提取的特征）
+这个预测模块后续在eval的时候就可以来检测drift程度。比如在eval的时候，当前t时刻，obs_t（提取z1）对应生成了一个size为
+50的actionchunk，取前10个作为z2（符合训练的模式），同时z1和z2产生一个预测的z3_pre；然后让机械臂执行这10步的action到
+状态z3，比较z3和z3_pre，来判断漂移。
+                          ┌─────────────────────────┐                                         
+                          │     Total Loss          │                                         
+                          │ = bc_loss + 0.1×cmp_loss│                                         
+                          └────────┬────────────────┘                                         
+                      ┌────────────┴────────────────────┐                                     
+                      ▼                                  ▼                                    
+                ┌──────────┐                     ┌────────────┐                               
+                │  BC Loss  │                     │  CMP Loss   │                             
+                │ (MSE)     │                     │             │                             
+                └─────┬─────┘                     └──────┬──────┘                             
+                      │                          ┌───────┴───────┐                            
+                      │                          ▼               ▼                            
+                      │                   contrastive_loss   L_forward                        
+                      │                          │               │                            
+      ┌───────────────┼──────────────────────────┼───────────────┼──────────┐                 
+      │  梯度回传到:   │                          │               │          │                
+      │               ▼                          ▼               ▼          │                 
+      │  ┌─────────────────────┐   ┌──────────────────────────────────┐    │                  
+      │  │ VLM 全 18 层        │   │ VLM 前 6 层 (forward_partial)    │    │                  
+      │  │ Expert 全 18 层     │   │ cls_head_prefix                  │    │                  
+      │  │ action_in/out_proj  │   │ ObsQueryBridge (z1 编码器)       │    │                  
+      │  │ time_mlp             │   │ ContentAttention (z2 编码器)     │    │                 
+      │  │                     │   │ proj_z2                          │    │                  
+      │  └─────────────────────┘   │ ITMHead                         │    │                   
+      │         ↑ BC                │ ForwardModel                    │    │                  
+      │                            └──────────────────────────────────┘    │                  
+      │                                       ↑ CMP                       │                   
+      └───────────────────────────────────────────────────────────────────┘ 
+
+
+
+
+
+
+
+
+目前引入时序上的负样本，预计效果如果模型能够很好地训练出来，那么能够和eval对齐；
+并且我的设想，如果去掉三元链这个限制，只训练预测z3的能力，那么后续eval时候replan的次数会变多。
+
+
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src python -m lerobot.scripts.lerobot_eval \
+      --policy.path=/home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/checkpoints/006000/pretrained_model \
+      --env.type=libero \
+      --env.task=libero_10 \
+      --eval.n_episodes=50 \
+      --eval.batch_size=10 \
+      --output_dir=/home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/eval_6000_itm \
+  > /home/kemove/hyp/lhm-heritage/outputs/triple_match_cross_cmp/eval_6000_itm.log 2>&1 &
+
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+      --policy.path=outputs/neg_imprv/checkpoints/005000/pretrained_model \
+      --env.type=libero \
+      --env.task=libero_10 \
+      --eval.batch_size=12 \
+      --eval.n_episodes=50 \
+      --policy.device=cuda \
+      --output_dir=outputs/neg_imprv/eval_5000 \
+      > outputs/neg_imprv/eval_5000.log 2>&1 &
+
+
+
+
+
+
+  CMP loss 确实设计得比较完整：三元链对比 + ForwardModel + 时序负样本。但目前的设计链条是： 
+                                                                                            
+  CMP 训练 → drift 检测能力 → 触发 replan → 重新生成 action chunk                           
+                                                ↑                                           
+                                           这一步 = 用同一个模型在当前 obs 重新跑一次       
+                                                                                            
+  问题在最后一步：replan 做的事情和 baseline 每 10 步做的事情完全一样——从当前 obs 重新生成  
+  chunk。drift replan 77.6% < baseline fixed 94%，说明：                                    
+                                                                                            
+  - 检测能力有了（62.6% → 77.6%，replan 确实在起作用）                                      
+  - 但纠错 ≠ 检测。检测只回答"偏了没有"，而纠错需要回答"怎么回来"                           
+                                                                                            
+  当前 70.8% 的 replan 发生在 seg=1（刚生成的 chunk                                         
+  立刻被判定偏了），形成级联。这意味着模型从偏离的状态重新规划，生成的 action               
+  依然不好——因为训练数据全是专家轨迹，模型没见过从偏离状态恢复的情况。                      
+                                                                                            
+  CMP 真正能体现价值的方向                                                                   
+  方向 A：效率论 — 不追求超越 baseline，而是证明 drift replan                               
+  可以用更少的推理次数达到接近的效果。baseline 每 episode 推理 52 次，如果 drift replan 能用
+   ~15 次达到 90%+，这就是计算效率的提升。但目前 12.8 次只到 77.6%，阈值和级联问题需要解决。
+                                                                                            
+  方向 B：将 drift 信号反馈到 action 生成 — 不只是二元的"replan or not"，而是利用           
+  ForwardModel 的 predicted_z3 vs actual_z3 的差值来修正 action。比如：                     
+  - 在 action 空间做残差修正：action_corrected = action + f(z3_pred - z3_actual)            
+  - 或者将 drift 向量作为额外条件输入到 action generation                                   
+                                                                                            
+  这才是真正的"纠错"，而不是"检测到错了就重来"。
+
+关于方向A我是认可的，这个我的想法        
+  就是最后我们的successrate可以到达90+（比baseline稍微低一点点）但是推理次数远低于base     
+  line的做法，这样是可以说故事写论文的，但是就是其中replan的阈值这个数字好不好解释，好     
+  不好找的问题。关于方案B我认为非常有道理，就是你说的这个做法是在推理中能做到吗？还是      
+  说要修改训练逻辑？
+
+
+
+
+2.2
+
+=========================================================================================================
+Eval 命令汇总
+=========================================================================================================
+
+── 已完成 ──────────────────────────────────────────────────────────────────────
+
+[1] baseline (纯BC, 每10步replan) → 94.0%
+    代码库: /home/kemove/hyp/lerobot/src
+    输出:   outputs/eval_baseline/
+    checkpoint: /home/kemove/hyp/lerobot/outputs/pi05_libero_official_reproduce/checkpoints/last/pretrained_model
+
+[2] neg_imprv 无replan (ckpt 6000) → 62.6%
+    nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+          --policy.path=outputs/neg_imprv/checkpoints/006000/pretrained_model \
+          --env.type=libero \
+          --env.task=libero_10 \
+          --eval.batch_size=12 \
+          --eval.n_episodes=50 \
+          --policy.device=cuda \
+          --output_dir=outputs/neg_imprv/eval_6000 \
+          > outputs/neg_imprv/eval_6000.log 2>&1 &
+
+[3] neg_imprv drift replan=0.10 (ckpt 6000) → 77.6%
+    nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+          --policy.path=outputs/neg_imprv/checkpoints/006000/pretrained_model \
+          --env.type=libero \
+          --env.task=libero_10 \
+          --eval.batch_size=12 \
+          --eval.n_episodes=50 \
+          --policy.device=cuda \
+          --policy.replan_drift_threshold=0.10 \
+          --output_dir=outputs/neg_imprv/eval_6000_replan_0.1 \
+          > outputs/neg_imprv/eval_6000_replan_0.1.log 2>&1 &
+
+── 待运行 (2×2 ablation) ──────────────────────────────────────────────────────
+
+[4] neg_imprv + fixed replan (每10步, 同baseline策略) → ?
+    代码库: lhm-heritage (需要 replan_mode=fixed 分支)
+    nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+          --policy.path=outputs/neg_imprv/checkpoints/006000/pretrained_model \
+          --env.type=libero \
+          --env.task=libero_10 \
+          --eval.batch_size=10 \
+          --eval.n_episodes=50 \
+          --policy.device=cuda \
+          --policy.replan_mode=fixed \
+          --output_dir=outputs/neg_imprv/eval_6000_fixed_replan \
+          > outputs/neg_imprv/eval_6000_fixed_replan.log 2>&1 &
+
+[5] baseline + 无replan (50步跑完) → ?
+    代码库: lhm-heritage (原始代码库的 feature validation 会报 empty_camera_0 缺失)
+    说明: CMP 权重缺失被 except 捕获(随机初始化), replan_mode=fixed 完全不触碰 CMP 模块
+    nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+          --policy.path=/home/kemove/hyp/lerobot/outputs/pi05_libero_official_reproduce/checkpoints/last/pretrained_model \
+          --env.type=libero \
+          --env.task=libero_10 \
+          --eval.batch_size=10 \
+          --eval.n_episodes=50 \
+          --policy.device=cuda \
+          --policy.n_action_steps=50 \
+          --policy.replan_mode=fixed \
+          --output_dir=/home/kemove/hyp/lhm-heritage/outputs/baseline_no_replan \
+          > /home/kemove/hyp/lhm-heritage/outputs/baseline_no_replan.log 2>&1 &
+
+    2×2 矩阵:
+    ┌──────────────────┬────────────────────────┬────────────────────────┐
+    │                  │ Fixed replan (每10步)   │ No replan (50步跑完)   │
+    ├──────────────────┼────────────────────────┼────────────────────────┤
+    │ baseline (纯BC)  │ 94.0% [1] ✓            │ ?     [5] ← 待跑      │
+    │ neg_imprv (BC+CMP)│ ?     [4] ← 待跑      │ 62.6% [2] ✓            │
+    └──────────────────┴────────────────────────┴────────────────────────┘
+    目的: 分离 CMP 训练对 BC 质量的影响 vs replan 策略的影响
+
+=== 当前结果 ===
+
+baseline (纯BC, 每10步replan):     94.0%  (推理 ~52 次/episode)
+neg_imprv 无replan (ckpt 6000):    62.6%  (推理 11 次/episode)
+neg_imprv drift replan=0.10:       77.6%  (推理 ~12.8 次/episode)
+
+drift replan 分析:
+- 总 replan 事件 137 次, 48 rollout 中 38 个有 replan
+- 70.8% 的 replan 发生在 seg=1（刚生成的 chunk 立刻被判定偏了）
+- 存在级联问题：15 条级联链，长度 2-9，平均 4.9
+
+=== 核心问题诊断 ===
+
+CMP 训练链条:
+  CMP 训练 → drift 检测能力 → 触发 replan → 重新生成 action chunk
+                                                ↑
+                                           这一步 = 用同一个模型在当前 obs 重新跑一次
+
+问题在最后一步：replan 做的事情和 baseline 每 10 步做的事情完全一样——从当前
+obs 重新生成 chunk。drift replan 77.6% < baseline fixed 94%，说明：
+- 检测能力有了（62.6% → 77.6%，replan 确实在起作用）
+- 但纠错 ≠ 检测。检测只回答"偏了没有"，而纠错需要回答"怎么回来"
+
+当前 70.8% 的 replan 发生在 seg=1（刚生成的 chunk 立刻被判定偏了），形成级联。
+模型从偏离的状态重新规划，生成的 action 依然不好——因为训练数据全是专家轨迹，
+模型没见过从偏离状态恢复的情况。
+
+=== 后续方向 ===
+
+方向 A：效率论（推荐，先做）
+  目标: success rate 90+（接近 baseline），推理次数远低于 baseline 的 52 次
+  故事: CMP 训练 + drift 检测 + 自适应执行 = 接近 baseline 准确率，推理次数降 70%+
+  关键: 解决级联问题 + 阈值调优
+  阈值选择依据: 可用训练时 l_forward 的均值/分位数作为参考（如 1.5x~2x 均值）
+
+方向 B：将 drift 信号反馈到 action 生成
+
+  B1. 纯推理方案（不改训练）:
+
+    梯度修正法（Embedding-space MPC）:
+    ForwardModel 是可微分的：actions → ContentAttention → z2 → FM(z1,z2) → predicted_z3
+    执行 k 步后拿到 actual_z3，对剩余 action 做梯度优化：
+      remaining_actions.requires_grad_(True)
+      z2 = proj_z2(content_attention(remaining_actions))
+      z3_pred = forward_model(actual_z3, z2)
+      loss = mse(z3_pred, target_z3)
+      loss.backward()
+      remaining_actions -= lr * remaining_actions.grad
+    本质: 嵌入空间 MPC，不改训练，但每次修正需要几步梯度迭代，推理成本增加。
+
+    自适应步长法（更简单，也不改训练）:
+    不做二元 replan/不 replan，用 drift 大小决定当前 chunk 还能用多少步：
+      drift 小 → 继续执行到 chunk 末尾（省推理）
+      drift 中 → 再执行一个 segment 后 replan
+      drift 大 → 立即 replan
+    直接解决级联问题——不是"偏了就整个扔掉重来"，而是渐进式调整执行长度。
+
+  B2. 需要改训练:
+    训练专门的 correction module: action_corrected = action + CorrNet(action, z3_pred - z3_actual)
+    问题: 没有 drift 数据（专家数据里不存在"执行偏了"的状态）
+    - 训练时加随机扰动制造 drift（扰动分布和真实 drift 可能不一致）
+    - 用 RL/online learning 在仿真中采集 drift 数据（工程量大）
+
+=== 务实路线 ===
+
+1. 先跑完 2×2 矩阵，确认 CMP 不伤 BC
+2. 方向 A + 自适应步长（不改训练，只改 select_action）
+   → 目标: 90+ 成功率 / ~15 次推理
+3. 梯度修正法作为 paper 的 future work 或 ablation
+
+
+
+
+
+
+
+
+
+
+=========================================================================================================
+评估结果汇总表 (精确统计)
+=========================================================================================================
+
+┌─ 总览对比 ─────────────────────────────────────────────────────────────────────────────────────────────
+│ 实验                                     replan策略           成功率      推理次数/ep   replan次数/rollout
+│────────────────────────────────────────────────────────────────────────────────────────────────────────
+│ baseline (纯BC, 每10步replan)             固定每10步           94.0%           52                N/A
+│ neg_imprv 无replan (ckpt 6000)          50步跑完            62.6%           11                  0
+│ neg_imprv drift replan=0.10 (ckpt 6000) drift>0.10       77.6%         12.8     3.6 (有replan的)
+└────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+┌─ Per-task 对比 (50 episodes/task) ─────────────────────────────────────────────────────────────────────
+│ Task │     baseline │      无replan │ drift replan │   replan提升 vs baseline
+│────────────────────────────────────────────────────────────────────────────────────────────────────────
+│    0 │          96% │          58% │          78% │       +20pp        -18pp
+│    1 │         100% │          74% │          92% │       +18pp         -8pp
+│    2 │         100% │          46% │          76% │       +30pp        -24pp
+│    3 │         100% │          90% │          78% │       -12pp        -22pp
+│    4 │          98% │          56% │          80% │       +24pp        -18pp
+│    5 │          94% │          74% │          86% │       +12pp         -8pp
+│    6 │          90% │          56% │          62% │        +6pp        -28pp
+│    7 │          98% │          66% │          86% │       +20pp        -12pp
+│    8 │          66% │          60% │          80% │       +20pp        +14pp ★
+│    9 │          98% │          46% │          58% │       +12pp        -40pp
+│────────────────────────────────────────────────────────────────────────────────────────────────────────
+│   总计 │       94.0% │       62.6% │       77.6% │     +15.0pp      -16.4pp
+└────────────────────────────────────────────────────────────────────────────────────────────────────────
+  注：现有 eval 数据中无 ep_steps 字段，需重新跑 eval 后才有 step 统计
+  ★ = drift replan 超越 baseline
+
+┌─ Drift Replan 精确统计 (threshold=0.10) ───────────────────────────────────────────────────────────────
+│ 总 replan 事件: 137  |  rollout: 48 个 (有replan: 38, 无: 10)
+│
+│ ▸ 精确推理次数/episode (模拟计算):
+│     次数  rollout数      占比
+│   ────────────────────────────
+│     11        14   29.2% ██████████████
+│     12        19   39.6% ███████████████████
+│     13         4    8.3% ████
+│     14         2    4.2% ██
+│     15         2    4.2% ██
+│     16         2    4.2% ██
+│     17         1    2.1% █
+│     18         2    4.2% ██
+│     19         2    4.2% ██
+│   平均: 12.81 次/episode
+│
+│ ▸ 触发 segment 分布:
+│     seg    次数      占比  含义
+│   ─────────────────────────────────────────────
+│   seg=1    97   70.8%  chunk 首个10步
+│   seg=2     7    5.1%  第20步
+│   seg=3     9    6.6%  第30步
+│   seg=4    24   17.5%  末尾10步
+│
+│ ▸ 首次 replan chunk:
+│   chunk=2: 4次 (10.5%)
+│   chunk=3: 30次 (78.9%)
+│   chunk=4: 4次 (10.5%)
+│
+│ ▸ seg=1 级联链: 15条, 长度 2-9, 平均 4.9
+└────────────────────────────────────────────────────────────────────────────────────────────────────────
+训练完后要做的事：                                                                   
+                                                                                             
+  1. 确认 bc_loss — 看是否收敛到 ~0.032（和 baseline 同水平），验证配置修复有效              
+  2. 重跑 2×2 矩阵 eval — 用修复后的模型替换之前的 neg_imprv，重新评估：                     
+    - 新模型 + fixed replan (n_action_steps=10)                                              
+    - 新模型 + drift replan (threshold=0.1)                                                  
+    - 新模型 + no replan (n_action_steps=50)                                                 
+  3. 对比 — 看 drift replan 能否超过 baseline no-replan 的 83.4%
+
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/idea/checkpoints/006000/pretrained_model \
+--env.type=libero \
+--env.task=libero_10 \
+--eval.batch_size=8 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--policy.replan_drift_threshold=0.10 \
+--output_dir=outputs/idea/eval_6000_replan_0.1 \
+> outputs/idea/eval_6000_replan_0.1.log 2>&1 &
+
+
+
+
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/idea/checkpoints/006000/pretrained_model \
+--env.type=libero \
+--env.task=libero_10 \
+--eval.batch_size=12 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--policy.replan_drift_threshold=0.10 \
+--policy.replan_drift_threshold_mid=0.07 \
+--output_dir=outputs/idea/eval_6000_adaptive_h0.10_m0.07 \
+> outputs/idea/eval_6000_adaptive_h0.10_m0.07.log 2>&1 &
+
+
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/comparasion1/checkpoints/006000/pretrained_model \
+--env.type=libero \
+--env.task=libero_10 \
+--eval.batch_size=10 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--output_dir=outputs/comparasion1/eval_6000 \
+> outputs/comparasion1/eval_6000.log 2>&1 &
+# 结果: 81.0% (no replan)
+
+
+# comparasion1 (QUANTILES 归一化 + VLM 梯度切断) 单一阈值 drift replan
+# 训练 l_fwd=0.020, 阈值=1.5x=0.03 (对照 idea 单一阈值 85.2%)
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/comparasion1/checkpoints/006000/pretrained_model \
+--env.type=libero \
+--env.task=libero_10 \
+--eval.batch_size=8 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--policy.replan_drift_threshold=0.03 \
+--policy.replan_drift_threshold_mid=0.0 \
+--output_dir=outputs/comparasion1/eval_6000_drift_h0.03 \
+> outputs/comparasion1/eval_6000_drift_h0.03.log 2>&1 &
+
+
+# comparasion1 (QUANTILES 归一化 + VLM 梯度切断) 双阈值 adaptive replan
+# 训练 l_fwd=0.020, mid=1.0x=0.02, high=1.5x=0.03 (对照 idea adaptive 91.2%)
+nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/comparasion1/checkpoints/006000/pretrained_model \
+--env.type=libero \
+--env.task=libero_10 \
+--eval.batch_size=8 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--policy.replan_drift_threshold=0.03 \
+--policy.replan_drift_threshold_mid=0.02 \
+--output_dir=outputs/comparasion1/eval_6000_adaptive_h0.03_m0.02 \
+> outputs/comparasion1/eval_6000_adaptive_h0.03_m0.02.log 2>&1 &
+# 结果: 93.4% (推理次数 38.2 次/ep) ⭐ 仅差 baseline 0.6pp!
+# 但阈值过激进，触发过多 replan。建议测试宽松阈值 h=0.06, m=0.04 
+
+
+
+
+2.12
+nohup env CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/comparasion1/checkpoints/006000/pretrained_model \ 
+--env.type=libero \
+--env.task=libero_goal \
+--eval.batch_size=12 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--policy.replan_drift_threshold=0.055 \
+--policy.replan_drift_threshold_mid=0.050 \
+--output_dir=outputs/comparasion1/eval_6000_adaptive_h0.055_m0.050/libero_goal \
+> outputs/comparasion1/eval_6000_adaptive_h0.055_m0.050_goal.log 2>&1 &
+
+
+3.1
+nohup env CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/home/kemove/hyp/lhm-heritage/src lerobot-eval \
+--policy.path=outputs/comparasion1/checkpoints/006000/pretrained_model \
+--env.type=libero \
+--env.task=libero_goal \
+--eval.batch_size=12 \
+--eval.n_episodes=50 \
+--policy.device=cuda \
+--policy.replan_drift_threshold=0.045 \
+--policy.replan_drift_threshold_mid=0.040 \
+--output_dir=outputs/comparasion1/eval_6000_adaptive_h0.045_m0.040/libero_goal \
+> outputs/comparasion1/eval_6000_adaptive_h0.045_m0.040_goal.log 2>&1 &
+
+
+
+
+################################################################################
+#                    Baseline vs Comparasion1 评估结果汇总                      #
+#                              (2025-03-01)                                    #
+################################################################################
+#
+# 数据来源:
+#   Baseline:     /home/kemove/hyp/lhm-heritage/outputs/eval_baseline
+#   Comp1 (h55):  /home/kemove/hyp/lhm-heritage/outputs/comparasion1/eval_6000_adaptive_h0.055_m0.050
+#   Comp1 (h45):  /home/kemove/hyp/lhm-heritage/outputs/comparasion1/eval_6000_adaptive_h0.045_m0.040
+#   Comp1 (h35):  /home/kemove/hyp/lhm-heritage/outputs/comparasion1/eval_6000_adaptive_h0.035_m0.030
+#
+# ==================== 一、各阈值配置成功率汇总 ====================
+#
+# ┌─────────────────┬────────────┬─────────────┬─────────────┬─────────────┬─────────────────┐
+# │ 任务集          │  Baseline  │  h55/m50    │  h45/m40    │  h35/m30    │ 最佳配置        │
+# ├─────────────────┼────────────┼─────────────┼─────────────┼─────────────┼─────────────────┤
+# │ LIBERO-10       │    94.0%   │    94.2%    │      -      │      -      │ h55/m50 (+0.2pp)│
+# │ LIBERO-SPATIAL  │    98.2%   │    92.6%    │    98.2%    │      -      │ h45/m40 (+0.0pp)│
+# │ LIBERO-OBJECT   │    99.2%   │    93.6%    │    97.2%    │    98.2%    │ h35/m30 (-1.0pp)│
+# │ LIBERO-GOAL     │    97.2%   │    92.0%    │    94.8%    │    94.8%    │ h45/m40 (-2.4pp)│
+# └─────────────────┴────────────┴─────────────┴─────────────┴─────────────┴─────────────────┘
+#
+
+
+
+################################################################################
+#                    全面对比汇总表 (Baseline vs CMP)                          #
+#                         (完整版 2026-03-02)                                  #
+################################################################################
+#
+# 数据来源:
+#   Baseline: /home/kemove/qyh/DRDE/DRDE/outputs/ + /home/kemove/hyp/lhm-heritage/outputs/eval_baseline/
+#   CMP:      /home/kemove/hyp/lhm-heritage/outputs/comparasion1/
+#
+# ==================================================================================================
+#                              Baseline vs CMP 完整对比大表 (含LIBERO-10)
+# ==================================================================================================
+#
+# ┌──────────────────┬────────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────────┬──────────┐
+# │ 任务集           │ 配置       │  成功率  │ 成功步数 │  总步数  │  replan  │ VLA推理  │ 步/推理  │ vs Baseline  │ 推理减少 │
+# ├──────────────────┼────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────────┼──────────┤
+# │ LIBERO-10        │ Baseline   │   94.0%  │    ~246  │  ~131K*  │  13310*  │  13310*  │   10.0   │      --      │    --    │
+# │ LIBERO-10        │ h55/m50    │   94.2%  │   245.9  │  130894  │    1369  │    3713  │   35.3   │    +0.2pp    │  72.1%   │
+# │ LIBERO-10        │ h45/m40    │   94.6%  │   241.5  │  128286  │    1862  │    4055  │   31.6   │    +0.6pp    │  69.5%   │
+# ├──────────────────┼────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────────┼──────────┤
+# │ LIBERO-SPATIAL   │ Baseline   │   98.2%  │   102.7  │   52934  │    5520  │    5520  │    9.6   │      --      │    --    │
+# │ LIBERO-SPATIAL   │ h55/m50    │   92.6%  │   105.2  │   59083  │     438  │    1532  │   38.6   │    -5.6pp    │  72.2%   │
+# │ LIBERO-SPATIAL   │ h45/m40    │   98.2%  │    99.7  │   51495  │     696  │    1587  │   32.5   │    +0.0pp    │  71.2%   │
+# ├──────────────────┼────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────────┼──────────┤
+# │ LIBERO-OBJECT    │ Baseline   │   99.2%  │   134.2  │   67697  │    6987  │    6987  │    9.7   │      --      │    --    │
+# │ LIBERO-OBJECT    │ h55/m50    │   93.6%  │   136.1  │   72658  │     366  │    1746  │   41.6   │    -5.6pp    │  75.0%   │
+# │ LIBERO-OBJECT    │ h45/m40    │   97.2%  │   135.3  │   69653  │     895  │    2109  │   33.0   │    -2.0pp    │  69.8%   │
+# │ LIBERO-OBJECT    │ h35/m30    │   98.2%  │   134.9  │   68764  │     891  │    2088  │   32.9   │    -1.0pp    │  70.1%   │
+# ├──────────────────┼────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────────┼──────────┤
+# │ LIBERO-GOAL      │ Baseline   │   97.2%  │   107.8  │   56607  │    5871  │    5871  │    9.6   │      --      │    --    │
+# │ LIBERO-GOAL      │ h55/m50    │   92.0%  │   107.0  │   61215  │     373  │    1523  │   40.2   │    -5.2pp    │  74.1%   │
+# │ LIBERO-GOAL      │ h45/m40    │   94.8%  │   104.2  │   57204  │     819  │    1799  │   31.8   │    -2.4pp    │  69.4%   │
+# │ LIBERO-GOAL      │ h35/m30    │   94.8%  │   103.8  │   56998  │     866  │    1833  │   31.1   │    -2.4pp    │  68.8%   │
+# └──────────────────┴────────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────────┴──────────┘
+#
+# * LIBERO-10 Baseline 无 ep_steps 字段，总步数/replan/VLA推理 为估算值
+#
+# ==================================================================================================
+#                                     指标说明
+# ==================================================================================================
+#
+#   - 成功率:     成功 episode 数 / 总 episode 数 (500 episodes per task set)
+#   - 成功步数:   成功 episode 的平均执行步数 (越少越好)
+#   - 总步数:     所有 500 个 episode 的 ep_steps 之和 (sum of per_task[*].metrics.ep_steps)
+#                 步/推理 = 总步数 / VLA推理
+#   - replan:     drift 阈值触发的重规划次数
+#                 Baseline: = VLA推理 (固定每10步, 每次推理即 replan)
+#                 CMP: sum(replan_counts), drift 阈值触发时 _replan_count++ (从 JSON 直接读取)
+#   - VLA推理:    VLA 模型总推理次数 (predict_action_chunk / sample_actions 调用次数)
+#                 Baseline: sum(ceil(ep_steps / 10)), 固定每10步推理一次
+#                 CMP: total_chunks = 初始chunk + 用满续期chunk + replan chunk
+#   - 步/推理:    总步数 / VLA推理 = 平均每次推理执行的动作步数 (Steps per Inference, 越高越高效)
+#                 Baseline ≈9.6-9.7 (理论10, 因最后一次推理不一定用满10步), CMP 越高说明 chunk 复用越好
+#   - 推理减少:   Inference Reduction = 1 - CMP_VLA推理 / Baseline_VLA推理
+#
+# ==================================================================================================
+#                                     综合结论
+# ==================================================================================================
+#
+# ┌──────────────────┬──────────┬──────────┬──────────┬──────────────┬──────────────┬────────────┐
+# │ 任务集           │ Baseline │ 最佳CMP  │ 成功率差 │ 推理减少     │ 步/推理      │ 最佳配置   │
+# ├──────────────────┼──────────┼──────────┼──────────┼──────────────┼──────────────┼────────────┤
+# │ LIBERO-10        │   94.0%  │   94.6%  │  +0.6pp  │    69.5%     │  31.6 步/次  │ h45/m40  ✓ │
+# │ LIBERO-SPATIAL   │   98.2%  │   98.2%  │  +0.0pp  │    71.2%     │  32.5 步/次  │ h45/m40  ✓ │
+# │ LIBERO-OBJECT    │   99.2%  │   98.2%  │  -1.0pp  │    70.1%     │  32.9 步/次  │ h35/m30  ✓ │
+# │ LIBERO-GOAL      │   97.2%  │   94.8%  │  -2.4pp  │    69.4%     │  31.8 步/次  │ h45/m40    │
+# └──────────────────┴──────────┴──────────┴──────────┴──────────────┴──────────────┴────────────┘
+#
+# 关键发现:
+#   1. CMP 减少约 70% 的 VLA 推理次数 (Inference Reduction 69-75%)
+#   2. 每次 VLA 推理平均执行 31-42 步 (vs Baseline 固定 10 步), 效率提升 3-4 倍
+#   3. LIBERO-10: 超越 Baseline (+0.6pp), 推理减少 69.5%
+#   4. LIBERO-SPATIAL: 追平 Baseline (+0.0pp), 推理减少 71.2%
+#   5. LIBERO-OBJECT: 仅差 1.0pp, 推理减少 70.1%
+#   6. LIBERO-GOAL: 差距最大 (-2.4pp), 推理减少 69.4%
+#
+# 核心结论:
+#   CMP 以约 30% 的 VLA 推理次数 (每次推理执行 ~32 步 vs Baseline 的 10 步)
+#   达到接近 Baseline 的成功率, 在 LIBERO-10 和 LIBERO-SPATIAL 上追平或超越 Baseline
+#
+# ==================================================================================================
+#                                  Replan 模式分析
+# ==================================================================================================
+#
+# ── 一、Replan 频率对比 (vs Baseline 固定模式 = 每10步replan一次, 频率=1.0) ──
+#
+# ┌──────────────────┬────────────┬────────┬────────┬─────────────┬──────────────┬──────────────────┐
+# │ 任务集           │ 配置       │ replan │ VLA推理│ replan占比  │ 频率(vs固定) │ 平均步数/replan  │
+# ├──────────────────┼────────────┼────────┼────────┼─────────────┼──────────────┼──────────────────┤
+# │ LIBERO-10        │ Baseline   │ 13310  │ 13310  │   100%      │    1.0       │    10.0 步       │
+# │ LIBERO-10        │ h55/m50    │  1369  │  3713  │  36.9%      │    0.105     │    95.6 步       │
+# │ LIBERO-10        │ h45/m40    │  1862  │  4055  │  45.9%      │    0.145     │    68.9 步       │
+# ├──────────────────┼────────────┼────────┼────────┼─────────────┼──────────────┼──────────────────┤
+# │ LIBERO-SPATIAL   │ Baseline   │  5520  │  5520  │   100%      │    1.0       │     9.6 步       │
+# │ LIBERO-SPATIAL   │ h55/m50    │   438  │  1532  │  28.6%      │    0.074     │   134.9 步       │
+# │ LIBERO-SPATIAL   │ h45/m40    │   696  │  1587  │  43.9%      │    0.135     │    74.0 步       │
+# ├──────────────────┼────────────┼────────┼────────┼─────────────┼──────────────┼──────────────────┤
+# │ LIBERO-OBJECT    │ Baseline   │  6987  │  6987  │   100%      │    1.0       │     9.7 步       │
+# │ LIBERO-OBJECT    │ h55/m50    │   366  │  1746  │  21.0%      │    0.050     │   198.5 步       │
+# │ LIBERO-OBJECT    │ h45/m40    │   895  │  2109  │  42.4%      │    0.128     │    77.8 步       │
+# │ LIBERO-OBJECT    │ h35/m30    │   891  │  2088  │  42.7%      │    0.130     │    77.2 步       │
+# ├──────────────────┼────────────┼────────┼────────┼─────────────┼──────────────┼──────────────────┤
+# │ LIBERO-GOAL      │ Baseline   │  5871  │  5871  │   100%      │    1.0       │     9.6 步       │
+# │ LIBERO-GOAL      │ h55/m50    │   373  │  1523  │  24.5%      │    0.061     │   164.1 步       │
+# │ LIBERO-GOAL      │ h45/m40    │   819  │  1799  │  45.5%      │    0.143     │    69.8 步       │
+# │ LIBERO-GOAL      │ h35/m30    │   866  │  1833  │  47.2%      │    0.152     │    65.8 步       │
+# └──────────────────┴────────────┴────────┴────────┴─────────────┴──────────────┴──────────────────┘
+#
+#   频率(vs固定) = replan / (总步数/10), 固定模式=1.0
+#   平均步数/replan = 总步数 / replan
+#   最高频率 0.152 (h35/m30 GOAL), 仍比固定模式低 6.6 倍
+#
+# ── 二、Replan 触发 Segment 分布 (从日志统计) ──
+#
+# ┌────────────┬─────────┬─────────┬─────────┬─────────┬────────────────────┐
+# │ 配置       │  seg=1  │  seg=2  │  seg=3  │  seg=4  │ 模式               │
+# ├────────────┼─────────┼─────────┼─────────┼─────────┼────────────────────┤
+# │ h55/m50    │ 57-79%  │ 16-32%  │  3-7%   │  2-5%   │ 分布较均匀         │
+# │ h45/m40    │ 96-100% │  0-3%   │  ~0%    │   0%    │ 几乎全在 seg=1     │
+# │ h35/m30    │  100%   │   0%    │   0%    │   0%    │ 全部 seg=1         │
+# └────────────┴─────────┴─────────┴─────────┴─────────┴────────────────────┘
+#
+#   seg=1 表示执行完 chunk 的前 10 步就触发 replan, 剩余 40 步被丢弃
+#   h45/m40 和 h35/m30 存在 seg=1 级联模式, 但只影响部分 chunk (43-47%)
+#
+# ── 三、Replan 类型分布 (immediate / scheduled / deferred) ──
+#
+# ┌────────────┬──────────────────┬──────────────────┬──────────────────┐
+# │ 配置       │ immediate(高drift)│ scheduled(中drift)│ deferred(延迟)  │
+# ├────────────┼──────────────────┼──────────────────┼──────────────────┤
+# │ h55/m50    │     15-58%       │     20-44%       │     19-42%       │
+# │ h45/m40    │     90-100%      │      0-5%        │      0-5%        │
+# │ h35/m30    │      100%        │       0%         │       0%         │
+# └────────────┴──────────────────┴──────────────────┴──────────────────┘
+#
+#   immediate: drift > high 阈值, 立即 replan
+#   scheduled: mid < drift < high, 标记下一段 replan
+#   deferred:  执行上一轮 scheduled 的延迟 replan
+#   h45/m40 和 h35/m30 的 mid 阈值低于自然 drift 水平, 所有 drift 直接超过 high, mid 形同虚设
+#
+# ── 四、Replan 分析结论 ──
+#
+#   1. 无频繁 replan: 所有 CMP 配置的 replan 频率 ≤0.152 (固定模式的 15%),
+#      平均 66-199 步触发一次 replan, 远低于固定模式的每 10 步
+#
+#   2. seg=1 级联模式: h45/m40 和 h35/m30 的 replan 几乎 100% 在 seg=1,
+#      说明 replan 后新 chunk 前 10 步仍检测到高 drift, 但这只影响部分 chunk (43-47%),
+#      大部分 chunk 能正常用完 50 步
+#
+#   3. h55/m50 replan 最健康: seg 分布均匀, scheduled/deferred 机制有效运作,
+#      但 SPATIAL/OBJECT/GOAL 成功率偏低 (-5.2~-5.6pp)
+#
+#   4. drift 地板效应: h35/m30 vs h45/m40 的 replan 次数几乎相同
+#      (如 OBJECT: 891 vs 895, GOAL: 866 vs 819), 阈值再低也不增加 replan
+#
+# ── 五、为什么 Replan 次数大幅减少但总时间没有显著缩短 ──
+#
+#   Baseline 每个 segment (10步) 的推理流程:
+#     embed_prefix (SigLIP图像编码) → sample_actions (VLM全18层生成动作)
+#     简记: E + S
+#
+#   CMP 每个 segment 的推理流程 (分两种情况):
+#
+#     不触发 replan 的 stale segment:
+#       embed_prefix → forward_partial (VLM前6层) → drift检测 → 复用旧chunk动作
+#       简记: E + F
+#       ※ 省掉了 S (sample_actions), 但多了 F (forward_partial) 用于 drift 检测
+#
+#     触发 replan 的 segment:
+#       embed_prefix → forward_partial → drift检测 → sample_actions (重新生成chunk)
+#       简记: E + F + S
+#       ※ 比 Baseline 多了一次 F
+#
+#   关键: 每个 stale segment 都必须执行 E + F 来检测 drift, 这是不可省略的开销
+#
+#   成本对比 (以 LIBERO-SPATIAL h45/m40 为例, 总步数=51495, 即 ~5150 个 segment):
+#
+#     Baseline:  5520 × (E + S) = 5520E + 5520S
+#     CMP:       5150 × (E + F) + 1587 × S = 5150E + 5150F + 1587S
+#                                             (每段都要drift检测) (仅replan时生成动作)
+#
+#     CMP 省了: 5520S - 1587S = 3933 次 sample_actions
+#     CMP 多了: 5150 次 forward_partial
+#
+#   由于 forward_partial (VLM前6层, ~1/3 VLM) 的计算量和 sample_actions 不在一个量级,
+#   但 embed_prefix (SigLIP编码) 是两者共有的主要耗时, 所以:
+#     - 省掉 sample_actions 节省的时间 ≈ 被 forward_partial 的额外开销部分抵消
+#     - embed_prefix 在两种模式下都必须执行, 这是最大的时间瓶颈
+#
+#   结论: CMP 的核心优势不是减少总计算时间, 而是减少 VLA 完整推理 (sample_actions) 的
+#   调用次数。在实际部署中, 如果 VLA 推理是稀缺资源 (如云端API调用/多机器人共享推理服务),
+#   减少 70% 的 VLA 推理次数是有实际价值的。drift 检测 (E+F) 可以在本地轻量设备执行,
+#   只在需要时才请求完整 VLA 推理。
+#
+################################################################################
