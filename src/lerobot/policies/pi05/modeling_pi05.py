@@ -2315,9 +2315,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             masks,
             noise=None,
             num_steps=None,
+            prefix_embs=None,
+            prefix_pad_masks=None,
+            prefix_att_masks=None,
             **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+        """Do a full inference forward and compute the action.
+
+        Args:
+            images, img_masks, tokens, masks: 输入数据
+            noise: 可选的初始噪声
+            num_steps: 采样步数
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入则跳过内部的 embed_prefix 调用（用于优化重复计算）
+        """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -2333,7 +2344,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        # 如果传入了预计算的 prefix_embs，则复用；否则调用 embed_prefix
+        if prefix_embs is None:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -3113,8 +3126,15 @@ class PI05Policy(PreTrainedPolicy):
                 self._replan_count += 1
                 print(f"[Replan-deferred] chunk={self._current_chunk_idx}, "
                       f"seg={self._chunk_segment_index}, replan #{self._replan_count}")
+                # 预计算 prefix_embs 供 predict_action_chunk 复用
+                if has_itm:
+                    images, img_masks = self._preprocess_images(batch)
+                    tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+                    masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+                    self._cached_prefix_embs, self._cached_prefix_pad_masks, self._cached_prefix_att_masks = \
+                        self.model.embed_prefix(images, img_masks, tokens, masks)
             elif self._full_action_chunk is not None and self._chunk_segment_index < n_segments:
-                # ---- 旧 chunk 还有剩余段：计算 stale ITM 和 drift ----
+                # ---- 旧 chunk 还有剩余段：只算 z1(actual_z3) 做 drift 检测 ----
                 seg_idx = self._chunk_segment_index
                 start = seg_idx * n_action_steps
                 end = start + n_action_steps
@@ -3124,16 +3144,20 @@ class PI05Policy(PreTrainedPolicy):
                     images, img_masks = self._preprocess_images(batch)
                     tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
                     masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-                    attn_act_len = self.config.attn_act_len
-                    _, stale_score, actual_z3 = self._should_replan(
-                        images, img_masks, tokens, masks, segment[:, :attn_act_len, :],
+
+                    # 预计算 prefix_embs（用于 _encode_obs 和可能的 replan 复用）
+                    stale_prefix_embs, stale_prefix_pad_masks, stale_prefix_att_masks = self.model.embed_prefix(
+                        images, img_masks, tokens, masks
                     )
-                    self._stale_itm_scores.append(stale_score.detach().cpu())
-                    self._stale_itm_chunk_ids.append(self._current_chunk_idx)
-                    self._stale_itm_segment_ids.append(seg_idx)
-                    if len(self._stale_itm_scores) % 10 == 1:
-                        print(f"[ITM-stale] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                              f"score={stale_score.mean().item():.4f}")
+
+                    # 只编码 obs 得到 z1，不计算 z2/ITM（drift 只需要 z1）
+                    attn_act_len = self.config.attn_act_len
+                    actual_z3 = self._encode_obs(
+                        images, img_masks, tokens, masks,
+                        prefix_embs=stale_prefix_embs,
+                        prefix_pad_masks=stale_prefix_pad_masks,
+                        prefix_att_masks=stale_prefix_att_masks,
+                    )
 
                     # ForwardModel drift 计算（cosine distance，与训练 loss 一致）
                     if (self._predicted_z3 is not None and actual_z3 is not None
@@ -3148,8 +3172,12 @@ class PI05Policy(PreTrainedPolicy):
                         # drift-based replan 判断（三级响应）
                         drift_val = drift.mean().item()
                         if drift_threshold > 0 and drift_val > drift_threshold:
-                            # 大 drift → 立即 replan
+                            # 大 drift → 立即 replan，保存 prefix_embs 和 z1 供 predict_action_chunk 复用
                             trigger_replan = True
+                            self._cached_prefix_embs = stale_prefix_embs
+                            self._cached_prefix_pad_masks = stale_prefix_pad_masks
+                            self._cached_prefix_att_masks = stale_prefix_att_masks
+                            self._cached_z1 = actual_z3
                             self._replan_count += 1
                             print(f"[Replan-immediate] chunk={self._current_chunk_idx}, seg={seg_idx}, "
                                   f"drift={drift_val:.4f} > high={drift_threshold:.4f}, "
@@ -3183,7 +3211,25 @@ class PI05Policy(PreTrainedPolicy):
             if trigger_replan or self._full_action_chunk is None or self._chunk_segment_index >= n_segments:
                 # ---- 需要新 chunk：生成动作，计算 fresh ITM ----
                 self._current_chunk_idx += 1
-                actions = self.predict_action_chunk(batch)  # 内部计算 fresh ITM + ForwardModel predicted_z3
+
+                # 如果有缓存的 prefix_embs（来自 stale path 的 immediate replan），则复用
+                cached_prefix = getattr(self, '_cached_prefix_embs', None)
+                if cached_prefix is not None:
+                    actions = self.predict_action_chunk(
+                        batch,
+                        prefix_embs=self._cached_prefix_embs,
+                        prefix_pad_masks=self._cached_prefix_pad_masks,
+                        prefix_att_masks=self._cached_prefix_att_masks,
+                        cached_z1=getattr(self, '_cached_z1', None),
+                    )
+                    # 清理缓存
+                    self._cached_prefix_embs = None
+                    self._cached_prefix_pad_masks = None
+                    self._cached_prefix_att_masks = None
+                    self._cached_z1 = None
+                else:
+                    actions = self.predict_action_chunk(batch)
+
                 self._full_action_chunk = actions.detach().clone()
 
                 # 取第一段放入 queue
@@ -3193,20 +3239,29 @@ class PI05Policy(PreTrainedPolicy):
 
                 if self._current_chunk_idx <= 2 or self._current_chunk_idx % 5 == 0:
                     print(f"[ITM-fresh] chunk={self._current_chunk_idx}, "
-                          f"fresh_count={len(self._itm_scores)}, stale_count={len(self._stale_itm_scores)}, "
+                          f"fresh_count={len(self._itm_scores)}, "
                           f"replan_count={self._replan_count}")
 
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def _encode_obs(self, images, img_masks, tokens, masks) -> Tensor:
-        """将 obs 编码为 z [B, 512]，与训练时 encode_obs 路径一致。"""
+    def _encode_obs(self, images, img_masks, tokens, masks,
+                    prefix_embs=None, prefix_pad_masks=None, prefix_att_masks=None) -> Tensor:
+        """将 obs 编码为 z [B, 512]，与训练时 encode_obs 路径一致。
+
+        Args:
+            images, img_masks, tokens, masks: 输入数据
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入则跳过内部的 embed_prefix 调用（用于优化重复计算）
+        """
         device = tokens.device
         batch_size = tokens.shape[0]
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
-            images, img_masks, tokens, masks
-        )
+        # 如果传入了预计算的 prefix_embs，则复用；否则调用 embed_prefix
+        if prefix_embs is None:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
+                images, img_masks, tokens, masks
+            )
         cls_head = self.model.cls_head_prefix.expand(batch_size, -1, -1).to(dtype=prefix_embs.dtype)
         prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1)
 
@@ -3252,6 +3307,9 @@ class PI05Policy(PreTrainedPolicy):
             masks,
             predict_actions: Tensor,
             z1: Tensor = None,
+            prefix_embs=None,
+            prefix_pad_masks=None,
+            prefix_att_masks=None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Check if replanning is needed based on ITM Head matching score.
@@ -3266,6 +3324,8 @@ class PI05Policy(PreTrainedPolicy):
             masks: Current language token masks [batch_size, seq_len]
             predict_actions: Previously predicted actions [batch_size, seq_len, action_dim]
             z1: 预计算的 obs 嵌入 [batch_size, 512]，如果为 None 则内部编码
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入且 z1 为 None，则传给 _encode_obs 复用（用于优化重复计算）
 
         Returns:
             tuple: (should_replan: Tensor [batch_size], itm_score: Tensor [batch_size], z1: Tensor [batch_size, 512])
@@ -3293,7 +3353,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # ========== z1: obs_t → VLM 前 6 层 → ObsQueryBridge ==========
         if z1 is None:
-            z1 = self._encode_obs(images, img_masks, tokens, masks)
+            z1 = self._encode_obs(images, img_masks, tokens, masks,
+                                  prefix_embs=prefix_embs,
+                                  prefix_pad_masks=prefix_pad_masks,
+                                  prefix_att_masks=prefix_att_masks)
 
         # ========== z2: action → ContentAttention → proj_z2 ==========
         attn_act_len = self.model.content_attention.attn_act_len
@@ -3312,16 +3375,44 @@ class PI05Policy(PreTrainedPolicy):
         return should_replan, itm_score, z1
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor],
+        prefix_embs: Tensor = None,
+        prefix_pad_masks: Tensor = None,
+        prefix_att_masks: Tensor = None,
+        cached_z1: Tensor = None,
+        **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
+        """Predict a chunk of actions given environment observations.
+
+        Args:
+            batch: 输入数据批次
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入则跳过内部的 embed_prefix 调用（用于 stale path 触发 replan 时复用）
+            cached_z1: 可选的预计算 obs 嵌入 z1，如果传入则跳过 _encode_obs（用于 stale path
+                触发 replan 时复用，避免重复 forward_partial）
+        """
         self.eval()
 
-        # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
-        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        # Prepare inputs（有 prefix_embs 时 sample_actions 不需要 images，跳过预处理）
+        if prefix_embs is not None:
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            images, img_masks = None, None
+        else:
+            images, img_masks = self._preprocess_images(batch)
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
+                images, img_masks, tokens, masks
+            )
 
-        # Sample actions using the model
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        # Sample actions using the model（复用 prefix_embs）
+        actions = self.model.sample_actions(
+            images, img_masks, tokens, masks,
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_att_masks=prefix_att_masks,
+            **kwargs
+        )
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -3331,8 +3422,13 @@ class PI05Policy(PreTrainedPolicy):
         if (hasattr(self.model, 'itm_head') and self.model.itm_head is not None
                 and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None):
             attn_act_len = self.config.attn_act_len
+            # 复用 cached_z1（来自 stale path 的 _encode_obs）跳过重复的 forward_partial
             _, itm_score, z1 = self._should_replan(
                 images, img_masks, tokens, masks, actions[:, :attn_act_len, :],
+                z1=cached_z1,
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_att_masks=prefix_att_masks,
             )
             self._itm_scores.append(itm_score.detach().cpu())
             # 每 10 次打印一次 ITM score 信息
