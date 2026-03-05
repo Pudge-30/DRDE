@@ -154,7 +154,10 @@ def from_tensor_to_numpy(x: torch.Tensor | Any) -> np.ndarray | float | int | An
     return x
 
 
-def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
+def _extract_complementary_data(
+    batch: dict[str, Any],
+    rename_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """
     Extract complementary data from a batch dictionary.
 
@@ -162,6 +165,11 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
 
     Args:
         batch: The batch dictionary.
+        rename_map: Optional key rename mapping (e.g. from dataset camera names to
+            policy-expected names). When provided, ``neg_future_*`` keys whose suffix
+            appears in the map are renamed so that downstream code can find them under
+            the policy-expected name (e.g. ``neg_future_observation.images.base_camera``
+            → ``neg_future_observation.images.image``).
 
     Returns:
         A dictionary with the extracted complementary data.
@@ -178,7 +186,18 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
             action_context_keys[key] = batch[key]
 
     # Extract CMP contrastive learning neg sample fields (neg_action, neg_future_*, etc.)
-    neg_keys = {k: v for k, v in batch.items() if k.startswith("neg_")}
+    # When rename_map is provided, rename neg_future_{old} → neg_future_{new} so that
+    # _preprocess_neg_future_images can find the key under the policy-expected name.
+    neg_prefix = "neg_future_"
+    neg_keys: dict[str, Any] = {}
+    for k, v in batch.items():
+        if not k.startswith("neg_"):
+            continue
+        if rename_map and k.startswith(neg_prefix):
+            suffix = k[len(neg_prefix):]  # e.g. "observation.images.base_camera"
+            if suffix in rename_map:
+                k = neg_prefix + rename_map[suffix]  # renamed key
+        neg_keys[k] = v
 
     return {**pad_keys, **task_key, **index_key, **task_index_key, **action_context_keys, **neg_keys}
 
@@ -332,7 +351,10 @@ def policy_action_to_transition(action: PolicyAction) -> EnvTransition:
     return create_transition(action=action)
 
 
-def batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
+def batch_to_transition(
+    batch: dict[str, Any],
+    rename_map: dict[str, str] | None = None,
+) -> EnvTransition:
     """
     Convert a batch dictionary from a dataset/dataloader into an `EnvTransition`.
 
@@ -341,6 +363,8 @@ def batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
 
     Args:
         batch: A batch dictionary.
+        rename_map: Optional key rename mapping forwarded to ``_extract_complementary_data``
+            so that ``neg_future_*`` keys are renamed consistently with observation keys.
 
     Returns:
         An `EnvTransition` dictionary.
@@ -359,7 +383,7 @@ def batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
 
     # Extract observation and complementary data keys.
     observation_keys = {k: v for k, v in batch.items() if k.startswith(OBS_PREFIX)}
-    complementary_data = _extract_complementary_data(batch)
+    complementary_data = _extract_complementary_data(batch, rename_map=rename_map)
 
     return create_transition(
         observation=observation_keys if observation_keys else None,

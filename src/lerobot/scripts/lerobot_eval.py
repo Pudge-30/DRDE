@@ -192,18 +192,44 @@ def rollout(
         if render_callback is not None:
             render_callback(env)
 
-        # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
-        # available if none of the envs finished.
+        # Gymnasium version compatibility:
+        # - >=1.0: info["final_info"] is typically a dict of arrays.
+        # - 0.29.x: info["final_info"] can be a sequence (list/ndarray) of per-env dict/None.
+        # - Some env wrappers expose `is_success` directly each step.
+        successes = [False] * env.num_envs
         if "final_info" in info:
             final_info = info["final_info"]
-            if not isinstance(final_info, dict):
-                raise RuntimeError(
-                    "Unsupported `final_info` format: expected dict (Gymnasium >= 1.0). "
-                    "You're likely using an older version of gymnasium (< 1.0). Please upgrade."
+            if isinstance(final_info, dict):
+                is_success = final_info.get("is_success", np.zeros(env.num_envs, dtype=bool))
+                success_arr = np.asarray(is_success).reshape(-1).astype(bool)
+                if success_arr.size >= env.num_envs:
+                    successes = success_arr[: env.num_envs].tolist()
+                else:
+                    successes = success_arr.tolist() + [False] * (env.num_envs - success_arr.size)
+            elif isinstance(final_info, list | tuple | np.ndarray):
+                final_mask = info.get("_final_info")
+                final_mask_arr = (
+                    np.asarray(final_mask).reshape(-1).astype(bool) if final_mask is not None else None
                 )
-            successes = final_info["is_success"].tolist()
-        else:
-            successes = [False] * env.num_envs
+                seq = list(final_info)
+                parsed = []
+                for i in range(env.num_envs):
+                    entry = seq[i] if i < len(seq) else None
+                    is_valid = (
+                        bool(final_mask_arr[i])
+                        if final_mask_arr is not None and i < final_mask_arr.size
+                        else entry is not None
+                    )
+                    parsed.append(bool(entry.get("is_success", False)) if is_valid and isinstance(entry, dict) else False)
+                successes = parsed
+            else:
+                raise RuntimeError(f"Unsupported `final_info` format: {type(final_info)}")
+        elif "is_success" in info:
+            success_arr = np.asarray(info["is_success"]).reshape(-1).astype(bool)
+            if success_arr.size >= env.num_envs:
+                successes = success_arr[: env.num_envs].tolist()
+            else:
+                successes = success_arr.tolist() + [False] * (env.num_envs - success_arr.size)
 
         # Keep track of which environments are done so far.
         # Mark the episode as done if we reach the maximum step limit.

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Any, TypedDict
 
 import torch
@@ -228,6 +229,17 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        # Extract rename_map from preprocessor overrides so neg_future_* keys are
+        # renamed consistently with observation keys inside batch_to_transition.
+        _rename_map = (
+            kwargs.get("preprocessor_overrides", {})
+            .get("rename_observations_processor", {})
+            .get("rename_map", None)
+        )
+        _batch_to_transition = (
+            partial(batch_to_transition, rename_map=_rename_map) if _rename_map else batch_to_transition
+        )
+
         return (
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,
@@ -235,7 +247,7 @@ def make_pre_post_processors(
                     "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
                 ),
                 overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
+                to_transition=_batch_to_transition,
                 to_output=transition_to_batch,
             ),
             PolicyProcessorPipeline.from_pretrained(

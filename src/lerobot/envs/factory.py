@@ -19,7 +19,7 @@ from typing import Any
 import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
-from lerobot.envs.configs import AlohaEnv, EnvConfig, LiberoEnv, PushtEnv
+from lerobot.envs.configs import AlohaEnv, EnvConfig, LiberoEnv, ManiSkill3Env, PushtEnv
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result
 from lerobot.processor import ProcessorStep
 from lerobot.processor.env_processor import LiberoProcessorStep
@@ -33,6 +33,8 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return PushtEnv(**kwargs)
     elif env_type == "libero":
         return LiberoEnv(**kwargs)
+    elif env_type == "maniskill3":
+        return ManiSkill3Env(**kwargs)
     else:
         raise ValueError(f"Policy type '{env_type}' is not available.")
 
@@ -134,6 +136,18 @@ def make_env(
             n_envs=n_envs,
             camera_name=cfg.camera_name,
             init_states=cfg.init_states,
+            gym_kwargs=cfg.gym_kwargs,
+            env_cls=env_cls,
+        )
+    elif "maniskill3" in cfg.type:
+        from lerobot.envs.maniskill3 import create_maniskill3_envs
+
+        if cfg.task is None:
+            raise ValueError("ManiSkill3Env requires a task to be specified")
+
+        return create_maniskill3_envs(
+            task=cfg.task,
+            n_envs=n_envs,
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
         )

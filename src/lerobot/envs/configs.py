@@ -327,6 +327,89 @@ class LiberoEnv(EnvConfig):
         }
 
 
+@EnvConfig.register_subclass("maniskill3")
+@dataclass
+class ManiSkill3Env(EnvConfig):
+    task: str = "PickCube-v1"
+    fps: int = 30
+    obs_type: str = "pixels_agent_pos"
+    obs_mode: str = "rgb"
+    render_mode: str = "rgb_array"
+    camera_key: str = "base_camera,base_camera"
+    camera_alias: str = "image,image2"
+    include_empty_camera_0: bool = True
+    empty_camera_size: int = 224
+    observation_height: int = 128
+    observation_width: int = 128
+    state_dim: int = 8
+    action_dim: int = 7
+    control_mode: str | None = "pd_ee_delta_pose"
+    max_episode_steps: int | None = None
+    sim_backend: str | None = None
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+        }
+    )
+
+    def __post_init__(self):
+        self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,))
+        camera_aliases = [x.strip() for x in self.camera_alias.split(",") if x.strip()]
+        if not camera_aliases:
+            raise ValueError("camera_alias must not be empty.")
+        for alias in camera_aliases:
+            pixel_key = f"pixels/{alias}"
+            self.features_map[pixel_key] = f"{OBS_IMAGES}.{alias}"
+        if self.include_empty_camera_0:
+            self.features_map["pixels/empty_camera_0"] = f"{OBS_IMAGES}.empty_camera_0"
+
+        if self.obs_type == "pixels":
+            for alias in camera_aliases:
+                self.features[f"pixels/{alias}"] = PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+                )
+            if self.include_empty_camera_0:
+                self.features["pixels/empty_camera_0"] = PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(self.empty_camera_size, self.empty_camera_size, 3)
+                )
+            self.features.pop("agent_pos", None)
+            self.features_map.pop("agent_pos", None)
+        elif self.obs_type == "pixels_agent_pos":
+            for alias in camera_aliases:
+                self.features[f"pixels/{alias}"] = PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+                )
+            if self.include_empty_camera_0:
+                self.features["pixels/empty_camera_0"] = PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(self.empty_camera_size, self.empty_camera_size, 3)
+                )
+            self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(self.state_dim,))
+            self.features_map["agent_pos"] = OBS_STATE
+        else:
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "obs_mode": self.obs_mode,
+            "render_mode": self.render_mode,
+            "camera_key": self.camera_key,
+            "camera_alias": self.camera_alias,
+            "include_empty_camera_0": self.include_empty_camera_0,
+            "empty_camera_size": self.empty_camera_size,
+            "state_dim": self.state_dim,
+            "control_mode": self.control_mode,
+            "max_episode_steps": self.max_episode_steps,
+            "sim_backend": self.sim_backend,
+        }
+
+
 @EnvConfig.register_subclass("metaworld")
 @dataclass
 class MetaworldEnv(EnvConfig):
