@@ -219,7 +219,9 @@ class OnlineConfig:
     # If online dataset has fewer frames, only offline training will be performed
     min_frames_for_online_training: int = 2000
     # train interval: how often to perform online training (every N steps)
-    train_interval: int = 100000
+    train_interval: int = 10
+    # Skip offline training steps, only run online steps
+    skip_offline_steps: bool = False
 
 
 @dataclass(kw_only=True)
