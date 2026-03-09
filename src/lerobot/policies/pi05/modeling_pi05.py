@@ -1786,6 +1786,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.part_layer_num = None
         self.cmp_step = 0
 
+        # Velocity distillation: frozen anchor Expert state (initialized before online training)
+        self._anchor_expert_state: dict[str, torch.Tensor] | None = None
+
         # 投影层
         self.proj_z1 = nn.Sequential(
             nn.Linear(paligemma_config.width, paligemma_config.width),
@@ -2011,7 +2014,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, condition_token=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None,
+                condition_token=None, return_internals=False) -> Tensor | tuple[Tensor, dict]:
         """Do a full training forward pass and compute the loss.
 
         Args:
@@ -2023,6 +2027,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise: 可选的噪声
             time: 可选的时间步
             condition_token: [batch, hidden_dim] 可选的条件 token（来自 prev_actions 的特征）
+            return_internals: 如果 True，额外返回 v_t/x_t/time/prefix_embs（用于 anchor loss）
         """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -2075,7 +2080,81 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss = F.mse_loss(u_t, v_t, reduction="none")
+        if return_internals:
+            return loss, {
+                "v_t": v_t,
+                "x_t": x_t,
+                "time": time,
+                "prefix_embs": prefix_embs,
+                "prefix_pad_masks": prefix_pad_masks,
+                "prefix_att_masks": prefix_att_masks,
+            }
+        return loss
+
+    def _forward_anchor(self, internals: dict, condition_token=None) -> torch.Tensor:
+        """Compute velocity prediction using frozen anchor Expert params.
+
+        Uses param.data pointer swap (zero-copy), reuses VLM prefix_embs.
+        The autograd graph of the caller's v_t is unaffected by the swap.
+        """
+        if self._anchor_expert_state is None:
+            raise RuntimeError("Anchor Expert not initialized. Call init_anchor_expert() first.")
+
+        x_t = internals["x_t"]
+        time = internals["time"]
+        prefix_embs = internals["prefix_embs"].detach()
+        prefix_pad_masks = internals["prefix_pad_masks"]
+        prefix_att_masks = internals["prefix_att_masks"]
+
+        # 1. Save current param.data pointers (zero-copy, just pointer swap)
+        saved = {}
+        expert_modules = [
+            ("gemma_expert.", self.paligemma_with_expert.gemma_expert),
+            ("action_in_proj.", self.action_in_proj),
+            ("action_out_proj.", self.action_out_proj),
+            ("time_mlp_in.", self.time_mlp_in),
+            ("time_mlp_out.", self.time_mlp_out),
+        ]
+        for prefix, module in expert_modules:
+            for name, param in module.named_parameters():
+                key = prefix + name
+                saved[key] = param.data
+                param.data = self._anchor_expert_state[key]
+
+        # 2. Forward with frozen anchor Expert (no grad, reuse VLM prefix)
+        with torch.no_grad():
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+                self.embed_suffix(x_t, time, condition_token)
+            )
+            if prefix_embs.dtype == torch.bfloat16:
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            suffix_out = suffix_out[:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            v_anchor = self.action_out_proj(suffix_out)
+
+        # 3. Restore current param.data pointers
+        for prefix, module in expert_modules:
+            for name, param in module.named_parameters():
+                key = prefix + name
+                param.data = saved[key]
+
+        return v_anchor
 
     def forward_cmp(
             self,
@@ -2306,6 +2385,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prefix_embs=None,
             prefix_pad_masks=None,
             prefix_att_masks=None,
+            condition_token=None,
             **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action.
@@ -2316,6 +2396,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             num_steps: 采样步数
             prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
                 如果传入则跳过内部的 embed_prefix 调用（用于优化重复计算）
+            condition_token: [batch, hidden_dim] 可选的条件 token（来自 prev_actions 的 content_attention），
+                与 sample_actions_differentiable 保持一致
         """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
@@ -2365,6 +2447,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
+                    condition_token=condition_token,
                 )
 
             if self._rtc_enabled():
@@ -2788,6 +2871,32 @@ class PI05Policy(PreTrainedPolicy):
         """
         return self.parameters()
 
+    # ==================== Velocity Distillation (Anchor) ====================
+
+    def _iter_expert_params(self):
+        """Yield (flat_key, nn.Parameter) for all Expert parameters."""
+        modules = [
+            ("gemma_expert.", self.model.paligemma_with_expert.gemma_expert),
+            ("action_in_proj.", self.model.action_in_proj),
+            ("action_out_proj.", self.model.action_out_proj),
+            ("time_mlp_in.", self.model.time_mlp_in),
+            ("time_mlp_out.", self.model.time_mlp_out),
+        ]
+        for prefix, module in modules:
+            for name, param in module.named_parameters():
+                yield prefix + name, param
+
+    def init_anchor_expert(self):
+        """Snapshot current Expert params as frozen anchor for velocity distillation.
+        Call after model loading, before online training begins."""
+        state = {}
+        for key, param in self._iter_expert_params():
+            state[key] = param.data.detach().clone()  # stays on GPU (~600MB for gemma_300m)
+        self.model._anchor_expert_state = state
+        n_params = sum(v.numel() for v in state.values())
+        mem_mb = sum(v.nbytes for v in state.values()) / (1024 ** 2)
+        logging.info(f"[Anchor] Snapshotted {n_params:,} Expert params ({mem_mb:.0f} MB)")
+
     def _apply_param_cmp(self) -> None:
         self.offline_mode = True
         params = []
@@ -2873,6 +2982,7 @@ class PI05Policy(PreTrainedPolicy):
         self._stale_itm_segment_ids: list[int] = []   # 每个 stale score 对应的 segment index (1-4)
         self._full_action_chunk: Tensor | None = None  # 保存完整 chunk_size 的 action chunk
         self._chunk_segment_index: int = 0             # 当前 chunk 内已使用到第几段 (0=fresh刚生成, 1-4=stale)
+        self._prev_chunk_actions: Tensor | None = None  # 上一 chunk 末尾 attn_act_len 步动作，用于 condition_token
         self._current_chunk_idx: int = -1              # 当前 chunk 编号
         self._select_action_count = 0
 
@@ -3200,6 +3310,13 @@ class PI05Policy(PreTrainedPolicy):
                 # ---- 需要新 chunk：生成动作，计算 fresh ITM ----
                 self._current_chunk_idx += 1
 
+                # 从上一 chunk 末尾动作计算 condition_token（首次为 None，与训练一致）
+                cond_token = None
+                if (self._prev_chunk_actions is not None
+                        and hasattr(self.model, 'content_attention')
+                        and self.model.content_attention is not None):
+                    cond_token = self.model.content_attention(self._prev_chunk_actions)
+
                 # 如果有缓存的 prefix_embs（来自 stale path 的 immediate replan），则复用
                 cached_prefix = getattr(self, '_cached_prefix_embs', None)
                 if cached_prefix is not None:
@@ -3209,6 +3326,7 @@ class PI05Policy(PreTrainedPolicy):
                         prefix_pad_masks=self._cached_prefix_pad_masks,
                         prefix_att_masks=self._cached_prefix_att_masks,
                         cached_z1=getattr(self, '_cached_z1', None),
+                        condition_token=cond_token,
                     )
                     # 清理缓存
                     self._cached_prefix_embs = None
@@ -3216,9 +3334,17 @@ class PI05Policy(PreTrainedPolicy):
                     self._cached_prefix_att_masks = None
                     self._cached_z1 = None
                 else:
-                    actions = self.predict_action_chunk(batch)
+                    actions = self.predict_action_chunk(batch, condition_token=cond_token)
 
                 self._full_action_chunk = actions.detach().clone()
+
+                # 保存本 chunk 末尾 attn_act_len 步动作，作为下次 condition_token 的输入
+                attn_act_len = getattr(self.config, 'attn_act_len', 0)
+                if attn_act_len > 0:
+                    original_action_dim = self.config.output_features[ACTION].shape[0]
+                    chunk_size = actions.shape[1]
+                    end_start = max(0, chunk_size - attn_act_len)
+                    self._prev_chunk_actions = actions[:, end_start:, :original_action_dim].detach().clone()
 
                 # 取第一段放入 queue
                 segment = actions[:, :n_action_steps]
@@ -3369,6 +3495,7 @@ class PI05Policy(PreTrainedPolicy):
         prefix_pad_masks: Tensor = None,
         prefix_att_masks: Tensor = None,
         cached_z1: Tensor = None,
+        condition_token: Tensor = None,
         **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
         """Predict a chunk of actions given environment observations.
@@ -3379,6 +3506,8 @@ class PI05Policy(PreTrainedPolicy):
                 如果传入则跳过内部的 embed_prefix 调用（用于 stale path 触发 replan 时复用）
             cached_z1: 可选的预计算 obs 嵌入 z1，如果传入则跳过 _encode_obs（用于 stale path
                 触发 replan 时复用，避免重复 forward_partial）
+            condition_token: [batch, hidden_dim] 可选的条件 token（来自上一 chunk 末尾动作的
+                content_attention），与训练时 sample_actions_differentiable 保持一致
         """
         self.eval()
 
@@ -3399,6 +3528,7 @@ class PI05Policy(PreTrainedPolicy):
             prefix_embs=prefix_embs,
             prefix_pad_masks=prefix_pad_masks,
             prefix_att_masks=prefix_att_masks,
+            condition_token=condition_token,
             **kwargs
         )
 
@@ -3433,22 +3563,35 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor], online=False) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], online=False, bc_only=False,
+                feature_weight: float = 0.0,
+                feature_batch: dict[str, Tensor] | None = None) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
         Args:
             batch: 输入数据批次
-            cmp: 是否为对比学习模式
-            online: 是否为在线训练模式
-                    如果为 True，使用 prev_actions 作为条件，生成动作并计算与 pred_action 的特征距离
+            online: 是否为在线训练模式（feature_loss only）
+            bc_only: 是否只计算 bc_loss（跳过 CMP），用于在线 BC 训练
+            feature_weight: 联合 feature_loss 权重。>0 时在 bc_only 路径中追加
+                           feature_loss: total = bc_loss + feature_weight * feature_loss。
+            feature_batch: 用于 feature_loss 的在线数据批次（包含 prev_actions, pred_action,
+                          以及对应的 images/tokens）。如果为 None 且 feature_weight > 0，
+                          则从 batch 中取 prev_actions/pred_action（向后兼容）。
         """
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        if online:
+
+        # 参数冻结：online 和 bc_only 都冻结 VLM/CMP，只允许动作专家梯度
+        if online or bc_only:
             if self.offline_mode is True:
                 self._apply_online_params()
 
+        if online:
             prev_actions = batch.get('prev_actions')  # [batch, 10, action_dim]
             pred_action = batch.get('pred_action')  # [batch, 10, action_dim]
+
+            if prev_actions is None or pred_action is None:
+                zero_loss = torch.tensor(0.0, device=next(self.parameters()).device, requires_grad=True)
+                return zero_loss, {"feature_loss": 0.0, "l2_actions": 0.0, "skipped": True}
 
             # 准备输入
             images, img_masks = self._preprocess_images(batch)
@@ -3471,19 +3614,38 @@ class PI05Policy(PreTrainedPolicy):
             # 4. pred_action 过 content_attention
             pred_feature = self.model.content_attention(pred_action)  # [batch, hidden_dim]
 
-            # 5. 计算特征距离 loss
-            feature_loss = torch.mean(F.relu(torch.square(gen_feature - pred_feature) - 0.1))
+            # 5. 计算 per-sample 特征距离 loss
+            per_sample_feature_loss = F.relu(torch.square(gen_feature - pred_feature) - 0.1).mean(dim=-1)  # [batch]
 
-            # 6. 计算 generated_actions 与 pred_action 在前 attn_act_len 步的 L2 距离
-            # 对齐形状到 [batch, attn_act_len, original_action_dim]
+            # 6. Success 加权：成功帧=1.0，失败帧按轨迹位置指数衰减
+            episode_success = batch.get("episode_success")  # [batch, 1] or None
+            if episode_success is not None:
+                success = episode_success.squeeze(-1)  # [batch]
+                frame_idx = batch.get("frame_index")  # [batch, 1]
+                if frame_idx is not None:
+                    t_normalized = frame_idx.squeeze(-1).float() / 520.0  # 归一化位置
+                    decay_rate = getattr(self.config, 'online_success_decay_rate', 8.0)
+                    fail_weight = torch.exp(-decay_rate * t_normalized)
+                    weight = torch.where(success > 0.5, torch.ones_like(success), fail_weight)
+                else:
+                    weight = torch.where(success > 0.5, torch.ones_like(success),
+                                         torch.full_like(success, 0.3))
+                feature_loss = (weight * per_sample_feature_loss).sum() / weight.sum().clamp(min=1)
+            else:
+                # 兼容旧数据集：无 episode_success → 原逻辑
+                weight = None
+                feature_loss = per_sample_feature_loss.mean()
+
+            # 7. 计算 generated_actions 与 pred_action 在前 attn_act_len 步的 L2 距离
             pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
-            # 每一步在 action 维度上的 L2 范数，然后对 batch 和时间步求平均
             l2_per_step = torch.mean(torch.square(gen_actions_slice - pred_actions_slice), dim=-1)  # [batch, attn_act_len]
             l2_actions = l2_per_step.mean()
 
             loss_dict = {
                 "feature_loss": feature_loss.item(),
                 "l2_actions": l2_actions.item(),
+                "avg_weight": weight.mean().item() if weight is not None else 1.0,
+                "n_success": int((episode_success.squeeze(-1) > 0.5).sum().item()) if episode_success is not None else -1,
             }
 
             return feature_loss, loss_dict
@@ -3493,34 +3655,36 @@ class PI05Policy(PreTrainedPolicy):
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-            # 提取未来帧（三元因果链用）
-            future_result = self._preprocess_future_images(batch)
-            future_images = future_result[0] if future_result is not None else None
-            future_img_masks = future_result[1] if future_result is not None else None
+            # CMP 相关预处理：bc_only 不需要 future/neg 数据，跳过节省计算
+            if not bc_only:
+                # 提取未来帧（三元因果链用）
+                future_result = self._preprocess_future_images(batch)
+                future_images = future_result[0] if future_result is not None else None
+                future_img_masks = future_result[1] if future_result is not None else None
 
-            # 提取同 episode GT 时序错位负样本（CMP L1 用）
-            neg_gt_actions = batch.get("neg_action", None)
-            neg_action_valid = batch.get("neg_action_is_valid", None)
-            neg_action_distance = batch.get("neg_action_distance", None)
+                # 提取同 episode GT 时序错位负样本（CMP L1 用）
+                neg_gt_actions = batch.get("neg_action", None)
+                neg_action_valid = batch.get("neg_action_is_valid", None)
+                neg_action_distance = batch.get("neg_action_distance", None)
 
-            # Debug: 检查 batch 中是否包含负样本 key
-            if not hasattr(self, '_batch_debug_printed'):
-                self._batch_debug_printed = True
-                neg_keys = [k for k in batch.keys() if 'neg' in k.lower()]
-                all_keys = sorted(batch.keys())
-                print(f"[forward DEBUG] batch keys: {all_keys}")
-                print(f"[forward DEBUG] neg-related keys: {neg_keys}")
-                print(f"[forward DEBUG] neg_gt_actions is None: {neg_gt_actions is None}")
-                print(f"[forward DEBUG] neg_action_valid is None: {neg_action_valid is None}")
+                # Debug: 检查 batch 中是否包含负样本 key
+                if not hasattr(self, '_batch_debug_printed'):
+                    self._batch_debug_printed = True
+                    neg_keys = [k for k in batch.keys() if 'neg' in k.lower()]
+                    all_keys = sorted(batch.keys())
+                    print(f"[forward DEBUG] batch keys: {all_keys}")
+                    print(f"[forward DEBUG] neg-related keys: {neg_keys}")
+                    print(f"[forward DEBUG] neg_gt_actions is None: {neg_gt_actions is None}")
+                    print(f"[forward DEBUG] neg_action_valid is None: {neg_action_valid is None}")
 
-            # 提取同 episode 远离 t+k 的 GT obs（CMP L2 用）
-            neg_future_result = self._preprocess_neg_future_images(batch)
-            if neg_future_result is not None:
-                neg_future_images, neg_future_img_masks, neg_future_valid = neg_future_result
-            else:
-                neg_future_images, neg_future_img_masks, neg_future_valid = None, None, None
+                # 提取同 episode 远离 t+k 的 GT obs（CMP L2 用）
+                neg_future_result = self._preprocess_neg_future_images(batch)
+                if neg_future_result is not None:
+                    neg_future_images, neg_future_img_masks, neg_future_valid = neg_future_result
+                else:
+                    neg_future_images, neg_future_img_masks, neg_future_valid = None, None, None
 
-            if self.config.cmp_pretrain:
+            if self.config.cmp_pretrain and not bc_only:
                 if self.offline_mode is False:
                     self._apply_param_cmp()
 
@@ -3541,29 +3705,178 @@ class PI05Policy(PreTrainedPolicy):
                 }
                 loss_dict.update(cmp_loss_info)
             else:
-                if self.offline_mode is False:
-                    self._apply_offline_params()
+                if not bc_only:
+                    if self.offline_mode is False:
+                        self._apply_offline_params()
                 actions = self.prepare_action(batch)
-                bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
-                bc_loss = bc_losses[:, :, :original_action_dim].mean()
+                anchor_weight = getattr(self.config, 'anchor_weight', 0.0)
+                need_anchor = (bc_only and anchor_weight > 0
+                               and self.model._anchor_expert_state is not None)
+                if need_anchor:
+                    bc_losses, _internals = self.model.forward(
+                        images, img_masks, tokens, masks, actions,
+                        return_internals=True)
+                else:
+                    bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
 
-                cmp_losses, cmp_loss_info = self.model.forward_cmp(
-                    images, img_masks, tokens, masks,
-                    future_images=future_images, future_img_masks=future_img_masks,
-                    neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
-                    neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
-                    neg_future_valid=neg_future_valid,
-                    neg_action_distance=neg_action_distance,
-                )
-                cmp_loss = 0.1 * cmp_losses.mean()
-                losses = bc_loss + cmp_loss
+                if not bc_only:
+                    # 离线训练：bc_loss + cmp_loss，全参数更新
+                    bc_loss = bc_losses[:, :, :original_action_dim].mean()
+                    cmp_losses, cmp_loss_info = self.model.forward_cmp(
+                        images, img_masks, tokens, masks,
+                        future_images=future_images, future_img_masks=future_img_masks,
+                        neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
+                        neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
+                        neg_future_valid=neg_future_valid,
+                        neg_action_distance=neg_action_distance,
+                    )
+                    cmp_loss = 0.1 * cmp_losses.mean()
+                    losses = bc_loss + cmp_loss
 
-                loss_dict = {
-                    "loss": losses.item(),
-                    "bc_loss": bc_loss.item(),
-                    "cmp_loss": cmp_loss.item(),
-                }
-                loss_dict.update(cmp_loss_info)
+                    loss_dict = {
+                        "loss": losses.item(),
+                        "bc_loss": bc_loss.item(),
+                        "cmp_loss": cmp_loss.item(),
+                    }
+                    loss_dict.update(cmp_loss_info)
+                else:
+                    # 在线 BC 训练：bc_loss，按 episode 成功率加权（如果有）
+                    # 成功帧权重=1.0，失败帧按轨迹位置衰减（早期帧权重高，后期帧权重低）
+                    feature_only_online = getattr(self.config, 'feature_only_online', False)
+
+                    per_sample_bc = bc_losses[:, :, :original_action_dim].mean(dim=(1, 2))  # [batch]
+
+                    episode_success = batch.get("episode_success")
+                    if episode_success is not None:
+                        success = episode_success.squeeze(-1)  # [batch]
+                        frame_idx = batch.get("frame_index")  # [batch, 1] or [batch]
+                        if frame_idx is not None:
+                            t_normalized = frame_idx.squeeze(-1).float() / 520.0
+                            decay_rate = getattr(self.config, 'online_success_decay_rate', 8.0)
+                            fail_weight = torch.exp(-decay_rate * t_normalized)
+                            weight = torch.where(success > 0.5, torch.ones_like(success), fail_weight)
+                        else:
+                            weight = torch.where(success > 0.5, torch.ones_like(success),
+                                                 torch.full_like(success, 0.3))
+                        bc_loss = (weight * per_sample_bc).sum() / weight.sum().clamp(min=1)
+                        avg_weight = weight.mean().item()
+                        n_success = int((success > 0.5).sum().item())
+                    else:
+                        # 离线数据没有 episode_success → 无权重，直接 mean
+                        bc_loss = per_sample_bc.mean()
+                        avg_weight = 1.0
+                        n_success = -1
+
+                    # Feature-only mode: zero out bc_loss (still logged for diagnostics)
+                    if feature_only_online:
+                        losses = torch.tensor(0.0, device=bc_loss.device, dtype=bc_loss.dtype)
+                    else:
+                        losses = bc_loss
+
+                    loss_dict = {
+                        "loss": losses.item(),
+                        "bc_loss": bc_loss.item(),
+                        "cmp_loss": 0.0,
+                        "avg_weight": avg_weight,
+                        "n_success": n_success,
+                    }
+
+                    # ====== Anchor loss (velocity distillation) ======
+                    if need_anchor:
+                        v_anchor = self.model._forward_anchor(_internals)
+                        v_current = _internals["v_t"]
+                        anchor_loss = F.mse_loss(
+                            v_current[:, :, :original_action_dim],
+                            v_anchor[:, :, :original_action_dim],
+                        )
+                        losses = losses + anchor_weight * anchor_loss
+                        loss_dict["loss"] = losses.item()
+                        loss_dict["anchor_loss"] = anchor_loss.item()
+                    else:
+                        loss_dict["anchor_loss"] = 0.0
+
+                    # ====== 联合 feature_loss（bc_only + feature_weight > 0）======
+                    # 使用 feature_batch（在线数据）的 images 和 prev_actions/pred_action
+                    # 计算 feature_loss，与 bc_loss 联合优化
+                    if feature_weight > 0:
+                        fb = feature_batch if feature_batch is not None else batch
+                        prev_actions = fb.get('prev_actions')
+                        pred_action = fb.get('pred_action')
+                        if prev_actions is not None and pred_action is not None:
+                            # 用 feature_batch 的 images/tokens（在线 rollout 观测）
+                            feat_images, feat_img_masks = self._preprocess_images(fb)
+                            feat_tokens = fb[f"{OBS_LANGUAGE_TOKENS}"]
+                            feat_masks = fb[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+                            # condition_token: prev_actions → content_attention（冻结前向）
+                            condition_token = self.model.content_attention(prev_actions)
+
+                            # 可微分动作生成（N 步 ODE），用在线观测生成动作
+                            generated_actions = self.model.sample_actions_differentiable(
+                                feat_images, feat_img_masks, feat_tokens, feat_masks,
+                                condition_token=condition_token,
+                                num_steps=self.config.num_inference_steps,
+                            )
+
+                            # gen_feature / pred_feature：content_attention（冻结前向）
+                            attn_act_len = self.model.content_attention.attn_act_len
+                            gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]
+                            gen_feature = self.model.content_attention(gen_actions_slice)
+                            pred_feature = self.model.content_attention(pred_action)
+
+                            # per-sample feature loss with margin
+                            per_sample_fl = F.relu(
+                                torch.square(gen_feature - pred_feature) - 0.1
+                            ).mean(dim=-1)  # [batch]
+
+                            # feature_loss weighting
+                            feat_episode_success = fb.get("episode_success")
+                            if feature_only_online:
+                                # 硬过滤：只用成功 episode（sampler 已过滤，这里是安全检查）
+                                if feat_episode_success is not None:
+                                    success_mask = feat_episode_success.squeeze(-1) > 0.5
+                                    if success_mask.any():
+                                        feature_loss = per_sample_fl[success_mask].mean()
+                                    else:
+                                        feature_loss = per_sample_fl.mean() * 0.0  # 保持 autograd graph
+                                else:
+                                    feature_loss = per_sample_fl.mean()
+                            elif feat_episode_success is not None:
+                                # 原来的软降权逻辑
+                                feat_success = feat_episode_success.squeeze(-1)
+                                feat_frame_idx = fb.get("frame_index")
+                                if feat_frame_idx is not None:
+                                    ft_norm = feat_frame_idx.squeeze(-1).float() / 520.0
+                                    fdecay = getattr(self.config, 'online_success_decay_rate', 8.0)
+                                    feat_fail_w = torch.exp(-fdecay * ft_norm)
+                                    feat_weight = torch.where(
+                                        feat_success > 0.5,
+                                        torch.ones_like(feat_success), feat_fail_w)
+                                else:
+                                    feat_weight = torch.where(
+                                        feat_success > 0.5,
+                                        torch.ones_like(feat_success),
+                                        torch.full_like(feat_success, 0.3))
+                                feature_loss = (feat_weight * per_sample_fl).sum() / feat_weight.sum().clamp(min=1)
+                            else:
+                                feature_loss = per_sample_fl.mean()
+
+                            # L2 action distance 诊断
+                            pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
+                            l2_actions = torch.mean(
+                                torch.square(gen_actions_slice - pred_actions_slice)
+                            )
+
+                            # 联合损失（losses 已包含 bc_loss + anchor_loss，不能覆盖）
+                            losses = losses + feature_weight * feature_loss
+
+                            loss_dict["loss"] = losses.item()
+                            loss_dict["feature_loss"] = feature_loss.item()
+                            loss_dict["l2_actions"] = l2_actions.item()
+                        else:
+                            # batch 中没有 prev_actions/pred_action → 只用 bc_loss
+                            loss_dict["feature_loss"] = 0.0
+                            loss_dict["l2_actions"] = 0.0
 
             return losses, loss_dict
 
@@ -3589,36 +3902,39 @@ class PI05Policy(PreTrainedPolicy):
             }
             注意：始终返回正确形状的数据，无效时用零填充且 valid=False
         """
-        # 从 config 读取默认值
         if prev_steps is None:
             prev_steps = self.config.attn_act_len
         if pred_steps is None:
             pred_steps = self.config.attn_act_len
 
-        # 获取 action_dim 和 device
-        original_action_dim = self.config.output_features[ACTION].shape[0]
+        action_dim = self.config.output_features[ACTION].shape[0]
         device = next(self.parameters()).device
 
-        chunk_size = self.config.chunk_size
-        # 初始化为零填充的数据（始终返回正确形状，不返回 None）
-        prev_actions = torch.zeros(batch_size, prev_steps, original_action_dim, device=device, dtype=torch.float32)
-        pred_action = torch.zeros(batch_size, pred_steps, original_action_dim, device=device, dtype=torch.float32)
+        # 默认返回零填充
+        prev_actions = torch.zeros(batch_size, prev_steps, action_dim, device=device, dtype=torch.float32)
+        pred_action = torch.zeros(batch_size, pred_steps, action_dim, device=device, dtype=torch.float32)
         valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        # 如果有预测 buffer，填充真实数据
-        if self.step_num_in_chunk is not None:
+        if self._full_action_chunk is None:
+            return {'prev_actions': prev_actions, 'pred_action': pred_action, 'actions_seq_valid': valid_mask}
 
-            valid_mask = (self.step_num_in_chunk > prev_steps) & (self.step_num_in_chunk + pred_steps <= chunk_size)
-            # 为有效的样本填充真实数据
-            for i in range(batch_size):
-                if valid_mask[i]:
-                    prev_actions[i] = self._last_actions_list[i, :, :original_action_dim]
-                    pred_action[i] = self._predicted_actions_buffer[i, :pred_steps, :original_action_dim]
+        # 从现有状态推算当前在 chunk 中的位置
+        # _chunk_segment_index: 下一段的索引（1 表示 segment 0 已加载）
+        # _action_queue: 当前段中尚未消耗的动作
+        n_act = self.config.n_action_steps
+        queue_len = len(self._action_queue)
+        if queue_len > 0:
+            # 正在消耗某段中间：已完成段数 * n_act + 当前段已消耗的动作数
+            pos = (self._chunk_segment_index - 1) * n_act + (n_act - queue_len)
+        else:
+            # 当前段刚好用完，下一次 select_action 会加载新段
+            pos = self._chunk_segment_index * n_act
 
-        result = {
-            'prev_actions': prev_actions,
-            'pred_action': pred_action,
-            'actions_seq_valid': valid_mask,
-        }
+        chunk_size = self.config.chunk_size
+        if pos >= prev_steps and pos + pred_steps <= chunk_size:
+            chunk = self._full_action_chunk[:, :, :action_dim]
+            prev_actions = chunk[:, pos - prev_steps : pos, :]
+            pred_action = chunk[:, pos : pos + pred_steps, :]
+            valid_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
 
-        return result
+        return {'prev_actions': prev_actions, 'pred_action': pred_action, 'actions_seq_valid': valid_mask}

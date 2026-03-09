@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+#!/usr/bin/env python
 
 import sys
 from pathlib import Path
@@ -48,7 +49,6 @@ from collections.abc import Callable
 from pathlib import Path
 from pprint import pformat
 from typing import Any
-from tqdm import trange
 from copy import deepcopy
 
 import einops
@@ -63,7 +63,8 @@ from torch.optim import Optimizer
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.configs import parser
 from lerobot.configs.train import OnlineTrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.factory import make_dataset, resolve_delta_timestamps
+from lerobot.datasets.utils import get_delta_indices, load_episodes, get_hf_features_from_features, hf_transform_to_torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
@@ -85,7 +86,6 @@ from lerobot.utils.utils import (
     format_big_number,
     has_method,
     init_logging,
-    inside_slurm,
 )
 from lerobot.envs.utils import (
     add_envs_task,
@@ -160,14 +160,23 @@ class FillMissingActionContextProcessor:
 
 
 class ValidActionContextSampler(torch.utils.data.Sampler):
-    """只采样 actions_seq_valid=True 的帧的 Sampler。"""
+    """只采样 actions_seq_valid=True 的帧的 Sampler。
 
-    def __init__(self, dataset: LeRobotDataset, shuffle: bool = True):
+    支持额外过滤：
+    - success_only: 只采样成功 episode 的帧
+    - min_episode_index: 只采样 episode_index >= min_episode_index 的帧（当前 iteration 数据）
+    """
+
+    def __init__(self, dataset: LeRobotDataset, shuffle: bool = True,
+                 success_only: bool = False, min_episode_index: int | None = None):
         super().__init__()
         self.dataset = dataset
         self.shuffle = shuffle
+        self.success_only = success_only
+        self.min_episode_index = min_episode_index
         self._valid_indices = None
         self._cached_num_frames = 0
+        self._cached_min_ep = min_episode_index
 
     def _find_valid_indices(self) -> list[int]:
         """高效地查找所有 actions_seq_valid=True 的帧索引。"""
@@ -197,8 +206,24 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
             if actions_seq_valid.ndim == 2:
                 actions_seq_valid = actions_seq_valid.squeeze(-1)
 
-            # 找到所有 True 的索引
-            valid_indices = np.where(actions_seq_valid)[0].tolist()
+            # 基础过滤：actions_seq_valid=True
+            valid_mask = actions_seq_valid.astype(bool)
+
+            # 追加过滤：只用当前 iteration 的 episodes
+            if self.min_episode_index is not None and 'episode_index' in hf_dataset.column_names:
+                episode_indices = np.array(hf_dataset['episode_index'])
+                if episode_indices.ndim == 2:
+                    episode_indices = episode_indices.squeeze(-1)
+                valid_mask &= (episode_indices >= self.min_episode_index)
+
+            # 追加过滤：只用成功 episodes
+            if self.success_only and 'episode_success' in hf_dataset.column_names:
+                episode_success = np.array(hf_dataset['episode_success'])
+                if episode_success.ndim == 2:
+                    episode_success = episode_success.squeeze(-1)
+                valid_mask &= (episode_success > 0.5)
+
+            valid_indices = np.where(valid_mask)[0].tolist()
         else:
             # 如果 hf_dataset 中没有这个列，回退到全部索引
             logging.warning("'actions_seq_valid' not in hf_dataset columns, using all indices")
@@ -215,9 +240,12 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
     def valid_indices(self) -> list[int]:
         """获取有效帧索引（带缓存）。"""
         current_num_frames = len(self.dataset)
-        if self._valid_indices is None or self._cached_num_frames != current_num_frames:
+        if (self._valid_indices is None
+                or self._cached_num_frames != current_num_frames
+                or self._cached_min_ep != self.min_episode_index):
             self._valid_indices = self._find_valid_indices()
             self._cached_num_frames = current_num_frames
+            self._cached_min_ep = self.min_episode_index
         return self._valid_indices
 
     def __iter__(self):
@@ -395,12 +423,6 @@ def rollout(
     # Keep track of which environments are done.
     done = np.array([False] * env.num_envs)
     max_steps = env.call("_max_episode_steps")[0]
-    progbar = trange(
-        max_steps,
-        desc=f"Running rollout with at most {max_steps} steps",
-        disable=inside_slurm(),  # we dont want progress bar when we use slurm, since it clutters the logs
-        leave=False,
-    )
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
@@ -446,16 +468,19 @@ def rollout(
         if render_callback is not None:
             render_callback(env)
 
-        # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
+        # VectorEnv stores is_success in `info["final_info"]`. "final_info" isn't
         # available if none of the envs finished.
         if "final_info" in info:
             final_info = info["final_info"]
-            if not isinstance(final_info, dict):
-                raise RuntimeError(
-                    "Unsupported `final_info` format: expected dict (Gymnasium >= 1.0). "
-                    "You're likely using an older version of gymnasium (< 1.0). Please upgrade."
-                )
-            successes = final_info["is_success"].tolist()
+            if isinstance(final_info, dict):
+                # Gymnasium >= 1.0: final_info is a dict with stacked arrays
+                successes = final_info["is_success"].tolist()
+            else:
+                # Gymnasium < 1.0: final_info is ndarray of dicts (or None per env)
+                successes = [
+                    fi.get("is_success", False) if isinstance(fi, dict) else False
+                    for fi in final_info
+                ]
         else:
             successes = [False] * env.num_envs
 
@@ -473,11 +498,15 @@ def rollout(
         all_successes.append(torch.tensor(successes))
 
         step += 1
-        running_success_rate = (
-            einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
-        )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
-        progbar.update()
+
+    # 打印 rollout 汇总（不用 tqdm 进度条）
+    final_success_rate = (
+        einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
+    )
+    logging.info(
+        f"Rollout done: {step}/{max_steps} steps, "
+        f"n_envs={env.num_envs}, success_rate={final_success_rate.item() * 100:.1f}%"
+    )
 
     # Track the final observation.
     if return_observations:
@@ -535,6 +564,10 @@ def update_policy(
         lr_scheduler=None,
         lock=None,
         online=False,
+        use_online_optimizer=False,
+        bc_only=False,
+        feature_weight: float = 0.0,
+        feature_batch: Any = None,
         online_optimizer: Optimizer | None = None,
         online_lr_scheduler=None,
 ) -> tuple[MetricsTracker, dict]:
@@ -563,8 +596,8 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
-    # 根据 online 参数选择对应的优化器和调度器
-    if online and online_optimizer is not None:
+    # 根据 online/use_online_optimizer 参数选择对应的优化器和调度器
+    if (online or use_online_optimizer) and online_optimizer is not None:
         current_optimizer = online_optimizer
         current_lr_scheduler = online_lr_scheduler
     else:
@@ -573,7 +606,9 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        loss, output_dict = policy.forward(batch, online=online)
+        loss, output_dict = policy.forward(batch, online=online, bc_only=bc_only,
+                                           feature_weight=feature_weight,
+                                           feature_batch=feature_batch)
 
     # Use accelerator's backward method
     accelerator.backward(loss)
@@ -646,8 +681,8 @@ def update_policy(
             print(f"{'='*60}\n")
 
     # Clip gradients if specified
-    # 根据 online 模式选择需要 clip 的参数
-    if online and online_optimizer is not None:
+    # 根据 online/use_online_optimizer 模式选择需要 clip 的参数
+    if (online or use_online_optimizer) and online_optimizer is not None:
         params_to_clip = policy.get_online_optim_params()
     else:
         params_to_clip = policy.parameters()
@@ -682,6 +717,13 @@ def update_policy(
         train_metrics.loss = output_dict["loss"]
         train_metrics.cmp_loss = output_dict["cmp_loss"]
         train_metrics.bc_loss = output_dict["bc_loss"]
+        # 联合 feature_loss（bc_only + feature_weight > 0 时存在）
+        if "feature_loss" in output_dict:
+            train_metrics.feature_loss = output_dict["feature_loss"]
+        if "l2_actions" in output_dict:
+            train_metrics.l2_actions = output_dict["l2_actions"]
+        if "anchor_loss" in output_dict:
+            train_metrics.anchor_loss = output_dict["anchor_loss"]
 
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = current_optimizer.param_groups[0]["lr"]
@@ -734,9 +776,10 @@ def collect_episodes(
         if start_seed is None:
             seeds = None
         else:
+            # seed 长度必须等于 env.num_envs，即使只收集部分 episode
             seeds = range(
                 start_seed + (batch_ix * env.num_envs),
-                start_seed + (batch_ix * env.num_envs) + episodes_this_batch,
+                start_seed + (batch_ix * env.num_envs) + env.num_envs,
             )
 
         rollout_data = rollout(
@@ -866,6 +909,17 @@ def add_episodes_to_dataset(
     # Track current episode to detect episode boundaries
     current_episode_index = None
 
+    # 计算 episode 级别 success：episode 内任意帧 success=True → 该 episode 成功
+    episode_success_map = {}
+    if "next.success" in episode_data:
+        ep_indices = episode_data["episode_index"]
+        success_data = episode_data["next.success"]
+        for ep_idx in torch.unique(ep_indices):
+            ep_mask = ep_indices == ep_idx
+            episode_success_map[ep_idx.item()] = 1.0 if success_data[ep_mask].any().item() else 0.0
+        n_suc = sum(v > 0 for v in episode_success_map.values())
+        logging.info(f"Episode success: {n_suc}/{len(episode_success_map)} successful")
+
     # Extract task information if available
     # Task might be in episode_data directly, or in observation keys
     task_key = None
@@ -948,6 +1002,13 @@ def add_episodes_to_dataset(
         #                 frame_dict["complementary_info.success"] = success_value
         #         else:
         #             frame_dict["complementary_info.success"] = success_value
+
+        # 写入 episode_success（episode 级别成功标志）
+        if "episode_success" in online_dataset.features and episode_success_map:
+            ep_idx = episode_data["episode_index"][frame_idx].item()
+            frame_dict["episode_success"] = torch.tensor(
+                [episode_success_map.get(ep_idx, 0.0)], dtype=torch.float32
+            )
 
         # Add action context fields if present in episode_data and dataset features
         if "prev_actions" in episode_data and "prev_actions" in online_dataset.features:
@@ -1116,12 +1177,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # Create environment for data collection (only if online_collect is enabled)
+    # 收集只需每 task 少量 episode，用 n_envs=1 避免浪费
+    # （eval.batch_size=8 时，8 个 env 全跑 520 步但只取 1 个 episode，7/8 计算白费）
     collect_env_dict = None
+    collect_n_envs = 1
     if cfg.online.online_collect:
         if is_main_process:
-            logging.info("Creating environment for data collection")
+            logging.info(f"Creating environment for data collection (n_envs={collect_n_envs})")
         collect_env_dict = make_env(
-            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+            cfg.env, n_envs=collect_n_envs, use_async_envs=False
         )
         # Keep the full dict to use all tasks, not just the first one
         # Structure: {suite_name: {task_id: vec_env}}
@@ -1280,9 +1344,14 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     "shape": (1,),
                     "names": None,
                 }
+                features["episode_success"] = {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": None,
+                }
                 logging.info(
                     f"Added action context features: prev_actions shape={(prev_steps, action_dim)}, "
-                    f"pred_action shape={(pred_steps, action_dim)}"
+                    f"pred_action shape={(pred_steps, action_dim)}, episode_success shape=(1,)"
                 )
 
                 # Create empty online dataset
@@ -1323,6 +1392,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # Use offline dataset for training if available, otherwise use online dataset
     # The online dataset will be used for collecting new episodes
     training_dataset = offline_dataset if offline_dataset is not None else online_dataset
+
+    # 为在线数据集设置 delta_timestamps（BC 训练需要 action chunks）
+    if online_dataset is not None and getattr(online_dataset, 'delta_timestamps', None) is None:
+        delta_ts = resolve_delta_timestamps(cfg.policy, online_dataset.meta)
+        if delta_ts is not None:
+            online_dataset.delta_timestamps = delta_ts
+            online_dataset.delta_indices = get_delta_indices(delta_ts, online_dataset.fps)
+            if is_main_process:
+                logging.info(f"Online dataset delta_timestamps set: {list(delta_ts.keys())}")
 
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
     _attn_val = getattr(cfg.policy, "attn_act_len", None)
@@ -1370,7 +1448,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"  attn_act_len:          {policy.config.attn_act_len}")
         logging.info(f"  part_layer_num:        {policy.config.part_layer_num}")
         logging.info(f"  cmp_pretrain:          {policy.config.cmp_pretrain}")
+        logging.info(f"  anchor_weight:         {getattr(policy.config, 'anchor_weight', 0.0)}")
         logging.info("=" * 60)
+
+    # Initialize anchor Expert for velocity distillation (before accelerator.prepare)
+    anchor_weight_val = getattr(policy.config, 'anchor_weight', 0.0)
+    if anchor_weight_val > 0:
+        policy.init_anchor_expert()
+        if is_main_process:
+            logging.info(f"[Anchor] Velocity distillation enabled (weight={anchor_weight_val})")
 
     # Create processors
     processor_kwargs = {}
@@ -1520,6 +1606,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"{cfg.online.n_iterations=}")
         logging.info(f"{cfg.online.collect_episodes_per_iteration=}")
         logging.info(f"{cfg.online.train_steps_per_iteration=}")
+        logging.info(f"{cfg.online.skip_offline_steps=}")
         if offline_dataset is not None:
             logging.info(
                 f"Offline dataset: {offline_dataset.num_episodes} episodes, "
@@ -1543,20 +1630,21 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # neg_action_config 需要通过 worker_init_fn 注入到每个 worker 的 dataset 副本中
     _neg_action_cfg = getattr(training_dataset, "neg_action_config", None)
 
-    def _worker_init_fn(worker_id):
-        """在每个 DataLoader worker 进程中注入 neg_action_config。"""
+    def _offline_worker_init_fn(worker_id):
+        """在离线 DataLoader worker 进程中注入 neg_action_config。"""
         if _neg_action_cfg is not None:
             worker_info = torch.utils.data.get_worker_info()
             if worker_info is not None:
                 worker_info.dataset.neg_action_config = _neg_action_cfg
 
-    def create_dataloader(dataset, online=False):
+    def create_dataloader(dataset, online=False, success_only=False, min_episode_index=None):
         """创建 DataLoader。
 
         Args:
             dataset: 数据集
-            use_valid_action_sampler: 是否使用 ValidActionContextSampler
-                仅采样 actions_seq_valid=True 的帧（用于在线数据集）
+            online: 是否使用 ValidActionContextSampler（仅采样 actions_seq_valid=True 的帧）
+            success_only: 是否只采样成功 episode 的帧
+            min_episode_index: 只采样 >= 此 episode index 的帧（当前 iteration 数据）
         """
 
         if online:
@@ -1564,6 +1652,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             sampler = ValidActionContextSampler(
                 dataset,
                 shuffle=True,
+                success_only=success_only,
+                min_episode_index=min_episode_index,
             )
         elif hasattr(cfg.policy, "drop_n_last_frames"):
             shuffle = False
@@ -1578,6 +1668,9 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             shuffle = True
             sampler = None
 
+        # online dataset 不需要 neg_action_config（CMP 负样本仅用于离线训练）
+        init_fn = _offline_worker_init_fn if not online else None
+
         return torch.utils.data.DataLoader(
             dataset,
             num_workers=cfg.num_workers,
@@ -1587,7 +1680,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             pin_memory=device.type == "cuda",
             drop_last=False,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
-            worker_init_fn=_worker_init_fn,
+            worker_init_fn=init_fn,
         )
 
     # Create dataloader for offline dataset (if exists)
@@ -1656,6 +1749,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "anchor_loss": AverageMeter("anchor_loss", ":.3f"),
     }
 
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -1674,12 +1768,20 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         else:
             logging.info("Start training on existing online dataset (no new data collection)")
 
+    # Feature-only mode flag
+    feature_only = getattr(policy.config, 'feature_only_online', False)
+    if is_main_process and feature_only:
+        logging.info("[Feature-Only] Mode enabled: no bc_loss, every step = feature_loss + anchor_loss")
+
     # Main online training loop
     for iteration in range(cfg.online.n_iterations):
         if is_main_process:
             logging.info(f"\n{'=' * 60}")
             logging.info(f"Iteration {iteration + 1}/{cfg.online.n_iterations}")
             logging.info(f"{'=' * 60}")
+
+        # 记录本轮 iteration 的起始 episode index（用于 sampler 过滤历史数据）
+        iteration_start_episode = online_dataset.num_episodes if hasattr(online_dataset, "num_episodes") else 0
 
         # Phase 1: Collect episodes from all tasks (only if online=True)
         if cfg.online.online_collect:
@@ -1717,7 +1819,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
                             task_episode_data = collect_episodes(
                                 env=env,
-                                batch_size=cfg.eval.batch_size,
+                                batch_size=env.num_envs,
                                 policy=accelerator.unwrap_model(policy),
                                 env_preprocessor=env_preprocessor,
                                 env_postprocessor=env_postprocessor,
@@ -1757,6 +1859,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 logging.info(f"[PERF] Phase 1 (collect_episodes): {phase1_time:.3f}s")
 
             # Phase 2: Add episodes to online dataset
+            # Record existing data files BEFORE saving (for incremental hf_dataset update)
+            data_dir = online_dataset.root / "data"
+            old_data_files = set(str(f) for f in data_dir.glob("*/*.parquet")) if data_dir.exists() else set()
+
             phase2_start = _time.time()
             if is_main_process:
                 logging.info("Adding collected episodes to online dataset")
@@ -1766,34 +1872,71 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 logging.info(f"[PERF] Phase 2 (add_episodes_to_dataset): {phase2_time:.3f}s")
                 logging.info(f"[PERF] Total data collection + dataset update: {phase1_time + phase2_time:.3f}s")
 
-            # Close all writers to ensure parquet files are properly finalized before reading
+            # Close writers to finalize parquet files, then incrementally update hf_dataset
+            # (避免 _ensure_hf_dataset_loaded 全量重载 3GB+ 数据，改为只加载新增文件)
             if is_main_process:
+                incr_start = _time.time()
                 online_dataset._close_writer()
+                online_dataset._writer_closed_for_reading = True  # 确保下次写入新文件
                 if hasattr(online_dataset.meta, "_close_writer"):
                     online_dataset.meta._close_writer()
-                online_dataset._ensure_hf_dataset_loaded()
+                    # 关闭 writer 后重置 latest_episode，强制下次写入创建新 parquet 文件
+                    # 否则新 writer 会覆盖旧文件，丢失之前的 episode 元数据
+                    online_dataset.meta.latest_episode = None
+
+                # 1. 从 metadata parquet 构建 meta.episodes（85KB，瞬间完成）
+                online_dataset.meta.episodes = load_episodes(online_dataset.root)
+                logging.info(f"Built meta.episodes: {len(online_dataset.meta.episodes)} rows "
+                             f"(info.total_episodes={online_dataset.meta.total_episodes})")
+
+                # 2. 增量更新 hf_dataset：只加载新增的 parquet 文件
+                import datasets as hf_datasets
+                from datasets import concatenate_datasets
+                new_data_files = sorted(set(str(f) for f in data_dir.glob("*/*.parquet")) - old_data_files)
+
+                if online_dataset.hf_dataset is not None and len(online_dataset.hf_dataset) > 0 and new_data_files:
+                    # 增量模式：只加载新文件并拼接
+                    features = get_hf_features_from_features(online_dataset.features)
+                    new_hf = hf_datasets.Dataset.from_parquet(new_data_files, features=features)
+                    new_hf.set_transform(hf_transform_to_torch)
+                    online_dataset.hf_dataset = concatenate_datasets([online_dataset.hf_dataset, new_hf])
+                    online_dataset.hf_dataset.set_transform(hf_transform_to_torch)
+                    logging.info(f"[PERF] Incremental hf_dataset update: loaded {len(new_data_files)} new files "
+                                 f"({len(new_hf)} frames) in {_time.time() - incr_start:.1f}s, "
+                                 f"total {len(online_dataset.hf_dataset)} frames")
+                else:
+                    # 首次加载（hf_dataset 为空或刚启动）：全量加载一次
+                    online_dataset.hf_dataset = online_dataset.load_hf_dataset()
+                    logging.info(f"[PERF] Full hf_dataset load: {len(online_dataset.hf_dataset)} frames "
+                                 f"in {_time.time() - incr_start:.1f}s (one-time cost)")
+
+                online_dataset._lazy_loading = False
 
             # Wait for dataset update to complete
             accelerator.wait_for_everyone()
 
-            # Reload online dataset to include new episodes
-            # Note: The online_dataset should be updated in-place by add_episodes_to_dataset
-            # If the dataset implementation requires reloading, do it here
-            # Force reload dataset metadata if needed
-            if hasattr(online_dataset.meta, "reload"):
-                online_dataset.meta.reload()
+            # 非主进程也需要更新 hf_dataset（多卡场景）
+            if not is_main_process:
+                online_dataset._close_writer()
+                online_dataset._writer_closed_for_reading = True
+                if hasattr(online_dataset.meta, "_close_writer"):
+                    online_dataset.meta._close_writer()
+                    online_dataset.meta.latest_episode = None
+                online_dataset.meta.episodes = load_episodes(online_dataset.root)
+                # 非主进程做全量加载（数据已被主进程写入 parquet）
+                online_dataset.hf_dataset = online_dataset.load_hf_dataset()
+                online_dataset._lazy_loading = False
 
             # Recreate dataloaders with updated datasets
-            # if offline_dataset is not None:
-            #     offline_dataloader = create_dataloader(offline_dataset)
-            #     offline_dataloader = accelerator.prepare(offline_dataloader)
-            #     offline_dl_iter = cycle(offline_dataloader)
-
-            # Only create online dataloader if dataset has data
-            # Use ValidActionContextSampler to only sample valid frames
             if online_dataset.num_frames > 0:
-                online_dataloader = create_dataloader(online_dataset, online=True)
-                # 保存 sampler 引用
+                if feature_only:
+                    online_dataloader = create_dataloader(
+                        online_dataset, online=True,
+                        success_only=True,
+                        min_episode_index=iteration_start_episode,
+                    )
+                else:
+                    online_dataloader = create_dataloader(online_dataset, online=True)
                 online_sampler = online_dataloader.sampler if hasattr(online_dataloader, 'sampler') else None
                 online_dataloader = accelerator.prepare(online_dataloader)
                 online_dl_iter = cycle(online_dataloader)
@@ -1802,6 +1945,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     logging.info(
                         f"Recreated online dataloader with ValidActionContextSampler "
                         f"({valid_count} valid frames out of {online_dataset.num_frames})"
+                        + (f" [Feature-Only: success_only, min_ep={iteration_start_episode}]"
+                           if feature_only else "")
                     )
             else:
                 if is_main_process:
@@ -1823,6 +1968,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 )
             continue
 
+        # Feature-only mode: skip training if no success episodes in this iteration
+        if feature_only and online_sampler is not None and len(online_sampler) == 0:
+            if is_main_process:
+                logging.warning(
+                    f"[Feature-Only] No success episodes in iteration {iteration+1}. "
+                    f"Skipping training phase."
+                )
+            continue
+
         # Phase 3: Train on both offline and online datasets
         # Each training step consists of two sub-steps:
         if is_main_process:
@@ -1839,56 +1993,85 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
         policy.train()
         iteration_start_step = step
+
+        # 判断在线数据是否足够用于 feature_loss
+        online_data_ready = (
+            online_dataset.num_episodes > 0
+            and online_dataloader is not None
+            and online_dataset.num_frames >= cfg.online.min_frames_for_online_training
+        )
+
         for train_step in range(cfg.online.train_steps_per_iteration):
-            if offline_dataset is not None and offline_dataset.num_episodes > 0:
+            bc_data_available = False
+
+            if cfg.online.skip_offline_steps:
+                # ====== Online 训练：bc_loss（每步） + feature_loss（每 train_interval 步） ======
+                # bc_loss：在模型实际访问的状态上强化成功动作（success weighted）
+                # feature_loss：时序一致性 + 教 Expert 使用 condition_token（计算昂贵，降频）
+                if online_data_ready:
+                    start_time = time.perf_counter()
+                    online_batch = next(online_dl_iter)
+                    online_batch = preprocessor(online_batch)
+                    bc_batch = online_batch  # bc_loss 和 feature_loss 用同一批在线数据
+                    # feature_loss 频率控制
+                    if feature_only:
+                        # Feature-only 模式：每步都是 feature step
+                        current_feature_weight = 1.0
+                    else:
+                        # 原逻辑：每 train_interval 步算一次（sample_actions_differentiable 很贵）
+                        is_feature_step = (cfg.online.train_interval > 0
+                                           and step % cfg.online.train_interval == 0)
+                        current_feature_weight = 1.0 if is_feature_step else 0.0
+                    current_feature_batch = None  # None → forward() 回落到 batch 本身
+                    train_tracker.dataloading_s = time.perf_counter() - start_time
+                    bc_data_available = True
+            elif offline_dataset is not None and offline_dataset.num_episodes > 0:
+                # 常规模式：用离线数据做 BC
                 start_time = time.perf_counter()
-                offline_batch = next(offline_dl_iter)
-                offline_batch = preprocessor(offline_batch)
+                bc_batch = next(offline_dl_iter)
+                bc_batch = preprocessor(bc_batch)
                 # Fill missing action context fields for offline dataset
-                offline_batch = fill_action_context_processor(offline_batch)
+                bc_batch = fill_action_context_processor(bc_batch)
                 train_tracker.dataloading_s = time.perf_counter() - start_time
+                bc_data_available = True
 
-                train_tracker, output_dict = update_policy(
-                    train_tracker,
-                    policy,
-                    offline_batch,
-                    offline_optimizer,
-                    cfg.optimizer.grad_clip_norm,
-                    accelerator=accelerator,
-                    lr_scheduler=offline_lr_scheduler,
-                    online=False,
-                    online_optimizer=online_optimizer,
-                    online_lr_scheduler=online_lr_scheduler,
-                )
+            if bc_data_available:
+                if cfg.online.skip_offline_steps:
+                    # online bc_loss + feature_loss 联合训练，online_optimizer（只更新动作专家）
+                    train_tracker, output_dict = update_policy(
+                        train_tracker,
+                        policy,
+                        bc_batch,
+                        offline_optimizer,
+                        cfg.optimizer.grad_clip_norm,
+                        accelerator=accelerator,
+                        lr_scheduler=offline_lr_scheduler,
+                        online=False,
+                        use_online_optimizer=True,
+                        bc_only=True,
+                        feature_weight=current_feature_weight,
+                        feature_batch=current_feature_batch,
+                        online_optimizer=online_optimizer,
+                        online_lr_scheduler=online_lr_scheduler,
+                    )
+                else:
+                    # 常规模式：offline data + offline_optimizer（更新全部参数）
+                    train_tracker, output_dict = update_policy(
+                        train_tracker,
+                        policy,
+                        bc_batch,
+                        offline_optimizer,
+                        cfg.optimizer.grad_clip_norm,
+                        accelerator=accelerator,
+                        lr_scheduler=offline_lr_scheduler,
+                        online=False,
+                        online_optimizer=online_optimizer,
+                        online_lr_scheduler=online_lr_scheduler,
+                    )
 
                 step += 1
                 train_tracker.step()
 
-            if (online_dataset.num_episodes > 0 and step % cfg.online.train_interval == 0 and online_dataloader is not None
-                    and online_dataset.num_frames >= cfg.online.min_frames_for_online_training):
-                start_time = time.perf_counter()
-                online_batch = next(online_dl_iter)
-                online_batch = preprocessor(online_batch)
-                train_tracker.dataloading_s = time.perf_counter() - start_time
-
-                train_tracker, output_dict = update_policy(
-                    train_tracker,
-                    policy,
-                    online_batch,
-                    offline_optimizer,
-                    cfg.optimizer.grad_clip_norm,
-                    accelerator=accelerator,
-                    lr_scheduler=offline_lr_scheduler,
-                    online=True,
-                    online_optimizer=online_optimizer,
-                    online_lr_scheduler=online_lr_scheduler,
-                )
-
-                step += 1
-                train_tracker.step()
-
-            # Log and save checkpoints after each training iteration
-            # (which includes both offline and online training steps)
             is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
             is_saving_step = step % cfg.save_freq == 0
 

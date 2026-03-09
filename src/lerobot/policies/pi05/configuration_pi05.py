@@ -96,6 +96,18 @@ class PI05Config(PreTrainedConfig):
     replan_mode: str = "drift"  # "drift": drift-based replan; "fixed": 每 n_action_steps 步固定 replan (同 baseline)
     embedding_max_norm: float = 0.0  # 0 = 关闭；>0 = 手动指定 clamp norm
 
+    # Online training: success-weighted feature loss
+    online_success_decay_power: float = 1.0  # 失败帧权重衰减幂次（1.0=线性, 2.0=二次衰减）
+
+    # Velocity distillation: anchor loss weight (0=disabled)
+    # L_total = L_bc + feature_weight*L_feature + anchor_weight*L_anchor
+    # L_anchor = MSE(v_current, v_offline) prevents Expert mode collapse
+    anchor_weight: float = 0.0
+
+    # Feature-only online training: remove bc_loss, every step = feature_loss + anchor_loss
+    # Only success episodes from current iteration are used
+    feature_only_online: bool = False
+
 
     def __post_init__(self):
         super().__post_init__()
