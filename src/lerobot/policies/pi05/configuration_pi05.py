@@ -90,6 +90,7 @@ class PI05Config(PreTrainedConfig):
     # CMP (Contrastive Model Prediction) parameters
     part_layer_num: int = 6      # PaliGemma 前 N 层用于 CMP
     attn_act_len: int = 10       # SingleHeadContentAttention 的输入长度
+    neg_chunk_size: int | None = None  # L1/L2 负样本采样跨度，None 时回退到 chunk_size
     cmp_pretrain: bool = False
     replan_drift_threshold: float = 0.0  # >0 时启用 drift-based replan（high threshold，立即 replan）
     replan_drift_threshold_mid: float = 0.0  # >0 时启用自适应步长（mid threshold，延迟一段后 replan）
@@ -114,6 +115,9 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.neg_chunk_size is not None and self.neg_chunk_size <= 0:
+            raise ValueError(f"neg_chunk_size must be positive when set, got {self.neg_chunk_size}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

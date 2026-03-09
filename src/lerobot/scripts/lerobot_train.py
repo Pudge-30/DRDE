@@ -193,9 +193,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         dataset = make_dataset(cfg)
 
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
+    # 支持将负样本采样跨度与 policy.chunk_size 解耦（默认回退到 chunk_size）。
     if hasattr(cfg.policy, "attn_act_len") and cfg.policy.attn_act_len > 0:
+        neg_chunk_size = int(getattr(cfg.policy, "neg_chunk_size", cfg.policy.chunk_size))
         dataset.neg_action_config = {
-            "chunk_size": cfg.policy.chunk_size,
+            "chunk_size": max(1, neg_chunk_size),
             "att_len": cfg.policy.attn_act_len,
         }
 

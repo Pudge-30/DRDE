@@ -412,8 +412,18 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    if not cfg.output_features:
-        cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    dataset_action_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    # 当使用数据集构建策略时，始终以数据集 action 维度为准，避免预训练配置残留维度
+    #（例如预训练 action=7，而当前数据集 action=8）导致下游模块维度不匹配。
+    if ds_meta is not None and dataset_action_features:
+        if cfg.output_features and cfg.output_features != dataset_action_features:
+            logging.warning(
+                "Overriding policy output_features with dataset action features to match dataset schema. "
+                f"policy={cfg.output_features}, dataset={dataset_action_features}"
+            )
+        cfg.output_features = dataset_action_features
+    elif not cfg.output_features:
+        cfg.output_features = dataset_action_features
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
     kwargs["config"] = cfg

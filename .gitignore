@@ -167,6 +167,7 @@ wandb/
 data/
 outputs/
 pretrained_models/
+@pretrained_models/
 
 # Large model artifacts
 *.safetensors
@@ -185,3 +186,4 @@ src/lerobot/policies/pi05/*.pdf
 *.xml
 *.part
 experiments/
+pretrained_models

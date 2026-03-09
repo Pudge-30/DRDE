@@ -344,7 +344,7 @@ class ManiSkill3Env(EnvConfig):
     state_dim: int = 8
     action_dim: int = 7
     control_mode: str | None = "pd_ee_delta_pose"
-    max_episode_steps: int | None = None
+    max_episode_steps: int = 300
     sim_backend: str | None = None
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {

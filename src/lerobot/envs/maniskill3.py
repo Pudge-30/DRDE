@@ -106,12 +106,18 @@ class ManiSkill3Env(gym.Env):
             kwargs["sim_backend"] = sim_backend
         if control_mode is not None:
             kwargs["control_mode"] = control_mode
+        if max_episode_steps is not None:
+            kwargs["max_episode_steps"] = int(max_episode_steps)
 
         self._env = gym.make(task, **kwargs)
         if max_episode_steps is not None:
             self._max_episode_steps = int(max_episode_steps)
         else:
+            # spec.max_episode_steps becomes None when gym.make overrides the limit;
+            # fall back to the actual TimeLimitWrapper value, then the spec, then 200.
             env_max_steps = getattr(self._env.spec, "max_episode_steps", None)
+            if env_max_steps is None:
+                env_max_steps = getattr(self._env, "_max_episode_steps", None)
             self._max_episode_steps = int(env_max_steps) if env_max_steps is not None else 200
 
         self.action_space = self._env.action_space
