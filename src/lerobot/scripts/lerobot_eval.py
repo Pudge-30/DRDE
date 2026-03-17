@@ -285,6 +285,11 @@ def rollout(
         ret["replan_count"] = policy._replan_count
         if policy._replan_count > 0:
             print(f"[Replan] rollout: {policy._replan_count} replans triggered")
+    # 模态对齐分析：收集 z1(obs) 和 z2(action) 嵌入
+    if hasattr(policy, '_z1_embeddings') and len(policy._z1_embeddings) > 0:
+        ret["z1_embeddings"] = torch.cat(policy._z1_embeddings, dim=0)  # [N_chunks * B, 512]
+    if hasattr(policy, '_z2_embeddings') and len(policy._z2_embeddings) > 0:
+        ret["z2_embeddings"] = torch.cat(policy._z2_embeddings, dim=0)  # [N_chunks * B, 512]
     if return_observations:
         stacked_observations = {}
         # Only stack keys that start with "observation."
@@ -352,6 +357,9 @@ def eval_policy(
     all_episode_itm_scores = []  # per-episode fresh ITM score sequences
     all_episode_stale_itm = []   # per-episode stale ITM: list of list[dict]
     all_episode_drift = []       # per-episode drift: list of dict[chunk_id -> [{segment, drift}]]
+    # 模态对齐分析：跨所有 rollout 批次累积 z1/z2 嵌入
+    all_z1_embeddings: list[Tensor] = []
+    all_z2_embeddings: list[Tensor] = []
     all_ep_steps = []            # per-episode 实际步数 (done_index + 1)
     all_replan_counts = []       # per-rollout replan 触发次数
     threads = []  # for video saving threads
@@ -490,6 +498,12 @@ def eval_policy(
                 all_episode_drift.append(ep_drift_by_chunk)
             print(f"[Drift] batch {batch_ix}: {drift_data.shape[0]} eps, total: {len(all_episode_drift)}")
 
+        # 收集 z1/z2 嵌入用于模态对齐分析
+        if "z1_embeddings" in rollout_data:
+            all_z1_embeddings.append(rollout_data["z1_embeddings"])
+        if "z2_embeddings" in rollout_data:
+            all_z2_embeddings.append(rollout_data["z2_embeddings"])
+
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
             this_episode_data = _compile_episode_data(
@@ -620,7 +634,297 @@ def eval_policy(
     if max_episodes_rendered > 0:
         info["video_paths"] = video_paths
 
+    # ── 模态对齐指标计算（retrieval / CKA / similarity / t-SNE） ──────────────────
+    if all_z1_embeddings and all_z2_embeddings:
+        try:
+            z1_all = torch.cat(all_z1_embeddings, dim=0).float().numpy()
+            z2_all = torch.cat(all_z2_embeddings, dim=0).float().numpy()
+            # 保存目录：与视频同级，命名为 modal_alignment
+            modal_save_dir = (videos_dir.parent / "modal_alignment") if videos_dir is not None else None
+            # 多任务时 videos_dir 为 .../videos/<task_group>_<task_id>，用 name 作为 tag，使 t-SNE 文件名带任务信息（如 modal_alignment_tsne_libero_10_0.png）
+            task_tag = (videos_dir.name if videos_dir.name != "videos" else "") if videos_dir is not None else ""
+            modal_metrics = compute_modal_alignment_metrics(
+                z1_all,
+                z2_all,
+                save_dir=modal_save_dir,
+                topk=(1, 5, 10),
+                tag=task_tag,
+            )
+            info["aggregated"]["modal_alignment"] = modal_metrics
+        except Exception as exc:
+            logging.warning(f"[Modal-Align] 指标计算失败: {exc}")
+
     return info
+
+
+def compute_modal_alignment_metrics(
+    z1: "np.ndarray",
+    z2: "np.ndarray",
+    save_dir: Path | None = None,
+    topk: tuple[int, ...] = (1, 5, 10),
+    tsne_perplexity: float = 30.0,
+    max_samples: int = 2000,
+    tag: str = "",
+) -> dict:
+    """计算 z1（观测模态）与 z2（动作模态）之间的对齐指标。
+
+    指标包括：
+    - Retrieval Recall@K（z1→z2 和 z2→z1 双向检索）
+    - Linear CKA（Centered Kernel Alignment，度量表示空间相似度）
+    - Mean Cosine Similarity（成对余弦相似度均值）
+    - AUC-ROC（ITM 二分类：正对 vs 负对）
+    - Kendall τ / Spearman（排序一致性）
+    - 有效维度（表示空间利用率）
+    - mAP（Mean Average Precision）
+    - 正负样本相似度分布（均值、标准差、gap 及直方图）
+    - t-SNE 与正负相似度分布可视化（保存为 PNG 图片）
+
+    Args:
+        z1: 观测嵌入，shape [N, D]
+        z2: 动作嵌入，shape [N, D]
+        save_dir: 图片保存目录；为 None 时跳过可视化
+        topk: Recall@K 中的 K 值列表
+        tsne_perplexity: t-SNE perplexity 参数
+        max_samples: 计算指标时最大采样数（超出则随机下采样）
+        tag: 日志前缀标签
+    """
+    prefix = f"[Modal-Align{'-' + tag if tag else ''}]"
+    N = z1.shape[0]
+    if N < 2:
+        logging.warning(f"{prefix} 样本数不足（N={N}），跳过模态对齐指标计算")
+        return {"n_samples": N}
+
+    metrics: dict = {"n_samples": N}
+
+    # 下采样（超大样本集）
+    rng = np.random.default_rng(42)
+    if N > max_samples:
+        idx = rng.choice(N, max_samples, replace=False)
+        z1_s, z2_s = z1[idx], z2[idx]
+    else:
+        z1_s, z2_s = z1.copy(), z2.copy()
+
+    n = z1_s.shape[0]
+
+    # L2 归一化
+    z1_norm = z1_s / (np.linalg.norm(z1_s, axis=1, keepdims=True) + 1e-8)
+    z2_norm = z2_s / (np.linalg.norm(z2_s, axis=1, keepdims=True) + 1e-8)
+
+    # ── 1. 成对余弦相似度 ──────────────────────────────────────
+    cos_sim = (z1_norm * z2_norm).sum(axis=1)
+    metrics["mean_cosine_similarity"] = float(cos_sim.mean())
+    metrics["std_cosine_similarity"] = float(cos_sim.std())
+
+    # ── 2. 检索 Recall@K ──────────────────────────────────────
+    sim_matrix = z1_norm @ z2_norm.T  # [n, n]
+    for k in topk:
+        if k > n:
+            continue
+        top_k = np.argsort(-sim_matrix, axis=1)[:, :k]
+        hit_fwd = np.array([i in top_k[i] for i in range(n)], dtype=float)
+        metrics[f"retrieval_z1_to_z2_recall@{k}"] = float(hit_fwd.mean())
+
+        top_k_rev = np.argsort(-sim_matrix.T, axis=1)[:, :k]
+        hit_rev = np.array([i in top_k_rev[i] for i in range(n)], dtype=float)
+        metrics[f"retrieval_z2_to_z1_recall@{k}"] = float(hit_rev.mean())
+
+    # ── 3. Linear CKA ─────────────────────────────────────────
+    def _linear_cka(X: "np.ndarray", Y: "np.ndarray") -> float:
+        X = X - X.mean(axis=0)
+        Y = Y - Y.mean(axis=0)
+        XtX = X @ X.T
+        YtY = Y @ Y.T
+        hsic_xy = float(np.sum(XtX * YtY)) / (n - 1) ** 2
+        hsic_xx = float(np.sum(XtX * XtX)) / (n - 1) ** 2
+        hsic_yy = float(np.sum(YtY * YtY)) / (n - 1) ** 2
+        return float(hsic_xy / (np.sqrt(hsic_xx * hsic_yy) + 1e-8))
+
+    metrics["linear_cka"] = _linear_cka(z1_norm, z2_norm)
+
+    # ── 4. AUC-ROC（ITM 二分类：正对 vs 负对）────────────────────
+    try:
+        from sklearn.metrics import roc_auc_score
+        labels = np.eye(n, dtype=np.float64).flatten()
+        scores = sim_matrix.astype(np.float64).flatten()
+        metrics["itm_auc_roc"] = float(roc_auc_score(labels, scores))
+    except Exception as e:
+        logging.warning(f"{prefix} AUC-ROC 计算失败: {e}")
+        metrics["itm_auc_roc"] = float("nan")
+
+    # ── 5. 排序一致性：Kendall τ 与 Spearman（每 query 的相似度排序 vs 理想排序）─
+    try:
+        from scipy.stats import spearmanr, kendalltau
+        kendall_list, spearman_list = [], []
+        for i in range(n):
+            pred_scores = sim_matrix[i].astype(np.float64)
+            relevance = (np.arange(n) == i).astype(np.float64)
+            k, _ = kendalltau(pred_scores, relevance)
+            s, _ = spearmanr(pred_scores, relevance)
+            if not np.isnan(k):
+                kendall_list.append(k)
+            if not np.isnan(s):
+                spearman_list.append(s)
+        metrics["ranking_kendall_tau"] = float(np.mean(kendall_list)) if kendall_list else float("nan")
+        metrics["ranking_spearman"] = float(np.mean(spearman_list)) if spearman_list else float("nan")
+    except Exception as e:
+        logging.warning(f"{prefix} Kendall/Spearman 计算失败: {e}")
+        metrics["ranking_kendall_tau"] = float("nan")
+        metrics["ranking_spearman"] = float("nan")
+
+    # ── 6. 表示空间利用率：有效维度 ─────────────────────────────
+    try:
+        def effective_dimension(X: "np.ndarray") -> float:
+            X_c = X - X.mean(axis=0)
+            cov = (X_c.T @ X_c) / (X.shape[0] - 1)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.maximum(eigvals, 0.0)
+            s1, s2 = eigvals.sum(), (eigvals ** 2).sum()
+            return float(s1 ** 2 / (s2 + 1e-12))
+        metrics["effective_dim_z1"] = effective_dimension(z1_norm)
+        metrics["effective_dim_z2"] = effective_dimension(z2_norm)
+    except Exception as e:
+        logging.warning(f"{prefix} 有效维度计算失败: {e}")
+        metrics["effective_dim_z1"] = float("nan")
+        metrics["effective_dim_z2"] = float("nan")
+
+    # ── 7. mAP（Mean Average Precision）────────────────────────
+    try:
+        ap_list = []
+        for i in range(n):
+            rel = (np.arange(n) == i).astype(np.float64)
+            order = np.argsort(-sim_matrix[i])
+            rel_ordered = rel[order]
+            num_rel = int(rel.sum())
+            if num_rel == 0:
+                continue
+            prec_sum, hit = 0.0, 0
+            for k in range(n):
+                if rel_ordered[k] > 0:
+                    hit += 1
+                    prec_sum += hit / (k + 1)
+            ap_list.append(prec_sum / num_rel)
+        metrics["mAP"] = float(np.mean(ap_list)) if ap_list else float("nan")
+    except Exception as e:
+        logging.warning(f"{prefix} mAP 计算失败: {e}")
+        metrics["mAP"] = float("nan")
+
+    # ── 8. 正负样本相似度分布 ──────────────────────────────────
+    pos_sim = np.diag(sim_matrix).astype(np.float64)
+    neg_mask = ~np.eye(n, dtype=bool)
+    neg_sim = sim_matrix[neg_mask].astype(np.float64)
+    metrics["pos_sim_mean"] = float(np.mean(pos_sim))
+    metrics["pos_sim_std"] = float(np.std(pos_sim))
+    metrics["neg_sim_mean"] = float(np.mean(neg_sim))
+    metrics["neg_sim_std"] = float(np.std(neg_sim))
+    metrics["pos_neg_sim_gap"] = float(metrics["pos_sim_mean"] - metrics["neg_sim_mean"])
+
+    # ── 打印摘要 ───────────────────────────────────────────────
+    logging.info(
+        f"{prefix} N={N} | cos_sim={metrics['mean_cosine_similarity']:.4f}±{metrics['std_cosine_similarity']:.4f} | "
+        f"CKA={metrics['linear_cka']:.4f} | AUC-ROC={metrics.get('itm_auc_roc', float('nan')):.4f} | "
+        f"mAP={metrics.get('mAP', float('nan')):.4f} | τ={metrics.get('ranking_kendall_tau', float('nan')):.4f}"
+    )
+    for k in topk:
+        if f"retrieval_z1_to_z2_recall@{k}" in metrics:
+            logging.info(
+                f"{prefix} Recall@{k}: z1→z2={metrics[f'retrieval_z1_to_z2_recall@{k}']:.4f}  "
+                f"z2→z1={metrics[f'retrieval_z2_to_z1_recall@{k}']:.4f}"
+            )
+
+    # ── 4. t-SNE 可视化 ────────────────────────────────────────
+    if save_dir is not None:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from sklearn.manifold import TSNE
+
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            # 限制 t-SNE 样本数（计算较慢）
+            n_tsne = min(n, 500)
+            if n > 500:
+                idx_t = rng.choice(n, n_tsne, replace=False)
+                z1_t = z1_norm[idx_t]
+                z2_t = z2_norm[idx_t]
+            else:
+                z1_t, z2_t = z1_norm, z2_norm
+
+            z_concat = np.concatenate([z1_t, z2_t], axis=0)
+            perp = min(tsne_perplexity, len(z_concat) // 3 - 1)
+            perp = max(perp, 2.0)
+            tsne = TSNE(n_components=2, perplexity=perp, random_state=42, max_iter=1000)
+            z_2d = tsne.fit_transform(z_concat.astype(np.float64))
+
+            z1_2d = z_2d[: len(z1_t)]
+            z2_2d = z_2d[len(z1_t) :]
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+            # 左图：2D t-SNE 散点图
+            ax = axes[0]
+            ax.scatter(z1_2d[:, 0], z1_2d[:, 1], c="steelblue", alpha=0.55, s=12, label="z1 (obs)")
+            ax.scatter(z2_2d[:, 0], z2_2d[:, 1], c="tomato", alpha=0.55, s=12, label="z2 (action)")
+            ax.set_xlabel("t-SNE Dim 1")
+            ax.set_ylabel("t-SNE Dim 2")
+            ax.set_title(f"t-SNE: z1 (obs) vs z2 (action){' — ' + tag if tag else ''}")
+            ax.legend(markerscale=2)
+
+            # 右图：t-SNE Dimension 1 分布直方图（直观展示模态对齐程度）
+            ax = axes[1]
+            ax.hist(z1_2d[:, 0], bins=30, alpha=0.6, color="steelblue", label="z1 (obs)", density=True)
+            ax.hist(z2_2d[:, 0], bins=30, alpha=0.6, color="tomato", label="z2 (action)", density=True)
+            ax.set_xlabel("t-SNE Dimension 1")
+            ax.set_ylabel("Density")
+            ax.set_title(
+                f"t-SNE Dimension 1 Distribution\n"
+                f"CKA={metrics['linear_cka']:.3f}  "
+                f"cos_sim={metrics['mean_cosine_similarity']:.3f}"
+            )
+            ax.legend()
+
+            plt.tight_layout()
+            fname = f"modal_alignment_tsne{'_' + tag if tag else ''}.png"
+            plot_path = save_dir / fname
+            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            metrics["tsne_plot_path"] = str(plot_path)
+            logging.info(f"{prefix} t-SNE 图已保存至 {plot_path}")
+
+            # 正负样本相似度分布直方图
+            fig2, ax2 = plt.subplots(figsize=(8, 5))
+            ax2.hist(
+                pos_sim,
+                bins=min(50, max(10, n // 20)),
+                alpha=0.7,
+                color="green",
+                label=f"正对 (mean={metrics['pos_sim_mean']:.4f}, std={metrics['pos_sim_std']:.4f})",
+                density=True,
+            )
+            ax2.hist(
+                neg_sim,
+                bins=min(80, max(20, neg_sim.size // 100)),
+                alpha=0.5,
+                color="red",
+                label=f"负对 (mean={metrics['neg_sim_mean']:.4f}, std={metrics['neg_sim_std']:.4f})",
+                density=True,
+            )
+            ax2.set_xlabel("余弦相似度")
+            ax2.set_ylabel("密度")
+            ax2.set_title(f"正负样本相似度分布 (gap={metrics['pos_neg_sim_gap']:.4f})" + (f" — {tag}" if tag else ""))
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            plt.tight_layout()
+            sim_dist_path = save_dir / f"modal_alignment_sim_dist{'_' + tag if tag else ''}.png"
+            plt.savefig(sim_dist_path, dpi=150, bbox_inches="tight")
+            plt.close(fig2)
+            metrics["sim_dist_plot_path"] = str(sim_dist_path)
+            logging.info(f"{prefix} 正负相似度分布图已保存至 {sim_dist_path}")
+        except Exception as e:
+            logging.warning(f"{prefix} t-SNE 可视化失败: {e}")
+
+    return metrics
 
 
 def _compile_episode_data(
@@ -757,6 +1061,7 @@ class TaskMetrics(TypedDict):
     drift_by_chunk: list[dict]               # per-episode drift grouped by chunk
     drift_means: list[float]                 # per-episode drift mean (cosine distance)
     drift_maxs: list[float]                  # per-episode drift max
+    modal_alignment: dict                    # 模态对齐指标（retrieval/CKA/similarity/tsne_plot_path）
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths",
@@ -829,6 +1134,8 @@ def eval_one(
         if valid_drift_means:
             print(f"[Drift] eval_one: {len(per_episode)} eps, drift mean range: [{min(valid_drift_means):.4f}, {max(valid_drift_means):.4f}]")
 
+    modal_alignment = task_result.get("aggregated", {}).get("modal_alignment", {})
+
     return TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
@@ -845,6 +1152,7 @@ def eval_one(
         drift_by_chunk=drift_by_chunk_list,
         drift_means=drift_means_list,
         drift_maxs=drift_maxs_list,
+        modal_alignment=modal_alignment,
     )
 
 
@@ -1012,6 +1320,26 @@ def eval_policy_all(
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
     }
+
+    # 汇总各任务的模态对齐标量指标（cos_sim / CKA / Recall@K）
+    all_modal = [
+        info["metrics"].get("modal_alignment", {})
+        for info in per_task_infos
+        if info["metrics"].get("modal_alignment")
+    ]
+    if all_modal:
+        scalar_keys = [k for k in all_modal[0] if isinstance(all_modal[0][k], float | int)]
+        overall_modal: dict = {}
+        for k in scalar_keys:
+            vals = [m[k] for m in all_modal if k in m]
+            if vals:
+                overall_modal[k] = float(np.nanmean(vals))
+        # 保留第一个任务的 t-SNE 图路径作为代表
+        for m in all_modal:
+            if "tsne_plot_path" in m:
+                overall_modal["tsne_plot_path"] = m["tsne_plot_path"]
+                break
+        overall_agg["modal_alignment"] = overall_modal
 
     return {
         "per_task": per_task_infos,

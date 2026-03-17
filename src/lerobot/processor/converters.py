@@ -188,6 +188,22 @@ def _extract_complementary_data(
     # Extract CMP contrastive learning neg sample fields (neg_action, neg_future_*, etc.)
     neg_keys = {k: v for k, v in batch.items() if k.startswith("neg_")}
 
+    # Apply rename_map to neg_future_* keys so downstream policy finds them under
+    # policy-expected names (e.g. neg_future_observation.images.base_camera ->
+    # neg_future_observation.images.image)
+    if rename_map:
+        renamed_neg = {}
+        for key, val in neg_keys.items():
+            if key.startswith("neg_future_"):
+                suffix = key[len("neg_future_") :]
+                if suffix in rename_map:
+                    renamed_neg["neg_future_" + rename_map[suffix]] = val
+                else:
+                    renamed_neg[key] = val
+            else:
+                renamed_neg[key] = val
+        neg_keys = renamed_neg
+
     return {**pad_keys, **task_key, **index_key, **task_index_key, **action_context_keys, **neg_keys}
 
 

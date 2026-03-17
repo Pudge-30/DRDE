@@ -2774,7 +2774,18 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            try:
+                missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            except Exception as load_err:
+                # When strict=True and checkpoint lacks CMP modules (cls_head, itm_head, etc.), retry with strict=False
+                if strict:
+                    print(
+                        f"Strict load failed ({load_err}). Retrying with strict=False to load matching keys "
+                        "(missing CMP modules will remain randomly initialized)."
+                    )
+                    missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+                else:
+                    raise
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -2798,6 +2809,8 @@ class PI05Policy(PreTrainedPolicy):
 
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
+            elif missing_keys:
+                print("Loaded matching keys; remaining missing keys (e.g. CMP modules) left at random init.")
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
@@ -3019,6 +3032,10 @@ class PI05Policy(PreTrainedPolicy):
         self._drift_segment_ids: list[int] = []           # 对应 segment index
         self._replan_count: int = 0                        # drift 触发 replan 的次数
         self._force_replan_next: bool = False                 # 自适应步长：中等 drift 触发的延迟 replan 标志
+
+        # 模态对齐分析：z1(obs) 和 z2(action) 嵌入
+        self._z1_embeddings: list[Tensor] = []  # z1 观测嵌入，每次生成新 chunk 时 [B, 512]
+        self._z2_embeddings: list[Tensor] = []  # z2 动作嵌入，每次生成新 chunk 时 [B, 512]
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -3483,23 +3500,21 @@ class PI05Policy(PreTrainedPolicy):
             if len(self._itm_scores) % 10 == 1:
                 print(f"[ITM] chunk #{len(self._itm_scores)}, score: {itm_score.mean().item():.4f} (batch mean)")
 
-            # ForwardModel: 预测执行 action[0:k] 后的 obs 嵌入
-            if (hasattr(self.model, 'forward_model') and self.model.forward_model is not None
-                    and z1 is not None):
+            # 计算 z2 用于模态对齐分析和 ForwardModel（当 z1 有效时）
+            if z1 is not None:
                 origin_action_dim = self.config.output_features[ACTION].shape[0]
                 z2_raw = self.model.content_attention(actions[:, :attn_act_len, :origin_action_dim])
-                z2 = _clamp_embedding_norm(self.model.proj_z2(z2_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
-                self._predicted_z3 = self.model.forward_model(z1, z2).detach()
+                z2 = _clamp_embedding_norm(
+                    self.model.proj_z2(z2_raw).to(dtype=torch.float32),
+                    self.config.embedding_max_norm,
+                )
+                # 存储 z1/z2 嵌入用于模态对齐分析
+                self._z1_embeddings.append(z1.detach().cpu())
+                self._z2_embeddings.append(z2.detach().cpu())
 
-        return actions
-
-            # ForwardModel: 预测执行 action[0:k] 后的 obs 嵌入
-            if (hasattr(self.model, 'forward_model') and self.model.forward_model is not None
-                    and z1 is not None):
-                origin_action_dim = self.config.output_features[ACTION].shape[0]
-                z2_raw = self.model.content_attention(actions[:, :attn_act_len, :origin_action_dim])
-                z2 = _clamp_embedding_norm(self.model.proj_z2(z2_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
-                self._predicted_z3 = self.model.forward_model(z1, z2).detach()
+                # ForwardModel: 预测执行 action[0:k] 后的 obs 嵌入
+                if hasattr(self.model, 'forward_model') and self.model.forward_model is not None:
+                    self._predicted_z3 = self.model.forward_model(z1, z2).detach()
 
         return actions
 
@@ -3662,19 +3677,21 @@ class PI05Policy(PreTrainedPolicy):
                         return_internals=True)
                 else:
                     bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
+                bc_loss = bc_losses[:, :, :original_action_dim].mean()
 
-                # 2) CMP：三元因果链对比损失 + 前向动力学项
-                cmp_losses, cmp_loss_info = self.model.forward_cmp(
-                    images, img_masks, tokens, masks,
-                    future_images=future_images, future_img_masks=future_img_masks,
-                    neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
-                    neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
-                    neg_future_valid=neg_future_valid,
-                    neg_action_distance=neg_action_distance,
-                )
-                cmp_loss = 0.1 * cmp_losses.mean()
-                # 3) 总损失：BC + 缩放后的 CMP
-                losses = bc_loss + cmp_loss
+                if not bc_only:
+                    # 2) CMP：三元因果链对比损失 + 前向动力学项
+                    cmp_losses, cmp_loss_info = self.model.forward_cmp(
+                        images, img_masks, tokens, masks,
+                        future_images=future_images, future_img_masks=future_img_masks,
+                        neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
+                        neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
+                        neg_future_valid=neg_future_valid,
+                        neg_action_distance=neg_action_distance,
+                    )
+                    cmp_loss = 0.1 * cmp_losses.mean()
+                    # 3) 总损失：BC + 缩放后的 CMP
+                    losses = bc_loss + cmp_loss
 
                     loss_dict = {
                         "loss": losses.item(),

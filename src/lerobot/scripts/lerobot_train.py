@@ -195,7 +195,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
     if hasattr(cfg.policy, "attn_act_len") and cfg.policy.attn_act_len > 0:
         dataset.neg_action_config = {
-            "chunk_size": cfg.policy.chunk_size,
+            "chunk_size": getattr(cfg.policy, "neg_chunk_size", cfg.policy.chunk_size),
             "att_len": cfg.policy.attn_act_len,
         }
 
@@ -434,10 +434,36 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
+                # 记录模态对齐标量指标
+                modal_alignment = aggregated.pop("modal_alignment", {})
+                if modal_alignment:
+                    logging.info(
+                        f"[Modal-Align] cos_sim={modal_alignment.get('mean_cosine_similarity', float('nan')):.4f}  "
+                        f"CKA={modal_alignment.get('linear_cka', float('nan')):.4f}  "
+                        f"R@1(z1→z2)={modal_alignment.get('retrieval_z1_to_z2_recall@1', float('nan')):.4f}"
+                    )
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    # 追加模态对齐标量指标到 wandb
+                    if modal_alignment:
+                        modal_scalars = {
+                            f"modal/{k}": v for k, v in modal_alignment.items()
+                            if isinstance(v, float | int)
+                        }
+                        wandb_log_dict.update(modal_scalars)
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    # 上传 t-SNE 图
+                    tsne_path = modal_alignment.get("tsne_plot_path")
+                    if tsne_path:
+                        try:
+                            import wandb as _wandb
+                            wandb_logger.run.log(
+                                {"eval/modal_alignment_tsne": _wandb.Image(tsne_path)},
+                                step=step,
+                            )
+                        except Exception as _e:
+                            logging.warning(f"[Modal-Align] wandb 图片上传失败: {_e}")
 
             accelerator.wait_for_everyone()
 

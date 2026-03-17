@@ -1620,7 +1620,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             if worker_info is not None:
                 worker_info.dataset.neg_action_config = _neg_action_cfg
 
-    def create_dataloader(dataset, online=False):
+    def create_dataloader(dataset, online=False, success_only=False, min_episode_index=None):
         """创建 DataLoader。
 
         Args:
@@ -1652,7 +1652,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             sampler = None
 
         # online dataset 不需要 neg_action_config（CMP 负样本仅用于离线训练）
-        init_fn = _offline_worker_init_fn if not online else None
+        init_fn = _worker_init_fn if not online else None
 
         return torch.utils.data.DataLoader(
             dataset,
@@ -1663,7 +1663,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             pin_memory=device.type == "cuda",
             drop_last=False,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
-            worker_init_fn=_worker_init_fn,
+            worker_init_fn=init_fn,
         )
 
     # Create dataloader for offline dataset (if exists)
