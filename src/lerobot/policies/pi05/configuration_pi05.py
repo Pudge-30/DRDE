@@ -109,6 +109,19 @@ class PI05Config(PreTrainedConfig):
     # Only success episodes from current iteration are used
     feature_only_online: bool = False
 
+    # EMA decay for anchor update (1.0 = fixed anchor, no update)
+    anchor_ema_decay: float = 0.995
+
+    # Maximum successful episodes in replay pool (0 = unlimited)
+    max_replay_episodes: int = 50
+
+    # RECAP fusion: directional feature_loss
+    feature_margin_neg: float = 0.3    # negative loss margin: ReLU(margin - MSE)
+    feature_neg_weight: float = 0.0    # negative loss weight in combined feature_loss (0=off)
+    quality_embed_dim: int = 128       # quality embedding dimension for RECAP conditioning
+    quality_lr: float = 1e-3           # separate lr for quality conditioning params (0=use same as expert)
+    max_failure_episodes: int = 20     # maximum failure episodes in replay pool
+
 
     def __post_init__(self):
         super().__post_init__()
