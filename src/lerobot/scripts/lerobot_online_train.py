@@ -45,6 +45,7 @@ lerobot-online-train \
 import logging
 import time
 from contextlib import nullcontext
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from pprint import pformat
@@ -102,17 +103,22 @@ class FillMissingActionContextProcessor:
     当这些字段缺失时，用零填充并将 valid 标志设为 False。
     """
 
-    def __init__(self, action_dim: int, prev_steps: int = 10, pred_steps: int = 10):
+    def __init__(self, action_dim: int, prev_steps: int = 10, pred_steps: int = 10,
+                 chunk_size: int = 50, max_action_dim: int = 32):
         """初始化 Processor。
 
         Args:
             action_dim: 动作维度
             prev_steps: prev_actions 的步数（默认10）
             pred_steps: pred_action 的步数（默认10）
+            chunk_size: chunk 大小（默认50）
+            max_action_dim: 最大动作维度（默认32）
         """
         self.action_dim = action_dim
         self.prev_steps = prev_steps
         self.pred_steps = pred_steps
+        self.chunk_size = chunk_size
+        self.max_action_dim = max_action_dim
 
     def __call__(self, batch: dict) -> dict:
         """处理 batch，为缺失字段填充默认值。
@@ -156,6 +162,13 @@ class FillMissingActionContextProcessor:
                 batch_size, 1, device=device, dtype=torch.bool
             )
 
+        # 检查 chunk_noise 是否存在或为 None
+        if 'chunk_noise' not in batch or batch.get('chunk_noise') is None:
+            batch['chunk_noise'] = torch.zeros(
+                batch_size, self.chunk_size, self.max_action_dim,
+                device=device, dtype=torch.float32
+            )
+
         return batch
 
 
@@ -168,15 +181,18 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
     """
 
     def __init__(self, dataset: LeRobotDataset, shuffle: bool = True,
-                 success_only: bool = False, min_episode_index: int | None = None):
+                 success_only: bool = False, min_episode_index: int | None = None,
+                 allowed_episodes: set[int] | None = None):
         super().__init__()
         self.dataset = dataset
         self.shuffle = shuffle
         self.success_only = success_only
         self.min_episode_index = min_episode_index
+        self.allowed_episodes = allowed_episodes
         self._valid_indices = None
         self._cached_num_frames = 0
         self._cached_min_ep = min_episode_index
+        self._cached_allowed_eps = frozenset(allowed_episodes) if allowed_episodes is not None else None
 
     def _find_valid_indices(self) -> list[int]:
         """高效地查找所有 actions_seq_valid=True 的帧索引。"""
@@ -209,19 +225,27 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
             # 基础过滤：actions_seq_valid=True
             valid_mask = actions_seq_valid.astype(bool)
 
-            # 追加过滤：只用当前 iteration 的 episodes
-            if self.min_episode_index is not None and 'episode_index' in hf_dataset.column_names:
+            # 回放池模式：allowed_episodes 替代 success_only + min_episode_index
+            if self.allowed_episodes is not None and 'episode_index' in hf_dataset.column_names:
                 episode_indices = np.array(hf_dataset['episode_index'])
                 if episode_indices.ndim == 2:
                     episode_indices = episode_indices.squeeze(-1)
-                valid_mask &= (episode_indices >= self.min_episode_index)
+                allowed_arr = np.array(list(self.allowed_episodes))
+                valid_mask &= np.isin(episode_indices, allowed_arr)
+            else:
+                # 追加过滤：只用当前 iteration 的 episodes
+                if self.min_episode_index is not None and 'episode_index' in hf_dataset.column_names:
+                    episode_indices = np.array(hf_dataset['episode_index'])
+                    if episode_indices.ndim == 2:
+                        episode_indices = episode_indices.squeeze(-1)
+                    valid_mask &= (episode_indices >= self.min_episode_index)
 
-            # 追加过滤：只用成功 episodes
-            if self.success_only and 'episode_success' in hf_dataset.column_names:
-                episode_success = np.array(hf_dataset['episode_success'])
-                if episode_success.ndim == 2:
-                    episode_success = episode_success.squeeze(-1)
-                valid_mask &= (episode_success > 0.5)
+                # 追加过滤：只用成功 episodes
+                if self.success_only and 'episode_success' in hf_dataset.column_names:
+                    episode_success = np.array(hf_dataset['episode_success'])
+                    if episode_success.ndim == 2:
+                        episode_success = episode_success.squeeze(-1)
+                    valid_mask &= (episode_success > 0.5)
 
             valid_indices = np.where(valid_mask)[0].tolist()
         else:
@@ -240,12 +264,15 @@ class ValidActionContextSampler(torch.utils.data.Sampler):
     def valid_indices(self) -> list[int]:
         """获取有效帧索引（带缓存）。"""
         current_num_frames = len(self.dataset)
+        current_allowed = frozenset(self.allowed_episodes) if self.allowed_episodes is not None else None
         if (self._valid_indices is None
                 or self._cached_num_frames != current_num_frames
-                or self._cached_min_ep != self.min_episode_index):
+                or self._cached_min_ep != self.min_episode_index
+                or self._cached_allowed_eps != current_allowed):
             self._valid_indices = self._find_valid_indices()
             self._cached_num_frames = current_num_frames
             self._cached_min_ep = self.min_episode_index
+            self._cached_allowed_eps = current_allowed
         return self._valid_indices
 
     def __iter__(self):
@@ -418,6 +445,7 @@ def rollout(
     all_prev_actions = []
     all_pred_actions = []
     all_actions_seq_valid = []
+    all_chunk_noise = []
 
     step = 0
     # Keep track of which environments are done.
@@ -449,6 +477,7 @@ def rollout(
             all_prev_actions.append(ctx['prev_actions'])
             all_pred_actions.append(ctx['pred_action'])
             all_actions_seq_valid.append(ctx['actions_seq_valid'])
+            all_chunk_noise.append(ctx.get('chunk_noise'))
 
         with torch.inference_mode():
             action = policy.select_action(observation)
@@ -547,6 +576,11 @@ def rollout(
         if len(valid_flags) > 0:
             # Stack along sequence dimension: [batch, sequence]
             ret["actions_seq_valid"] = torch.stack(valid_flags, dim=1)
+
+        valid_chunk_noise = [n for n in all_chunk_noise if n is not None]
+        if len(valid_chunk_noise) > 0:
+            # Stack along sequence dimension: [batch, sequence, chunk_size, max_action_dim]
+            ret["chunk_noise"] = torch.stack(valid_chunk_noise, dim=1)
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -680,6 +714,26 @@ def update_policy(
 
             print(f"{'='*60}\n")
 
+    # Expert 梯度 norm 诊断（feature_loss 是否能传梯度到 Expert）
+    if bc_only and output_dict.get("feature_loss", 0) > 0:
+        unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+        expert_module = None
+        if hasattr(unwrapped, 'model') and hasattr(unwrapped.model, 'paligemma_with_expert'):
+            expert_module = unwrapped.model.paligemma_with_expert.gemma_expert
+        if expert_module is not None:
+            expert_grad_norms = []
+            expert_none_count = 0
+            for p in expert_module.parameters():
+                if p.grad is not None:
+                    expert_grad_norms.append(p.grad.norm().item())
+                else:
+                    expert_none_count += 1
+            if expert_grad_norms:
+                output_dict["expert_grad_norm"] = sum(expert_grad_norms) / len(expert_grad_norms)
+            else:
+                output_dict["expert_grad_norm"] = -1.0  # 全部 None，区分于 0.0
+            output_dict["expert_grad_none_ratio"] = expert_none_count / max(1, expert_none_count + len(expert_grad_norms))
+
     # Clip gradients if specified
     # 根据 online/use_online_optimizer 模式选择需要 clip 的参数
     if (online or use_online_optimizer) and online_optimizer is not None:
@@ -712,6 +766,8 @@ def update_policy(
     if online:
         train_metrics.feature_loss = output_dict["feature_loss"]
         train_metrics.l2_actions = output_dict["l2_actions"]
+        if "avg_pos_weight" in output_dict:
+            train_metrics.avg_pos_weight = output_dict["avg_pos_weight"]
     else:
         # For regular training, record loss
         train_metrics.loss = output_dict["loss"]
@@ -724,6 +780,14 @@ def update_policy(
             train_metrics.l2_actions = output_dict["l2_actions"]
         if "anchor_loss" in output_dict:
             train_metrics.anchor_loss = output_dict["anchor_loss"]
+        if "avg_pos_weight" in output_dict:
+            train_metrics.avg_pos_weight = output_dict["avg_pos_weight"]
+        # Feature loss diagnostics
+        for diag_key in ["fl_raw_mse", "fl_active_ratio", "fl_cosine_sim", "fl_gen_norm", "fl_pred_norm",
+                         "expert_grad_norm", "expert_grad_none_ratio",
+                         "fl_max", "fl_std", "fl_bc_ratio", "bc_max", "bc_std"]:
+            if diag_key in output_dict:
+                setattr(train_metrics, diag_key, output_dict[diag_key])
 
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = current_optimizer.param_groups[0]["lr"]
@@ -819,7 +883,7 @@ def collect_episodes(
         )
 
         if return_action_context:
-            for key in ["prev_actions", "pred_action", "actions_seq_valid"]:
+            for key in ["prev_actions", "pred_action", "actions_seq_valid", "chunk_noise"]:
                 if key in rollout_data:
                     # # 诊断日志：打印 rollout_data 中的形状
                     # logging.info(f"[DEBUG collect_episodes] rollout_data['{key}'] shape: {rollout_data[key].shape}")
@@ -901,7 +965,7 @@ def add_episodes_to_dataset(
 
     if not episode_data:
         logging.warning("episode_data is empty, nothing to add to dataset")
-        return
+        return 0, {}
 
     # Get total number of frames
     total_frames = len(episode_data[ACTION])
@@ -1030,6 +1094,13 @@ def add_episodes_to_dataset(
                 pred_action = pred_action.cpu()
             frame_dict["pred_action"] = pred_action
 
+        # chunk_noise: rollout 时生成 chunk 所用的 noise
+        if "chunk_noise" in episode_data and "chunk_noise" in online_dataset.features:
+            chunk_noise = episode_data["chunk_noise"][frame_idx]
+            if isinstance(chunk_noise, torch.Tensor):
+                chunk_noise = chunk_noise.cpu()
+            frame_dict["chunk_noise"] = chunk_noise
+
         if "actions_seq_valid" in episode_data and "actions_seq_valid" in online_dataset.features:
             actions_seq_valid_raw = episode_data["actions_seq_valid"][frame_idx]
 
@@ -1129,6 +1200,8 @@ def add_episodes_to_dataset(
     logging.info(f"[PERF]   save_episode time: {save_episode_time:.3f}s ({100 * save_episode_time / total_time:.1f}%)")
     logging.info(f"[PERF]   Avg time per frame: {1000 * total_time / total_frames:.2f}ms")
     logging.info(f"Added {total_frames} frames to dataset")
+
+    return total_frames, episode_success_map
 
 
 @parser.wrap()
@@ -1349,9 +1422,18 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     "shape": (1,),
                     "names": None,
                 }
+                # chunk_noise: rollout 时生成 chunk 所用的 noise，训练时复用以消除方差
+                chunk_size = getattr(cfg.policy, 'chunk_size', 50)
+                max_action_dim = getattr(cfg.policy, 'max_action_dim', 32)
+                features["chunk_noise"] = {
+                    "dtype": "float32",
+                    "shape": (chunk_size, max_action_dim),
+                    "names": ["chunk_step", "action_dim"],
+                }
                 logging.info(
                     f"Added action context features: prev_actions shape={(prev_steps, action_dim)}, "
-                    f"pred_action shape={(pred_steps, action_dim)}, episode_success shape=(1,)"
+                    f"pred_action shape={(pred_steps, action_dim)}, episode_success shape=(1,), "
+                    f"chunk_noise shape=({chunk_size}, {max_action_dim})"
                 )
 
                 # Create empty online dataset
@@ -1449,6 +1531,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"  part_layer_num:        {policy.config.part_layer_num}")
         logging.info(f"  cmp_pretrain:          {policy.config.cmp_pretrain}")
         logging.info(f"  anchor_weight:         {getattr(policy.config, 'anchor_weight', 0.0)}")
+        logging.info(f"  quality_lr:            {getattr(policy.config, 'quality_lr', 0.0)}")
         logging.info("=" * 60)
 
     # Initialize anchor Expert for velocity distillation (before accelerator.prepare)
@@ -1541,14 +1624,19 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     action_dim = training_dataset.meta.features[ACTION]["shape"][-1]
     # Get attn_act_len from policy config (defaults to 10 for backward compatibility)
     attn_act_len = getattr(cfg.policy, 'attn_act_len', 10)
+    chunk_size = getattr(cfg.policy, 'chunk_size', 50)
+    max_action_dim = getattr(cfg.policy, 'max_action_dim', 32)
     fill_action_context_processor = FillMissingActionContextProcessor(
         action_dim=action_dim,
         prev_steps=attn_act_len,
         pred_steps=attn_act_len,
+        chunk_size=chunk_size,
+        max_action_dim=max_action_dim,
     )
     if is_main_process:
         logging.info(
-            f"Created FillMissingActionContextProcessor with action_dim={action_dim}, attn_act_len={attn_act_len}")
+            f"Created FillMissingActionContextProcessor with action_dim={action_dim}, attn_act_len={attn_act_len}, "
+            f"chunk_size={chunk_size}, max_action_dim={max_action_dim}")
 
     if is_main_process:
         logging.info("Creating optimizers and schedulers for online and offline training")
@@ -1559,7 +1647,21 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     offline_params = policy.get_offline_optim_params()
 
     # 创建 online 优化器和调度器
-    online_optimizer = cfg.optimizer.build(online_params)
+    # 如果 quality_lr > 0，使用分离学习率：Expert 用 optimizer_lr，Quality 用 quality_lr
+    quality_lr = getattr(policy.config, 'quality_lr', 0.0)
+    if quality_lr > 0 and hasattr(policy, 'get_online_optim_param_groups'):
+        expert_lr = policy.config.optimizer_lr
+        param_groups = policy.get_online_optim_param_groups(expert_lr, quality_lr)
+        online_optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=getattr(policy.config, 'optimizer_betas', (0.9, 0.999)),
+            eps=getattr(policy.config, 'optimizer_eps', 1e-8),
+            weight_decay=getattr(policy.config, 'optimizer_weight_decay', 1e-10),
+        )
+        if is_main_process:
+            logging.info(f"  [Optimizer] Separate lr: Expert={expert_lr}, Quality={quality_lr}")
+    else:
+        online_optimizer = cfg.optimizer.build(online_params)
     online_lr_scheduler = cfg.scheduler.build(online_optimizer, cfg.steps) if cfg.scheduler is not None else None
 
     # 创建 offline 优化器和调度器
@@ -1637,7 +1739,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             if worker_info is not None:
                 worker_info.dataset.neg_action_config = _neg_action_cfg
 
-    def create_dataloader(dataset, online=False, success_only=False, min_episode_index=None):
+    def create_dataloader(dataset, online=False, success_only=False, min_episode_index=None,
+                          allowed_episodes: set[int] | None = None):
         """创建 DataLoader。
 
         Args:
@@ -1645,6 +1748,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             online: 是否使用 ValidActionContextSampler（仅采样 actions_seq_valid=True 的帧）
             success_only: 是否只采样成功 episode 的帧
             min_episode_index: 只采样 >= 此 episode index 的帧（当前 iteration 数据）
+            allowed_episodes: 回放池模式 — 只采样这些 episode 的帧（替代 success_only + min_episode_index）
         """
 
         if online:
@@ -1654,6 +1758,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 shuffle=True,
                 success_only=success_only,
                 min_episode_index=min_episode_index,
+                allowed_episodes=allowed_episodes,
             )
         elif hasattr(cfg.policy, "drop_n_last_frames"):
             shuffle = False
@@ -1750,6 +1855,20 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
         "anchor_loss": AverageMeter("anchor_loss", ":.3f"),
+        "avg_pos_weight": AverageMeter("pos_w", ":.3f"),
+        "fl_raw_mse": AverageMeter("raw_mse", ":.4f"),
+        "fl_active_ratio": AverageMeter("active%", ":.2f"),
+        "fl_cosine_sim": AverageMeter("cos_sim", ":.3f"),
+        "fl_gen_norm": AverageMeter("gen_n", ":.2f"),
+        "fl_pred_norm": AverageMeter("pred_n", ":.2f"),
+        "expert_grad_norm": AverageMeter("exp_gn", ":.6f"),
+        "expert_grad_none_ratio": AverageMeter("gn_none%", ":.2f"),
+        # 增强诊断 metrics
+        "fl_max": AverageMeter("fl_max", ":.3f"),
+        "fl_std": AverageMeter("fl_std", ":.3f"),
+        "fl_bc_ratio": AverageMeter("fl/bc", ":.2f"),
+        "bc_max": AverageMeter("bc_max", ":.3f"),
+        "bc_std": AverageMeter("bc_std", ":.3f"),
     }
 
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -1772,6 +1891,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     feature_only = getattr(policy.config, 'feature_only_online', False)
     if is_main_process and feature_only:
         logging.info("[Feature-Only] Mode enabled: no bc_loss, every step = feature_loss + anchor_loss")
+
+    # Success + Failure episode replay pools (cross-iteration accumulation)
+    max_replay = getattr(policy.config, 'max_replay_episodes', 50)
+    max_failure = getattr(policy.config, 'max_failure_episodes', 20)
+    success_episode_pool = deque(maxlen=max_replay if max_replay > 0 else None)
+    failure_episode_pool = deque(maxlen=max_failure if max_failure > 0 else None)
+    latest_rollout_success = -1  # updated after each rollout
+    if is_main_process and feature_only:
+        logging.info(f"[Feature-Only] Replay pools initialized "
+                     f"(success_max={max_replay}, failure_max={max_failure})")
 
     # Main online training loop
     for iteration in range(cfg.online.n_iterations):
@@ -1817,6 +1946,9 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                                     f"Collecting {n_episodes_this_task} episodes from {suite_name} task {task_id}"
                                 )
 
+                            # Diverse seeds per iteration: avoid replay pool overfitting to fixed initial conditions
+                            iter_seed = (cfg.seed + iteration * cfg.online.collect_episodes_per_iteration
+                                         if cfg.seed is not None else None)
                             task_episode_data = collect_episodes(
                                 env=env,
                                 batch_size=env.num_envs,
@@ -1826,7 +1958,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                                 preprocessor=collect_preprocessor,  # Use collect_preprocessor (without normalizer)
                                 postprocessor=collect_postprocessor,  # Use collect_postprocessor (without unnormalizer)
                                 n_episodes=n_episodes_this_task,
-                                start_seed=cfg.seed if cfg.seed is not None else None,
+                                start_seed=iter_seed,
                                 start_episode_index=current_ep_idx,
                                 return_action_context=True,  # Collect action context for online training
                             )
@@ -1864,13 +1996,48 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
             old_data_files = set(str(f) for f in data_dir.glob("*/*.parquet")) if data_dir.exists() else set()
 
             phase2_start = _time.time()
+            iteration_success_map = {}
             if is_main_process:
                 logging.info("Adding collected episodes to online dataset")
-                add_episodes_to_dataset(online_dataset, episode_data)
+                _total_frames, iteration_success_map = add_episodes_to_dataset(online_dataset, episode_data)
             phase2_time = _time.time() - phase2_start
             if is_main_process:
                 logging.info(f"[PERF] Phase 2 (add_episodes_to_dataset): {phase2_time:.3f}s")
                 logging.info(f"[PERF] Total data collection + dataset update: {phase1_time + phase2_time:.3f}s")
+
+            # Track rollout success for wandb (will be logged with training steps)
+            if is_main_process and iteration_success_map:
+                latest_rollout_success = sum(1 for v in iteration_success_map.values() if v > 0.5)
+                # Per-task success history tracking (episode order = task order: ep0=task0, ep1=task1, ...)
+                if not hasattr(online_train_main, '_task_history'):
+                    online_train_main._task_history = {}  # task_id -> [success_list]
+                sorted_eps = sorted(iteration_success_map.keys())
+                for i, ep_idx in enumerate(sorted_eps):
+                    task_id = i % total_tasks  # within each iteration, episodes are collected in task order
+                    success = iteration_success_map[ep_idx]
+                    if task_id not in online_train_main._task_history:
+                        online_train_main._task_history[task_id] = []
+                    online_train_main._task_history[task_id].append(1 if success > 0.5 else 0)
+                # Log per-task success rates (recent 5 and cumulative)
+                task_summary = []
+                for tid in sorted(online_train_main._task_history.keys()):
+                    hist = online_train_main._task_history[tid]
+                    recent = hist[-5:] if len(hist) >= 5 else hist
+                    total_s = sum(hist)
+                    task_summary.append(f"T{tid}:{sum(recent)}/{len(recent)}({total_s}/{len(hist)})")
+                logging.info(f"[TASK] Per-task success [recent(total)]: {' '.join(task_summary)}")
+
+            # Add episodes to replay pools (success + failure)
+            if feature_only and iteration_success_map:
+                for ep_idx, success in iteration_success_map.items():
+                    if success > 0.5:
+                        success_episode_pool.append(ep_idx)
+                    else:
+                        failure_episode_pool.append(ep_idx)
+                if is_main_process:
+                    logging.info(f"[Feature-Only] Replay pools: "
+                                 f"success={len(success_episode_pool)}, "
+                                 f"failure={len(failure_episode_pool)} episodes")
 
             # Close writers to finalize parquet files, then incrementally update hf_dataset
             # (避免 _ensure_hf_dataset_loaded 全量重载 3GB+ 数据，改为只加载新增文件)
@@ -1929,11 +2096,11 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
             # Recreate dataloaders with updated datasets
             if online_dataset.num_frames > 0:
-                if feature_only:
+                if feature_only and (len(success_episode_pool) > 0 or len(failure_episode_pool) > 0):
+                    all_replay_episodes = set(success_episode_pool) | set(failure_episode_pool)
                     online_dataloader = create_dataloader(
                         online_dataset, online=True,
-                        success_only=True,
-                        min_episode_index=iteration_start_episode,
+                        allowed_episodes=all_replay_episodes,
                     )
                 else:
                     online_dataloader = create_dataloader(online_dataset, online=True)
@@ -1945,7 +2112,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     logging.info(
                         f"Recreated online dataloader with ValidActionContextSampler "
                         f"({valid_count} valid frames out of {online_dataset.num_frames})"
-                        + (f" [Feature-Only: success_only, min_ep={iteration_start_episode}]"
+                        + (f" [Feature-Only: success={len(success_episode_pool)}, "
+                           f"failure={len(failure_episode_pool)} episodes]"
                            if feature_only else "")
                     )
             else:
@@ -1968,12 +2136,12 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                 )
             continue
 
-        # Feature-only mode: skip training if no success episodes in this iteration
+        # Feature-only mode: skip training if no success episodes in replay pool
         if feature_only and online_sampler is not None and len(online_sampler) == 0:
             if is_main_process:
                 logging.warning(
-                    f"[Feature-Only] No success episodes in iteration {iteration+1}. "
-                    f"Skipping training phase."
+                    f"[Feature-Only] No valid frames (replay_pool={len(success_episode_pool)} episodes) "
+                    f"in iteration {iteration+1}. Skipping training phase."
                 )
             continue
 
@@ -2077,11 +2245,81 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
             if is_log_step:
                 logging.info(train_tracker)
+                # ===== 增强诊断输出（feature_loss 详情）=====
+                if output_dict and output_dict.get("feature_loss", 0) > 0:
+                    fl_val = output_dict.get("feature_loss", 0)
+                    diag_parts = []
+                    # Per-sample distribution
+                    fl_max_v = output_dict.get("fl_max", -1)
+                    fl_std_v = output_dict.get("fl_std", -1)
+                    fl_gt025 = output_dict.get("fl_gt025", 0)
+                    diag_parts.append(f"fl_range=[{output_dict.get('fl_min', 0):.3f},{fl_max_v:.3f}] std={fl_std_v:.3f} spike({fl_gt025}/{output_dict.get('fl_n_pos', 0)+output_dict.get('fl_n_neg', 0)})")
+                    # Directional loss breakdown (RECAP fusion)
+                    fl_pos = output_dict.get('fl_pos_loss', 0)
+                    fl_neg = output_dict.get('fl_neg_loss', 0)
+                    n_pos = output_dict.get('fl_n_pos', 0)
+                    n_neg = output_dict.get('fl_n_neg', 0)
+                    neg_active = output_dict.get('fl_neg_active_ratio', 0)
+                    diag_parts.append(f"pos({n_pos})={fl_pos:.4f} neg({n_neg})={fl_neg:.4f} neg_act={neg_active:.2f}")
+                    # Spike sample info
+                    if "fl_spike_ep" in output_dict:
+                        diag_parts.append(f"spike_ep={output_dict['fl_spike_ep']} frame={output_dict.get('fl_spike_frame', '?')} pos={output_dict.get('fl_spike_pos', '?')}")
+                    # Success vs fail feature distance
+                    if "fl_succ_mean" in output_dict or "fl_fail_mean" in output_dict:
+                        s_mean = output_dict.get('fl_succ_mean', 0)
+                        f_mean = output_dict.get('fl_fail_mean', 0)
+                        s_cos = output_dict.get('fl_succ_cos', 0)
+                        f_cos = output_dict.get('fl_fail_cos', 0)
+                        diag_parts.append(f"succ_mse={s_mean:.3f}/cos={s_cos:.3f} fail_mse={f_mean:.3f}/cos={f_cos:.3f}")
+                    # Position breakdown
+                    if "fl_fresh_fl" in output_dict:
+                        diag_parts.append(f"fresh({output_dict.get('fl_n_fresh', 0)})={output_dict['fl_fresh_fl']:.3f} late({output_dict.get('fl_n_late', 0)})={output_dict.get('fl_late_fl', 0):.3f}")
+                    # Action L2 per position
+                    l2_parts = []
+                    for apos in [0, 4, 9]:
+                        key = f"fl_l2_p{apos}"
+                        if key in output_dict:
+                            l2_parts.append(f"p{apos}={output_dict[key]:.4f}")
+                    if l2_parts:
+                        diag_parts.append(f"l2[{','.join(l2_parts)}]")
+                    # ODE convergence
+                    if "ode_act_n0" in output_dict:
+                        diag_parts.append(f"ode_act[{output_dict['ode_act_n0']:.1f}→{output_dict['ode_act_n_last']:.1f}] v_max=step{output_dict.get('ode_max_v_step', '?')}({output_dict.get('ode_max_v_val', 0):.1f})")
+                    # BC loss breakdown
+                    if "bc_succ_mean" in output_dict:
+                        diag_parts.append(f"bc[succ={output_dict['bc_succ_mean']:.3f} fail={output_dict.get('bc_fail_mean', 0):.3f}]")
+                    # fl/bc ratio
+                    if "fl_bc_ratio" in output_dict:
+                        diag_parts.append(f"fl/bc={output_dict['fl_bc_ratio']:.2f}")
+                    # Trimmed mean effect
+                    if "fl_untrimmed" in output_dict:
+                        diag_parts.append(f"trim({output_dict.get('fl_n_trimmed', 0)}):{output_dict['fl_untrimmed']:.3f}→{output_dict.get('feature_loss', 0):.3f}")
+                    # Batch episode distribution
+                    if "fl_batch_eps" in output_dict:
+                        diag_parts.append(f"eps={output_dict['fl_batch_eps']}")
+                    # Quality conditioning 诊断 (additive gate)
+                    if "qc_gate_norm" in output_dict:
+                        diag_parts.append(
+                            f"QC: gate={output_dict['qc_gate_norm']:.4f} "
+                            f"emb_diff={output_dict['qc_emb_diff']:.4f} "
+                            f"sig_pos={output_dict.get('qc_signal_pos', 0):.3f} "
+                            f"sig_neg={output_dict.get('qc_signal_neg', 0):.3f} "
+                            f"sig_Δ={output_dict.get('qc_signal_diff', 0):.3f}"
+                        )
+                    logging.info(f"  [DIAG] {' | '.join(diag_parts)}")
+
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:
-                        wandb_log_dict.update(output_dict)
+                        for k, v in output_dict.items():
+                            if k not in wandb_log_dict and not isinstance(v, (list, dict)):
+                                wandb_log_dict[k] = v
                     wandb_log_dict["iteration"] = iteration + 1
+                    if feature_only:
+                        wandb_log_dict["replay_pool_size"] = len(success_episode_pool)
+                        wandb_log_dict["failure_pool_size"] = len(failure_episode_pool)
+                    if latest_rollout_success >= 0:
+                        wandb_log_dict["rollout/success"] = latest_rollout_success
                     wandb_logger.log_dict(wandb_log_dict, step)
                 train_tracker.reset_averages()
 
@@ -2119,6 +2357,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
                 accelerator.wait_for_everyone()
 
+        # EMA update anchor after each iteration's training
+        if feature_only and anchor_weight_val > 0:
+            ema_decay = getattr(policy.config, 'anchor_ema_decay', 0.995)
+            if ema_decay < 1.0:
+                unwrapped = accelerator.unwrap_model(policy)
+                unwrapped.update_anchor_ema(decay=ema_decay)
+                if is_main_process:
+                    logging.info(f"[Anchor] EMA updated (decay={ema_decay})")
+
         if is_main_process:
             total_episodes = (
                     (offline_dataset.num_episodes if offline_dataset is not None else 0)
@@ -2136,6 +2383,27 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     f"Total: {total_episodes} episodes ({offline_dataset.num_episodes if offline_dataset is not None else 0} offline + {online_dataset.num_episodes} online), "
                     f"{total_frames} frames"
                 )
+                # ===== 迭代级汇总诊断 =====
+                # Anchor drift: 当前 Expert 参数 vs anchor 参数的距离
+                unwrapped_diag = accelerator.unwrap_model(policy)
+                if (hasattr(unwrapped_diag, 'model')
+                        and hasattr(unwrapped_diag.model, '_anchor_expert_state')
+                        and unwrapped_diag.model._anchor_expert_state is not None):
+                    import torch as _torch
+                    with _torch.no_grad():
+                        drift_sum = 0.0
+                        param_count = 0
+                        for key, param in unwrapped_diag._iter_expert_params():
+                            if key in unwrapped_diag.model._anchor_expert_state:
+                                anchor_p = unwrapped_diag.model._anchor_expert_state[key]
+                                drift_sum += (param.data - anchor_p).pow(2).sum().item()
+                                param_count += param.numel()
+                        if param_count > 0:
+                            rms_drift = (drift_sum / param_count) ** 0.5
+                            logging.info(
+                                f"[DRIFT] Expert→Anchor RMS drift: {rms_drift:.6f} "
+                                f"({param_count} params)"
+                            )
             else:
                 logging.info(
                     f"Iteration {iteration + 1} complete: "
