@@ -161,6 +161,9 @@ def collect_results(output_dir: Path, checkpoint_names: list[str]) -> list[dict]
             "neg_sim_std": modal.get("neg_sim_std", float("nan")),
             "pos_neg_sim_gap": modal.get("pos_neg_sim_gap", float("nan")),
             "sim_dist_plot_path": modal.get("sim_dist_plot_path", ""),
+            "mean_itm_similarity": modal.get("mean_itm_similarity", float("nan")),
+            "itm_logits_auc_roc": modal.get("itm_logits_auc_roc", float("nan")),
+            "itm_pos_neg_gap": modal.get("itm_pos_neg_gap", float("nan")),
         }
         # 收集所有 retrieval_* 指标（Recall@1/5/10/20 等）
         for key, val in modal.items():
@@ -210,8 +213,8 @@ def plot_metrics_line_charts(results: list[dict], output_dir: Path) -> None:
                 pass
     recall_ks = sorted(recall_ks)[:3]  # 最多画 3 个 Recall 子图：@1, @5, @10（或 @20）
 
-    # Success, CosSim, CKA + Recall@K + AUC-ROC, Kendall, Spearman, mAP, EffDim, Pos-Neg Gap
-    n_plots = 3 + len(recall_ks) + 6
+    # Success, CosSim, CKA + Recall@K + AUC-ROC, Kendall, Spearman, mAP, EffDim, Pos-Neg Gap + Mean ITM Sim, ITM Logits AUC-ROC
+    n_plots = 3 + len(recall_ks) + 6 + 2
     n_cols = 3
     n_rows = (n_plots + n_cols - 1) // n_cols
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 5 * n_rows))
@@ -354,6 +357,32 @@ def plot_metrics_line_charts(results: list[dict], output_dir: Path) -> None:
         ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
         ax.grid(True, alpha=0.3)
 
+    # Mean ITM Similarity（ITM logits 正对分数均值）
+    if idx < len(axes_flat):
+        ax = axes_flat[idx]
+        idx += 1
+        vals = [r.get("mean_itm_similarity", float("nan")) for r in valid]
+        ax.plot(x, vals, "o-", color="darkmagenta", linewidth=2, markersize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_ylabel("Mean ITM Sim")
+        ax.set_title("Mean ITM Similarity (z1↔z2)")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+
+    # ITM Logits AUC-ROC
+    if idx < len(axes_flat):
+        ax = axes_flat[idx]
+        idx += 1
+        vals = [r.get("itm_logits_auc_roc", float("nan")) for r in valid]
+        ax.plot(x, vals, "o-", color="indigo", linewidth=2, markersize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_ylabel("AUC-ROC")
+        ax.set_title("ITM Logits AUC-ROC")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+
     for j in range(idx, len(axes_flat)):
         axes_flat[j].set_visible(False)
 
@@ -435,6 +464,7 @@ def generate_report(results: list[dict], output_dir: Path, checkpoints_dir: Path
     extra_metric_headers = [
         "AUC-ROC", "Kendall τ", "Spearman", "mAP",
         "EffDim z1", "EffDim z2", "Pos-Neg Gap",
+        "Mean ITM Sim", "ITM AUC-ROC", "ITM Pos-Neg Gap",
     ]
     header_cells = (
         ["Checkpoint", "Success Rate (%)", "Mean Cos Sim", "Linear CKA"]
@@ -481,6 +511,9 @@ def generate_report(results: list[dict], output_dir: Path, checkpoints_dir: Path
                 _fmt(r.get("effective_dim_z1")),
                 _fmt(r.get("effective_dim_z2")),
                 _fmt(r.get("pos_neg_sim_gap")),
+                _fmt(r.get("mean_itm_similarity")),
+                _fmt(r.get("itm_logits_auc_roc")),
+                _fmt(r.get("itm_pos_neg_gap")),
             ]
             for k in recall_keys:
                 val = r.get(k, float("nan"))
@@ -509,6 +542,9 @@ def generate_report(results: list[dict], output_dir: Path, checkpoints_dir: Path
         "- **mAP**: Mean Average Precision，检索正样本时的平均精度均值",
         "- **EffDim z1/z2**: 表示有效维度 (Σλ)²/Σλ²，衡量表示空间利用率",
         "- **Pos-Neg Gap**: 正对与负对余弦相似度均值之差",
+        "- **Mean ITM Sim**: 使用 ITM Head logits 计算的正对 (z1_i, z2_i) 相似度（sigmoid）均值",
+        "- **ITM AUC-ROC**: 以 ITM 分数为得分的二分类（正对 vs 负对）AUC-ROC",
+        "- **ITM Pos-Neg Gap**: 正对与负对 ITM 分数均值之差",
         "- **R@K (z1→z2)**: 给定 z1 检索 top-K 最相似 z2 时配对命中的比例",
         "- **R@K (z2→z1)**: 给定 z2 检索 top-K 最相似 z1 时配对命中的比例",
         "",

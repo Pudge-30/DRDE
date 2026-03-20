@@ -650,6 +650,14 @@ def eval_policy(
                 topk=(1, 5, 10),
                 tag=task_tag,
             )
+            # 使用 ITM logits 计算的 z1–z2 相似度指标（与训练目标一致）
+            try:
+                itm_metrics = compute_itm_modal_metrics(
+                    policy, z1_all, z2_all, max_samples=500, tag=task_tag
+                )
+                modal_metrics.update(itm_metrics)
+            except Exception as exc_itm:
+                logging.warning(f"[Modal-Align-ITM] 指标计算失败: {exc_itm}")
             info["aggregated"]["modal_alignment"] = modal_metrics
         except Exception as exc:
             logging.warning(f"[Modal-Align] 指标计算失败: {exc}")
@@ -925,6 +933,84 @@ def compute_modal_alignment_metrics(
             logging.warning(f"{prefix} t-SNE 可视化失败: {e}")
 
     return metrics
+
+
+def compute_itm_modal_metrics(
+    policy: Any,
+    z1: "np.ndarray",
+    z2: "np.ndarray",
+    max_samples: int = 500,
+    tag: str = "",
+) -> dict:
+    """使用模型 ITM Head 的 logits 计算 z1–z2 相似度相关指标（与训练目标一致）。
+
+    在保留原有基于余弦相似度指标的前提下，增加：
+    - mean_itm_similarity: 正对 (z1_i, z2_i) 的 ITM 分数（sigmoid(logit)）均值
+    - itm_pos_neg_gap: 正对与负对 ITM 分数均值之差
+    - itm_logits_auc_roc: 以 ITM 分数为得分的二分类（正对 vs 负对）AUC-ROC
+
+    Args:
+        policy: 已加载的 policy，需有 policy.model.itm_head
+        z1: 观测嵌入 [N, D]
+        z2: 动作嵌入 [N, D]
+        max_samples: 计算 ITM 矩阵时最大样本数（避免 N×N 前向过多）
+        tag: 日志前缀
+    """
+    prefix = f"[Modal-Align-ITM{'-' + tag if tag else ''}]"
+    out: dict = {}
+    itm_head = getattr(getattr(policy, "model", None), "itm_head", None)
+    if itm_head is None:
+        logging.debug(f"{prefix} 无 itm_head，跳过 ITM 指标")
+        return out
+
+    N = z1.shape[0]
+    if N < 2:
+        return out
+
+    rng = np.random.default_rng(42)
+    n = min(N, max_samples)
+    if N > max_samples:
+        idx = rng.choice(N, n, replace=False)
+        z1_s, z2_s = z1[idx], z2[idx]
+    else:
+        z1_s, z2_s = z1.copy(), z2.copy()
+
+    device = next(policy.parameters()).device
+    dtype = next(policy.parameters()).dtype
+    z1_t = torch.from_numpy(z1_s).to(device=device, dtype=dtype)
+    z2_t = torch.from_numpy(z2_s).to(device=device, dtype=dtype)
+
+    itm_head.eval()
+    with torch.no_grad():
+        # 构建 [n, n] ITM 分数矩阵：第 i 行 = sigmoid(ITM(z1[i], z2[:]))
+        itm_matrix = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            z1_row = z1_t[i : i + 1].expand(n, -1)  # [n, D]
+            logits = itm_head(z1_row, z2_t)  # [n]
+            itm_matrix[i] = torch.sigmoid(logits).float().cpu().numpy()
+
+    pos_scores = np.diag(itm_matrix).astype(np.float64)
+    neg_mask = ~np.eye(n, dtype=bool)
+    neg_scores = itm_matrix[neg_mask].astype(np.float64)
+
+    out["mean_itm_similarity"] = float(np.mean(pos_scores))
+    out["std_itm_similarity"] = float(np.std(pos_scores))
+    out["itm_pos_neg_gap"] = float(np.mean(pos_scores) - np.mean(neg_scores))
+
+    try:
+        from sklearn.metrics import roc_auc_score
+        labels = np.eye(n, dtype=np.float64).flatten()
+        scores = itm_matrix.astype(np.float64).flatten()
+        out["itm_logits_auc_roc"] = float(roc_auc_score(labels, scores))
+    except Exception as e:
+        logging.warning(f"{prefix} ITM AUC-ROC 计算失败: {e}")
+        out["itm_logits_auc_roc"] = float("nan")
+
+    logging.info(
+        f"{prefix} N={n} | mean_itm_sim={out['mean_itm_similarity']:.4f}±{out['std_itm_similarity']:.4f} | "
+        f"pos_neg_gap={out['itm_pos_neg_gap']:.4f} | itm_auc_roc={out.get('itm_logits_auc_roc', float('nan')):.4f}"
+    )
+    return out
 
 
 def _compile_episode_data(
