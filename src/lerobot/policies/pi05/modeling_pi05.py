@@ -48,6 +48,7 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -1809,8 +1810,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             nn.GELU(),
             nn.Linear(paligemma_config.width, 512),
         )
+        # state_proj: 将机器人状态投影到 embedding，用于拼接到 z2
+        state_emb_dim = 256
+        self.state_proj = nn.Sequential(
+            nn.Linear(config.max_state_dim, state_emb_dim),
+            nn.GELU(),
+        )
+        # proj_z2 输入 = content_attention 输出 + state_emb
         self.proj_z2 = nn.Sequential(
-            nn.Linear(action_expert_config.width, action_expert_config.width),
+            nn.Linear(action_expert_config.width + state_emb_dim, action_expert_config.width),
             nn.GELU(),
             nn.Linear(action_expert_config.width, 512),
         )
@@ -2028,6 +2036,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def _prepare_state(self, state: Tensor) -> Tensor:
+        """Ensure state is [B, max_state_dim] for state_proj."""
+        if state.dim() == 3:
+            state = state[:, -1, :]
+        return pad_vector(state, self.config.max_state_dim)
+
+    def _compute_z2_from_action_and_state(self, action_raw: Tensor, state: Tensor | None) -> Tensor:
+        """z2 = proj_z2(concat(action_raw, state_emb))，使 z2 同时包含 action 和 state 信息。"""
+        if state is None:
+            bsize = action_raw.shape[0]
+            state = torch.zeros(bsize, self.config.max_state_dim, device=action_raw.device, dtype=action_raw.dtype)
+        state_prep = self._prepare_state(state)
+        state_emb = self.state_proj(state_prep)
+        combined = torch.cat([action_raw, state_emb], dim=-1)
+        return _clamp_embedding_norm(
+            self.proj_z2(combined).to(dtype=torch.float32), self.config.embedding_max_norm
+        )
+
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None,
                 condition_token=None, return_internals=False) -> Tensor | tuple[Tensor, dict]:
         """Do a full training forward pass and compute the loss.
@@ -2176,6 +2202,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             img_masks,
             tokens,
             masks,
+            state: Tensor | None = None,
             future_images=None,
             future_img_masks=None,
             neg_gt_actions=None,
@@ -2188,12 +2215,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """三元因果链对比学习: obs_t ↔ action_t ↔ obs_{t+k}
 
         使用 ALBEF ITM (Image-Text Matching) 做匹配判断，不依赖 dot product。
+        z2 同时包含 action 和 state 信息（通过 state_proj 拼接后在 proj_z2 前融合）。
 
         Args:
             images: 当前帧图像列表 (obs_t)
             img_masks: 当前帧图像掩码列表
             tokens: 语言 tokens
             masks: 语言 token 掩码
+            state: [B, state_dim] 或 [B, n_obs_steps, state_dim]，机器人状态（关节角等）
             future_images: 未来帧图像列表 (obs_{t+k})，None 时退化为二元
             future_img_masks: 未来帧图像掩码列表
             neg_gt_actions: [B, att_len, action_dim] 同 episode GT 时序错位动作（L1 负样本）
@@ -2282,22 +2311,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if cmp_vec_0.dim() != 2:
             raise ValueError(f"Expected cmp_vec_0 to be 2D, got shape {cmp_vec_0.shape}")
 
-        # ========== z2: action_t → ContentAttention → proj_z2 ==========
+        # ========== z2: action_t + state → ContentAttention + state_proj → proj_z2 ==========
         attn_act_len = self.content_attention.attn_act_len  # 取前几步动作
         actions = self.sample_actions(images, img_masks, tokens, masks)  # 采样动作序列
         origin_action_dim = self.config.output_features[ACTION].shape[0]  # 原始动作维度
         selected_actions = actions[:, :attn_act_len, :origin_action_dim]  # 选取用于 CMP 的动作
         cmp_vec_1_raw = self.content_attention(selected_actions)  # 动作聚合表征
-        # action 表征投影到 CMP 共享空间，并进行可选范数裁剪
-        cmp_vec_1 = _clamp_embedding_norm(self.proj_z2(cmp_vec_1_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
+        cmp_vec_1 = self._compute_z2_from_action_and_state(cmp_vec_1_raw, state)
 
-        # ========== z2_neg: 同 episode GT 时序错位负样本 ==========
+        # ========== z2_neg: 同 episode GT 时序错位负样本（使用当前帧 state）==========
         cmp_vec_1_neg = None  # L1 负样本表征
         neg_valid = None  # L1 负样本有效标记
         if neg_gt_actions is not None and neg_action_valid is not None:
-            # neg_gt_actions: [B, att_len, action_dim]
             cmp_vec_1_neg_raw = self.content_attention(neg_gt_actions)
-            cmp_vec_1_neg = _clamp_embedding_norm(self.proj_z2(cmp_vec_1_neg_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
+            cmp_vec_1_neg = self._compute_z2_from_action_and_state(cmp_vec_1_neg_raw, state)
             neg_valid = neg_action_valid  # [B] bool
 
         # ========== z3: obs_{t+k} ==========
@@ -2857,11 +2884,6 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05
-            if key.startswith("state_proj."):
-                logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
-                continue
-
             # Handle vision tower embedding layer potential differences
             if "patch_embedding" in key:
                 # Some checkpoints might have this, but current model expects different structure
@@ -2950,6 +2972,10 @@ class PI05Policy(PreTrainedPolicy):
 
         if self.model.proj_z2 is not None:
             params.extend(self.model.proj_z2.parameters())
+
+        # state_proj（z2 中的 state 分支）
+        if hasattr(self.model, 'state_proj') and self.model.state_proj is not None:
+            params.extend(self.model.state_proj.parameters())
 
         # ObsQueryBridge
         if hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None:
@@ -3286,8 +3312,10 @@ class PI05Policy(PreTrainedPolicy):
                     tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
                     masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
                     attn_act_len = self.config.attn_act_len
+                    state = batch.get(OBS_STATE)
                     _, stale_score, actual_z3 = self._should_replan(
                         images, img_masks, tokens, masks, segment[:, :attn_act_len, :],
+                        state=state,
                     )
                     self._stale_itm_scores.append(stale_score.detach().cpu())
                     self._stale_itm_chunk_ids.append(self._current_chunk_idx)
@@ -3328,7 +3356,7 @@ class PI05Policy(PreTrainedPolicy):
                                 next_segment = self._full_action_chunk[:, next_start:next_end]
                                 origin_action_dim = self.config.output_features[ACTION].shape[0]
                                 z2_next_raw = self.model.content_attention(next_segment[:, :attn_act_len, :origin_action_dim])
-                                z2_next = _clamp_embedding_norm(self.model.proj_z2(z2_next_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
+                                z2_next = self.model._compute_z2_from_action_and_state(z2_next_raw, state)
                                 self._predicted_z3 = self.model.forward_model(actual_z3, z2_next).detach()
 
                         if len(self._drift_scores) % 10 == 1:
@@ -3412,12 +3440,13 @@ class PI05Policy(PreTrainedPolicy):
             tokens,
             masks,
             predict_actions: Tensor,
+            state: Tensor | None = None,
             z1: Tensor = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Check if replanning is needed based on ITM Head matching score.
 
-        使用训练时相同的编码路径：ObsQueryBridge 提取 z1，ContentAttention + proj_z2 提取 z2，
+        使用训练时相同的编码路径：ObsQueryBridge 提取 z1，ContentAttention + state_proj + proj_z2 提取 z2，
         ITM Head 判断 (obs, action) 是否匹配。匹配分数低于阈值时触发 replan。
 
         Args:
@@ -3426,6 +3455,7 @@ class PI05Policy(PreTrainedPolicy):
             tokens: Current language tokens [batch_size, seq_len]
             masks: Current language token masks [batch_size, seq_len]
             predict_actions: Previously predicted actions [batch_size, seq_len, action_dim]
+            state: [B, state_dim] 机器人状态，用于 z2 拼接
             z1: 预计算的 obs 嵌入 [batch_size, 512]，如果为 None 则内部编码
 
         Returns:
@@ -3456,12 +3486,12 @@ class PI05Policy(PreTrainedPolicy):
         if z1 is None:
             z1 = self._encode_obs(images, img_masks, tokens, masks)
 
-        # ========== z2: action → ContentAttention → proj_z2 ==========
+        # ========== z2: action + state → ContentAttention + state_proj → proj_z2 ==========
         attn_act_len = self.model.content_attention.attn_act_len
         origin_action_dim = self.config.output_features[ACTION].shape[0]
         selected_actions = predict_actions[:, :attn_act_len, :origin_action_dim]
         z2_raw = self.model.content_attention(selected_actions)
-        z2 = _clamp_embedding_norm(self.model.proj_z2(z2_raw).to(dtype=torch.float32), self.config.embedding_max_norm)  # [batch_size, 512]
+        z2 = self.model._compute_z2_from_action_and_state(z2_raw, state)  # [batch_size, 512]
 
         # ========== ITM Head 打分 ==========
         itm_logits = self.model.itm_head(z1, z2)  # [batch_size] raw logits
@@ -3492,8 +3522,10 @@ class PI05Policy(PreTrainedPolicy):
         if (hasattr(self.model, 'itm_head') and self.model.itm_head is not None
                 and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None):
             attn_act_len = self.config.attn_act_len
+            state = batch.get(OBS_STATE)
             _, itm_score, z1 = self._should_replan(
                 images, img_masks, tokens, masks, actions[:, :attn_act_len, :],
+                state=state,
             )
             self._itm_scores.append(itm_score.detach().cpu())
             # 每 10 次打印一次 ITM score 信息
@@ -3504,10 +3536,7 @@ class PI05Policy(PreTrainedPolicy):
             if z1 is not None:
                 origin_action_dim = self.config.output_features[ACTION].shape[0]
                 z2_raw = self.model.content_attention(actions[:, :attn_act_len, :origin_action_dim])
-                z2 = _clamp_embedding_norm(
-                    self.model.proj_z2(z2_raw).to(dtype=torch.float32),
-                    self.config.embedding_max_norm,
-                )
+                z2 = self.model._compute_z2_from_action_and_state(z2_raw, state)
                 # 存储 z1/z2 嵌入用于模态对齐分析
                 self._z1_embeddings.append(z1.detach().cpu())
                 self._z2_embeddings.append(z2.detach().cpu())
@@ -3645,8 +3674,10 @@ class PI05Policy(PreTrainedPolicy):
                 if self.offline_mode is False:
                     self._apply_param_cmp()
 
+                state = batch.get(OBS_STATE)
                 cmp_losses, cmp_loss_info = self.model.forward_cmp(
                     images, img_masks, tokens, masks,
+                    state=state,
                     future_images=future_images, future_img_masks=future_img_masks,
                     neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
                     neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
@@ -3681,8 +3712,10 @@ class PI05Policy(PreTrainedPolicy):
 
                 if not bc_only:
                     # 2) CMP：三元因果链对比损失 + 前向动力学项
+                    state = batch.get(OBS_STATE)
                     cmp_losses, cmp_loss_info = self.model.forward_cmp(
                         images, img_masks, tokens, masks,
+                        state=state,
                         future_images=future_images, future_img_masks=future_img_masks,
                         neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
                         neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
