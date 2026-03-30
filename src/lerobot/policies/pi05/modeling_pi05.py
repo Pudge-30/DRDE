@@ -592,8 +592,7 @@ class ITMHead(nn.Module):
             soft_label_beta: float = 1.0,
             neg_z2: Tensor = None,
             neg_z2_valid: Tensor = None,
-            neg_distance: Tensor = None,  # neg 距离（用于 soft label）
-            temperature: float = 0.07,  # 略高(如0.1)时 logits/temperature 软化梯度，减轻过度拉近正对
+            neg_distance: Tensor = None,  # 新增：neg 距离（用于 soft label）
     ) -> tuple[Tensor, dict]:
         """计算 ITM loss。
 
@@ -604,7 +603,6 @@ class ITMHead(nn.Module):
             z2: [B, hidden_dim]
             action_distances: [B, B] action 空间的 pairwise 距离矩阵，None 时退化为硬标签
             soft_label_beta: 软标签温度，越小越接近硬标签
-            temperature: 略高于 1 时缩放 logits，减轻过度拉近正对
             neg_z2: [B, hidden_dim] 另一侧的负样本编码
                     - L1 (obs↔action): 同 episode GT 时序错位的 action 编码
                     - L2 (action↔future_obs): 同 episode 远离 t+k 的 obs 编码
@@ -615,38 +613,36 @@ class ITMHead(nn.Module):
             loss: scalar
             info: 诊断信息 dict
         """
-        # 功能总结：基于正样本与时序错位负样本的二分类匹配损失，
-        #         支持软标签（由距离决定）并记录诊断信息。
-        batch_size = z1.shape[0]  # batch 大小
-        device = z1.device  # 当前设备
+        batch_size = z1.shape[0]
+        device = z1.device
 
         # 正样本：(z1_i, z2_i)
-        pos_logits = self.forward(z1, z2)  # [B] 正样本匹配分数
-        pos_labels = torch.ones(batch_size, device=device)  # 正样本标签=1
+        pos_logits = self.forward(z1, z2)  # [B]
+        pos_labels = torch.ones(batch_size, device=device)
 
         if neg_z2 is not None:
             # ===== GT 时序错位负样本（替换 batch cross-pair）=====
             # 使用 action-distance soft label：距离近 → 不推太远，距离远 → 推远
-            neg_logits = self.forward(z1, neg_z2)  # [B] 负样本匹配分数
+            neg_logits = self.forward(z1, neg_z2)  # [B]
 
             # 计算 soft label
             if neg_distance is not None:
                 with torch.no_grad():
                     # 计算 scale：使用 action_distances 的 median，或 fallback 到固定值
-                    if action_distances is not None:  # L1 使用 action 距离做尺度
+                    if action_distances is not None:
                         eps = 1e-6
-                        eye_mask = torch.eye(batch_size, dtype=torch.bool, device=device)  # 对角线 mask
-                        non_diag = action_distances[~eye_mask]  # 去除自距离
-                        scale = non_diag.median().detach() + eps  # 使用 median 作为尺度
+                        eye_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+                        non_diag = action_distances[~eye_mask]
+                        scale = non_diag.median().detach() + eps
                     else:
                         scale = 1.0  # L2 (obs) 没有 action_distances，用固定 scale
 
                     # soft_label = exp(-distance / (scale × beta))
                     # distance 小 → label 接近 1（不推远），distance 大 → label 接近 0（推远）
-                    neg_labels = torch.exp(-neg_distance / (scale * soft_label_beta))  # 软负标签，根据负样本距离生成一对距离敏感的标签，用于计算负样本的BCE
+                    neg_labels = torch.exp(-neg_distance / (scale * soft_label_beta))
 
                     # Debug logging (每 100 次调用打印一次)
-                    self._log_counter += 1  # 调试计数器累加
+                    self._log_counter += 1
                     if self._log_counter % 100 == 0:
                         label_type = "L1" if action_distances is not None else "L2"
                         print(f"[ITMHead {label_type}] call={self._log_counter}, "
@@ -659,35 +655,29 @@ class ITMHead(nn.Module):
                               f"max={neg_labels.max().item():.4f}")
             else:
                 # 没有 distance 信息，回退到硬标签
-                neg_labels = torch.zeros(batch_size, device=device)  # 硬负标签=0
+                neg_labels = torch.zeros(batch_size, device=device)
 
-            # 正样本二分类损失（logit + label=1）
-            # 略高 temperature(0.07→0.1) 时 logits/temperature 软化梯度，减轻过度拉近正对
-            pos_logits_scaled = pos_logits / temperature
-            pos_loss = F.binary_cross_entropy_with_logits(pos_logits_scaled, pos_labels)
-            # 负样本逐样本损失（logit + soft label）
-            neg_logits_scaled = neg_logits / temperature
+            pos_loss = F.binary_cross_entropy_with_logits(pos_logits, pos_labels)
             neg_loss_per_sample = F.binary_cross_entropy_with_logits(
-                neg_logits_scaled, neg_labels, reduction='none'
-            )  # [B] 逐样本负样本 BCE
+                neg_logits, neg_labels, reduction='none'
+            )  # [B]
 
             # 按 validity mask 屏蔽 episode 过短的样本
-            if neg_z2_valid is not None:  # 仅使用有效负样本
+            if neg_z2_valid is not None:
                 valid_mask = neg_z2_valid.float().to(device)
-                n_valid = valid_mask.sum().clamp(min=1.0)  # 防止除零
-                neg_loss = (neg_loss_per_sample * valid_mask).sum() / n_valid  # masked mean
+                n_valid = valid_mask.sum().clamp(min=1.0)
+                neg_loss = (neg_loss_per_sample * valid_mask).sum() / n_valid
             else:
-                neg_loss = neg_loss_per_sample.mean()  # 全量平均
+                neg_loss = neg_loss_per_sample.mean()
 
-            # 正负样本对等权平均得到 ITM 总损失
-            loss = (pos_loss + neg_loss) / 2.0  # 正负平均
+            loss = (pos_loss + neg_loss) / 2.0
 
             # 诊断信息
             with torch.no_grad():
-                pos_acc = (pos_logits > 0).float().mean().item()  # 正样本判真率
-                neg_acc = (neg_logits < 0).float().mean().item()  # 负样本判假率
-                n_valid_int = int(neg_z2_valid.sum().item()) if neg_z2_valid is not None else batch_size  # 有效数
-                avg_neg_soft_label = neg_labels.mean().item() if neg_distance is not None else 0.0  # 软标签均值
+                pos_acc = (pos_logits > 0).float().mean().item()
+                neg_acc = (neg_logits < 0).float().mean().item()
+                n_valid_int = int(neg_z2_valid.sum().item()) if neg_z2_valid is not None else batch_size
+                avg_neg_soft_label = neg_labels.mean().item() if neg_distance is not None else 0.0
 
             info = {
                 "pos_score": pos_logits.mean().item(),
@@ -723,7 +713,6 @@ class ForwardModel(nn.Module):
         )
 
     def forward(self, z1: Tensor, z2: Tensor) -> Tensor:
-        # 功能总结：预测 z3（残差式前向动力学），只学习 delta。
         delta = self.mlp(torch.cat([z1, z2], dim=-1))
         return z1 + delta
 
@@ -734,7 +723,6 @@ def _clamp_embedding_norm(z: Tensor, max_norm: float = 0.0) -> Tensor:
     max_norm <= 0 时直接返回原始 z（MEAN_STD 模式不需要 clamp）。
     max_norm > 0 时，norm 超过阈值的 embedding 等比缩放到 max_norm（QUANTILES 建议 32.0）。
     """
-    # 功能总结：限制 embedding 的 L2 范数，避免数值膨胀。
     if max_norm <= 0:
         return z
     z_norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -781,57 +769,56 @@ def contrastive_loss_with_structure(
         total_loss: 标量损失
         loss_info: 各子项数值 dict，用于 wandb 日志
     """
-    # 功能总结：计算 CMP 的三部分损失（跨模态/结构/防坍缩），并返回日志信息。
     # 使用函数属性来跟踪调用次数（静态变量）
     if not hasattr(contrastive_loss_with_structure, 'step_count'):
-        contrastive_loss_with_structure.step_count = 0  # 首次调用初始化计数器
-    contrastive_loss_with_structure.step_count += 1  # 步数递增
-    step = contrastive_loss_with_structure.step_count  # 当前步数
+        contrastive_loss_with_structure.step_count = 0
+    contrastive_loss_with_structure.step_count += 1
+    step = contrastive_loss_with_structure.step_count
 
     # 权重调度：intra 逐渐衰减，cross 保持不变
     if warmup_steps > 0 and step < warmup_steps:
-        cross_progress = step / warmup_steps  # warmup 进度
-        lambda_intra_eff = lambda_intra  # 同模态权重（当前未使用）
-        lambda_cross_eff = lambda_cross * cross_progress  # 跨模态权重线性升温
+        cross_progress = step / warmup_steps
+        lambda_intra_eff = lambda_intra
+        lambda_cross_eff = lambda_cross * cross_progress
     else:
-        decay_progress = (step - warmup_steps) / decay_steps  # 衰减进度
-        lambda_intra_eff = lambda_intra * max(0.3, 1.0 - decay_progress)  # 同模态权重衰减
-        lambda_cross_eff = lambda_cross  # 跨模态权重保持
+        decay_progress = (step - warmup_steps) / decay_steps
+        lambda_intra_eff = lambda_intra * max(0.3, 1.0 - decay_progress)
+        lambda_cross_eff = lambda_cross
 
     # Flatten inputs
-    z1_flat = z1 if z1.dim() == 2 else z1.reshape(-1, z1.shape[-1])  # [B, D]
-    z2_flat = z2 if z2.dim() == 2 else z2.reshape(-1, z2.shape[-1])  # [B, D]
-    batch_size = z1_flat.shape[0]  # 扁平后的 batch
-    dim = z1_flat.shape[-1]  # 特征维度
+    z1_flat = z1 if z1.dim() == 2 else z1.reshape(-1, z1.shape[-1])
+    z2_flat = z2 if z2.dim() == 2 else z2.reshape(-1, z2.shape[-1])
+    batch_size = z1_flat.shape[0]
+    dim = z1_flat.shape[-1]
 
     # Action 距离矩阵
-    actions_flat = z2_original.reshape(batch_size, -1) if z2_original.dim() == 3 else z2_original  # 展平动作
-    action_distances = torch.cdist(actions_flat, actions_flat, p=2)  # 动作 L2 距离矩阵
-    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)  # 对角线 mask
+    actions_flat = z2_original.reshape(batch_size, -1) if z2_original.dim() == 3 else z2_original
+    action_distances = torch.cdist(actions_flat, actions_flat, p=2)
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=z2.device)
 
     # 计算 z1/z2 内部相似度（用于监控）
-    z1_norm = F.normalize(z1_flat, p=2, dim=-1)  # z1 归一化
-    z1_sim = torch.matmul(z1_norm, z1_norm.T)  # 余弦相似度矩阵
-    z1_internal_sim = z1_sim[~eye_mask].mean().item()  # 去除对角线平均
+    z1_norm = F.normalize(z1_flat, p=2, dim=-1)
+    z1_sim = torch.matmul(z1_norm, z1_norm.T)
+    z1_internal_sim = z1_sim[~eye_mask].mean().item()
 
-    z2_norm = F.normalize(z2_flat, p=2, dim=-1)  # z2 归一化
-    z2_sim = torch.matmul(z2_norm, z2_norm.T)  # 余弦相似度矩阵
-    z2_internal_sim = z2_sim[~eye_mask].mean().item()  # 去除对角线平均
+    z2_norm = F.normalize(z2_flat, p=2, dim=-1)
+    z2_sim = torch.matmul(z2_norm, z2_norm.T)
+    z2_internal_sim = z2_sim[~eye_mask].mean().item()
 
     # ========== 1. 跨模态损失 (z1 vs z2) — ITM 三元因果链 ==========
     if itm_head is not None:
         # Flatten z3 for L2
-        z3_flat = None  # L2 正样本（obs_{t+k}）
+        z3_flat = None
         if z3 is not None:
             z3_flat = z3 if z3.dim() == 2 else z3.reshape(-1, z3.shape[-1])
 
         # Flatten z2_neg for L1 GT 时序错位负样本
-        z2_neg_flat = None  # L1 负样本（action 时序错位）
+        z2_neg_flat = None
         if z2_neg is not None:
             z2_neg_flat = z2_neg if z2_neg.dim() == 2 else z2_neg.reshape(-1, z2_neg.shape[-1])
 
         # Flatten z3_neg for L2 GT 远离 t+k 的负样本
-        z3_neg_flat = None  # L2 负样本（远离的未来观测）
+        z3_neg_flat = None
         if z3_neg is not None:
             z3_neg_flat = z3_neg if z3_neg.dim() == 2 else z3_neg.reshape(-1, z3_neg.shape[-1])
 
@@ -840,116 +827,108 @@ def contrastive_loss_with_structure(
             z1_flat, z2_flat, action_distances=action_distances,
             neg_z2=z2_neg_flat, neg_z2_valid=z2_neg_valid,
             neg_distance=z2_neg_distance,  # L1 action 距离
-            temperature=temperature,
         )
 
         # L2: action_t ↔ obs_{t+k} — GT 远离 t+k 的负样本
-        cross_loss_L2 = torch.tensor(0.0, device=z2.device)  # 默认无 L2
-        itm_info_2 = None  # L2 诊断信息
+        cross_loss_L2 = torch.tensor(0.0, device=z2.device)
+        itm_info_2 = None
         if z3_flat is not None:
             cross_loss_L2, itm_info_2 = itm_head.compute_loss(
                 z2_flat, z3_flat,
                 neg_z2=z3_neg_flat, neg_z2_valid=z3_neg_valid,
                 neg_distance=z3_neg_distance,  # L2 obs 嵌入距离
-                temperature=temperature,
             )
 
-        # 汇总跨模态损失（L1+L2）
         cross_loss = cross_loss_L1 + cross_loss_L2
 
         # 诊断用：从 ITM info 提取 gap 信息
         with torch.no_grad():
-            pos_mean = itm_info['pos_score']  # 正样本分数均值
-            neg_mean = (itm_info['neg_score_1'] + itm_info['neg_score_2']) / 2  # 负样本分数均值
-            cross_gap = pos_mean - neg_mean  # 正负差距
+            pos_mean = itm_info['pos_score']
+            neg_mean = (itm_info['neg_score_1'] + itm_info['neg_score_2']) / 2
+            cross_gap = pos_mean - neg_mean
 
     # ========== 2. 结构保持损失 ==========
-    orig_distances = action_distances.clone()  # 原始动作距离
-    orig_distances[eye_mask] = float('inf')  # 屏蔽自距离
-    max_k = min(top_k, batch_size - 1)  # 实际 k
-    total_pairs = 0  # 统计总对数
-    violated_pairs = 0  # 统计不一致对数
+    orig_distances = action_distances.clone()
+    orig_distances[eye_mask] = float('inf')
+    max_k = min(top_k, batch_size - 1)
+    total_pairs = 0
+    violated_pairs = 0
 
     if max_k <= 0:
         structure_loss = torch.tensor(0.0, device=z2.device, dtype=z2.dtype)
     else:
-        _, orig_knn_indices = torch.topk(orig_distances, k=max_k, dim=-1, largest=False)  # 原始 KNN
-        learned_distances = torch.cdist(z2_flat, z2_flat, p=2)  # 学到的距离
-        structure_losses = []  # 每样本结构损失
+        _, orig_knn_indices = torch.topk(orig_distances, k=max_k, dim=-1, largest=False)
+        learned_distances = torch.cdist(z2_flat, z2_flat, p=2)
+        structure_losses = []
         for i in range(batch_size):
-            knn_indices = orig_knn_indices[i]  # 第 i 个样本的邻居
-            orig_knn_dists = orig_distances[i, knn_indices]  # 原始邻居距离
-            learned_knn_dists = learned_distances[i, knn_indices]  # 学到的邻居距离
+            knn_indices = orig_knn_indices[i]
+            orig_knn_dists = orig_distances[i, knn_indices]
+            learned_knn_dists = learned_distances[i, knn_indices]
 
             # Soft Rank
-            orig_dists_expanded = orig_knn_dists.unsqueeze(0)  # [1, k]
-            orig_dists_expanded_T = orig_knn_dists.unsqueeze(1)  # [k, 1]
-            orig_diff = orig_dists_expanded_T - orig_dists_expanded  # 成对差值
-            orig_soft_ranks = torch.sigmoid(orig_diff / temperature_structure).sum(dim=1)  # 软排序
+            orig_dists_expanded = orig_knn_dists.unsqueeze(0)
+            orig_dists_expanded_T = orig_knn_dists.unsqueeze(1)
+            orig_diff = orig_dists_expanded_T - orig_dists_expanded
+            orig_soft_ranks = torch.sigmoid(orig_diff / temperature_structure).sum(dim=1)
 
-            learned_dists_expanded = learned_knn_dists.unsqueeze(0)  # [1, k]
-            learned_dists_expanded_T = learned_knn_dists.unsqueeze(1)  # [k, 1]
-            learned_diff = learned_dists_expanded_T - learned_dists_expanded  # 成对差值
-            learned_soft_ranks = torch.sigmoid(learned_diff / temperature_structure).sum(dim=1)  # 软排序
+            learned_dists_expanded = learned_knn_dists.unsqueeze(0)
+            learned_dists_expanded_T = learned_knn_dists.unsqueeze(1)
+            learned_diff = learned_dists_expanded_T - learned_dists_expanded
+            learned_soft_ranks = torch.sigmoid(learned_diff / temperature_structure).sum(dim=1)
 
-            rank_loss = F.l1_loss(learned_soft_ranks / (max_k - 1), orig_soft_ranks / (max_k - 1))  # 排名损失
-            pair_loss = torch.mean((learned_diff.sign() - orig_diff.sign()).abs())  # 相对顺序一致性
-            combined_loss = rank_loss + 0.1 * pair_loss  # 组合结构损失
-            structure_losses.append(combined_loss)  # 收集
+            rank_loss = F.l1_loss(learned_soft_ranks / (max_k - 1), orig_soft_ranks / (max_k - 1))
+            pair_loss = torch.mean((learned_diff.sign() - orig_diff.sign()).abs())
+            combined_loss = rank_loss + 0.1 * pair_loss
+            structure_losses.append(combined_loss)
 
             # 统计排序一致性
-            orig_ranks = torch.argsort(orig_knn_dists)  # 原始排序
-            learned_ranks = torch.argsort(learned_knn_dists)  # 学到排序
-            rank_matches = (orig_ranks == learned_ranks).sum().item()  # 排序一致数
-            total_pairs += max_k  # 累计总对数
-            violated_pairs += (max_k - rank_matches)  # 统计不一致对
+            orig_ranks = torch.argsort(orig_knn_dists)
+            learned_ranks = torch.argsort(learned_knn_dists)
+            rank_matches = (orig_ranks == learned_ranks).sum().item()
+            total_pairs += max_k
+            violated_pairs += (max_k - rank_matches)
 
-        # 聚合结构损失（batch 平均）
         structure_loss = torch.mean(torch.stack(structure_losses))
-        violation_rate = violated_pairs / total_pairs if total_pairs > 0 else 0.0  # 一致性比例
+        violation_rate = violated_pairs / total_pairs if total_pairs > 0 else 0.0
 
     # ========== 4. 防坍缩损失 ==========
-    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)  # z1 标准差
-    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)  # z2 标准差
-    # 方差项：鼓励各维度方差不小于 gamma
+    std_z1 = torch.sqrt(torch.var(z1_flat, dim=0) + eps)
+    std_z2 = torch.sqrt(torch.var(z2_flat, dim=0) + eps)
     variance_loss = torch.mean(F.relu(gamma - std_z1)) + torch.mean(F.relu(gamma - std_z2))
 
-    # 协方差项：惩罚特征维度间相关性（去掉对角线）
-    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)  # 去均值
-    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)  # 去均值
-    cov_z1 = (z1_centered.T @ z1_centered) / (batch_size - 1)  # 协方差
-    cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)  # 协方差
+    z1_centered = z1_flat - torch.mean(z1_flat, dim=0, keepdim=True)
+    z2_centered = z2_flat - torch.mean(z2_flat, dim=0, keepdim=True)
+    cov_z1 = (z1_centered.T @ z1_centered) / (batch_size - 1)
+    cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)
 
-    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)  # 非对角 mask
-    offdiag_z1 = cov_z1 * off_diagonal_mask  # 去对角线
-    offdiag_z2 = cov_z2 * off_diagonal_mask  # 去对角线
-    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim * dim)  # z1 协方差损失
-    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim * dim)  # z2 协方差损失
-    covariance_loss = cov_loss_z1 + cov_loss_z2  # 协方差总损失
+    off_diagonal_mask = 1 - torch.eye(dim, device=z1.device, dtype=z1.dtype)
+    offdiag_z1 = cov_z1 * off_diagonal_mask
+    offdiag_z2 = cov_z2 * off_diagonal_mask
+    cov_loss_z1 = torch.sum(torch.square(offdiag_z1)) / (dim * dim)
+    cov_loss_z2 = torch.sum(torch.square(offdiag_z2)) / (dim * dim)
+    covariance_loss = cov_loss_z1 + cov_loss_z2
 
-    # 防坍缩损失 = 方差项 + 协方差项
     anticollapse_loss = variance_loss + covariance_loss
 
     # ========== 总损失（使用动态权重）==========
     # intra_loss 已移除（不再使用同模态 RS-CL），仅保留 cross/structure/anticollapse
-    weighted_cross_loss = lambda_cross_eff * cross_loss  # 跨模态加权
-    weighted_structure_loss = lambda_structure * structure_loss  # 结构加权
-    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss  # 防坍缩加权
+    weighted_cross_loss = lambda_cross_eff * cross_loss
+    weighted_structure_loss = lambda_structure * structure_loss
+    weighted_anticollapse_loss = lambda_anticollapse * anticollapse_loss
 
-    # 三项损失线性加权得到 CMP 总损失
     total_loss = weighted_cross_loss + weighted_structure_loss + weighted_anticollapse_loss
 
     # ========== 日志输出 ==========
-    step = contrastive_loss_with_structure.step_count  # 当前步数
-    cross_mode = "ITM" if itm_head is not None else "dot"  # 跨模态类型
-    logger = logging.getLogger(__name__)  # 日志器
+    step = contrastive_loss_with_structure.step_count
+    cross_mode = "ITM" if itm_head is not None else "dot"
+    logger = logging.getLogger(__name__)
 
     # 提取 soft label 信息
-    soft_label_val = itm_info.get('avg_neg_soft_label', 0.0) if itm_info is not None else 0.0  # 软负标签均值
+    soft_label_val = itm_info.get('avg_neg_soft_label', 0.0) if itm_info is not None else 0.0
 
     # 每 10 步：简洁一行日志
     if step % log_interval == 0:
-        total_val = total_loss.item()  # 当前总损失
+        total_val = total_loss.item()
         if itm_head is not None:
             logger.info(f"[CMP|{step:4d}] "
                   f"z1:{z1_internal_sim:.3f} z2:{z2_internal_sim:.3f} | "
@@ -963,10 +942,10 @@ def contrastive_loss_with_structure(
 
     # 每 100 步：详细损失分解
     if step % 100 == 0:
-        cross_val = cross_loss.item()  # 跨模态值
-        structure_val = structure_loss.item()  # 结构值
-        anticollapse_val = anticollapse_loss.item()  # 防坍缩值
-        total_val = total_loss.item()  # 总损失
+        cross_val = cross_loss.item()
+        structure_val = structure_loss.item()
+        anticollapse_val = anticollapse_loss.item()
+        total_val = total_loss.item()
 
         detail_log = (
             f"\n{'='*70}\n"
@@ -996,7 +975,7 @@ def contrastive_loss_with_structure(
             detail_log += f"    pos: {pos_mean:.4f}, neg: {neg_mean:.4f}, gap: {cross_gap:+.4f}, T: {temp_val:.4f}\n"
         detail_log += f"  Structure (top-{top_k}):   {structure_val:.4f} × {lambda_structure:.2f} = {structure_val * lambda_structure:.4f}\n"
         if max_k > 0 and total_pairs > 0:
-            consistent_rate = ((total_pairs - violated_pairs) / total_pairs) * 100  # 排序一致率
+            consistent_rate = ((total_pairs - violated_pairs) / total_pairs) * 100
             detail_log += f"    ranking consistency: {consistent_rate:.1f}%\n"
         detail_log += (
             f"  Anti-collapse:        {anticollapse_val:.4f} × {lambda_anticollapse:.2f} = {anticollapse_val * lambda_anticollapse:.4f}\n"
@@ -1811,6 +1790,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Velocity distillation: frozen anchor Expert state (initialized before online training)
         self._anchor_expert_state: dict[str, torch.Tensor] | None = None
 
+        # Quality conditioning for RECAP-style online training (additive architecture)
+        # quality_label: 1=positive(success), 0=negative(failure)
+        # Additive: output = condition_token + quality_gate(quality_embedding(label))
+        # condition_token 直通不被修改，quality 信号纯加性
+        quality_dim = getattr(config, 'quality_embed_dim', 128)
+        self.quality_dim = quality_dim
+        self.quality_embedding = nn.Embedding(2, quality_dim)
+        self.quality_gate = nn.Linear(quality_dim, action_expert_config.width, bias=False)
+        # 初始化：全零 → 初始行为=原始模型（无 quality 贡献）
+        nn.init.normal_(self.quality_embedding.weight, std=0.01)
+        nn.init.zeros_(self.quality_gate.weight)
+
         # 投影层
         self.proj_z1 = nn.Sequential(
             nn.Linear(paligemma_config.width, paligemma_config.width),
@@ -1934,6 +1925,26 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def _prepare_state(self, state: Tensor) -> Tensor:
+        """Ensure state is [B, max_state_dim] for state_proj."""
+        if state.dim() == 3:
+            state = state[:, -1, :]
+        return pad_vector(state, self.config.max_state_dim)
+
+    def _compute_z2_from_action_and_state(self, action_raw: Tensor, state: Tensor | None) -> Tensor:
+        """z2 = proj_z2(concat(action_raw, state_emb))."""
+        if state is None:
+            bsize = action_raw.shape[0]
+            state = torch.zeros(
+                bsize, self.config.max_state_dim, device=action_raw.device, dtype=action_raw.dtype
+            )
+        state_prep = self._prepare_state(state)
+        state_emb = self.state_proj(state_prep)
+        combined = torch.cat([action_raw, state_emb], dim=-1)
+        return _clamp_embedding_norm(
+            self.proj_z2(combined).to(dtype=torch.float32), self.config.embedding_max_norm
+        )
+
     def embed_prefix(
             self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1975,6 +1986,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks
+
+    def fuse_quality_condition(self, condition_token, quality_label):
+        """Fuse quality conditioning into condition_token via additive gate.
+
+        output = condition_token + quality_gate(quality_embedding(label))
+        condition_token 直通不被修改，quality 信号纯加性。
+
+        Args:
+            condition_token: [batch, hidden_dim] from content_attention(prev_actions)
+            quality_label: [batch] int tensor, 1=positive(success), 0=negative(failure)
+
+        Returns:
+            [batch, hidden_dim] quality-conditioned token
+        """
+        quality_emb = self.quality_embedding(quality_label)  # [batch, quality_dim]
+        quality_signal = self.quality_gate(quality_emb)  # [batch, hidden_dim]
+        return condition_token + quality_signal
 
     def embed_suffix(self, noisy_actions, timestep, condition_token=None):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
@@ -2042,24 +2070,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
-
-    def _prepare_state(self, state: Tensor) -> Tensor:
-        """Ensure state is [B, max_state_dim] for state_proj."""
-        if state.dim() == 3:
-            state = state[:, -1, :]
-        return pad_vector(state, self.config.max_state_dim)
-
-    def _compute_z2_from_action_and_state(self, action_raw: Tensor, state: Tensor | None) -> Tensor:
-        """z2 = proj_z2(concat(action_raw, state_emb))，使 z2 同时包含 action 和 state 信息。"""
-        if state is None:
-            bsize = action_raw.shape[0]
-            state = torch.zeros(bsize, self.config.max_state_dim, device=action_raw.device, dtype=action_raw.dtype)
-        state_prep = self._prepare_state(state)
-        state_emb = self.state_proj(state_prep)
-        combined = torch.cat([action_raw, state_emb], dim=-1)
-        return _clamp_embedding_norm(
-            self.proj_z2(combined).to(dtype=torch.float32), self.config.embedding_max_norm
-        )
 
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None,
                 condition_token=None, return_internals=False) -> Tensor | tuple[Tensor, dict]:
@@ -2139,6 +2149,53 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             }
         return loss
 
+    def forward_velocity_at(self, x_t, time, condition_token, prefix_embs,
+                            prefix_pad_masks, prefix_att_masks) -> Tensor:
+        """在指定的 (x_t, t) 点计算 Expert 速度场，复用已计算的 VLM prefix。
+
+        用于截断反传 feature_loss：前 N-1 步 ODE no_grad，最后 1 步 with_grad。
+        参考 ReFL (Xu et al. 2023) / DRaFT (Clark et al. 2023) 的截断反传方案。
+
+        Args:
+            x_t: [batch, chunk_size, action_dim] 当前 ODE 状态
+            time: [batch] 当前时间步
+            condition_token: [batch, hidden_dim] 条件 token
+            prefix_embs: VLM 前缀嵌入（从 bc forward 复用）
+            prefix_pad_masks: VLM 前缀 pad mask
+            prefix_att_masks: VLM 前缀 attention mask
+
+        Returns:
+            v_t: [batch, chunk_size, action_dim] 速度场预测
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t, time, condition_token
+        )
+
+        if (self.paligemma_with_expert.paligemma.language_model.layers[0]
+                .self_attn.q_proj.weight.dtype == torch.bfloat16):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
+
     def _forward_anchor(self, internals: dict, condition_token=None) -> torch.Tensor:
         """Compute velocity prediction using frozen anchor Expert params.
 
@@ -2209,7 +2266,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             img_masks,
             tokens,
             masks,
-            state: Tensor | None = None,
+            state=None,
             future_images=None,
             future_img_masks=None,
             neg_gt_actions=None,
@@ -2222,14 +2279,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """三元因果链对比学习: obs_t ↔ action_t ↔ obs_{t+k}
 
         使用 ALBEF ITM (Image-Text Matching) 做匹配判断，不依赖 dot product。
-        z2 同时包含 action 和 state 信息（通过 state_proj 拼接后在 proj_z2 前融合）。
 
         Args:
             images: 当前帧图像列表 (obs_t)
             img_masks: 当前帧图像掩码列表
             tokens: 语言 tokens
             masks: 语言 token 掩码
-            state: [B, state_dim] 或 [B, n_obs_steps, state_dim]，机器人状态（关节角等）
             future_images: 未来帧图像列表 (obs_{t+k})，None 时退化为二元
             future_img_masks: 未来帧图像掩码列表
             neg_gt_actions: [B, att_len, action_dim] 同 episode GT 时序错位动作（L1 负样本）
@@ -2241,7 +2296,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         Returns:
             对比学习损失 (expanded to [batch_size, 1, action_dim])
         """
-        # 功能总结：构造 z1/z2/z3 及其负样本，计算 CMP 各子项损失，并附加前向动力学损失。
         if self.cls_head_prefix is None:
             raise ValueError(
                 "cls_head_prefix is not initialized. Please set part_layer_num in config."
@@ -2255,19 +2309,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 "part_layer_num is not set in config."
             )
 
-        batch_size = tokens.shape[0]  # batch 大小
-        device = tokens.device  # 设备
+        batch_size = tokens.shape[0]
+        device = tokens.device
 
         # ========== VLM 前向（共用辅助函数） ==========
-        action_expert_config = get_gemma_config(self.config.action_expert_variant)  # expert 配置
-        cls_head = self.cls_head_prefix.expand(batch_size, -1, -1)  # 复制 CLS token
-        cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)  # CLS pad mask
-        cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)  # CLS attention mask
+        action_expert_config = get_gemma_config(self.config.action_expert_variant)
+        cls_head = self.cls_head_prefix.expand(batch_size, -1, -1)
+        cls_pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        cls_att_mask = torch.tensor([0], dtype=torch.bool, device=device)
         dummy_suffix_embs = torch.zeros(
             batch_size, 1, action_expert_config.width, dtype=cls_head.dtype, device=device
         )
-        dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)  # 虚拟 suffix pad
-        dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)  # 虚拟 suffix att
+        dummy_suffix_pad_masks = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        dummy_suffix_att_masks = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
 
         def forward_partial_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids):
             intermediate_embeds, intermediate_state = self.paligemma_with_expert.forward_partial(
@@ -2282,11 +2336,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         def encode_obs(imgs, img_msks):
             """将一组图像通过 VLM + ObsQueryBridge 编码为 z [B, 512]"""
-            # 1) 取前缀 embedding（图像+语言）
             prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                 imgs, img_msks, tokens, masks
             )
-            # 2) 拼接 cls token，形成用于 CMP 的序列输入
             prefix_embs_with_cls = torch.cat(
                 [cls_head.to(dtype=prefix_embs.dtype), prefix_embs], dim=1
             )
@@ -2294,23 +2346,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prefix_att_masks_with_cls = torch.cat(
                 [cls_att_mask.unsqueeze(0).expand(batch_size, -1), prefix_att_masks], dim=1
             )
-            # 3) 构造 attention mask
             pad_msks = torch.cat([prefix_pad_masks_with_cls, dummy_suffix_pad_masks], dim=1)
             att_msks = torch.cat([prefix_att_masks_with_cls, dummy_suffix_att_masks], dim=1)
             att_2d = make_att_2d_masks(pad_msks, att_msks)
             pos_ids = torch.cumsum(pad_msks, dim=1) - 1
             att_4d = self._prepare_attention_masks_4d(att_2d)
 
-            # 4) 仅前向到 part_layer_num，得到中间特征
             inter_embeds, _ = self._apply_checkpoint(
                 forward_partial_func, prefix_embs_with_cls, dummy_suffix_embs, att_4d, pos_ids
             )
             # vlm_seq = inter_embeds[0]  # 原版：CMP 梯度回传到 VLM front 6 layers
-            # 5) 关键：CMP 梯度在此处截断，VLM 仅由 BC 更新
             vlm_seq = inter_embeds[0].detach()  # 切断 CMP → VLM 梯度，BC 独占 VLM 更新
-            # 6) 通过 ObsQueryBridge 得到 z 表示
             z = self.obs_query_bridge(vlm_seq).to(dtype=torch.float32)
-            # 7) 可选的 embedding 范数裁剪
             return _clamp_embedding_norm(z, self.config.embedding_max_norm)
 
         # ========== z1: obs_t ==========
@@ -2319,29 +2366,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             raise ValueError(f"Expected cmp_vec_0 to be 2D, got shape {cmp_vec_0.shape}")
 
         # ========== z2: action_t + state → ContentAttention + state_proj → proj_z2 ==========
-        attn_act_len = self.content_attention.attn_act_len  # 取前几步动作
-        actions = self.sample_actions(images, img_masks, tokens, masks)  # 采样动作序列
-        origin_action_dim = self.config.output_features[ACTION].shape[0]  # 原始动作维度
-        selected_actions = actions[:, :attn_act_len, :origin_action_dim]  # 选取用于 CMP 的动作
-        cmp_vec_1_raw = self.content_attention(selected_actions)  # 动作聚合表征
+        attn_act_len = self.content_attention.attn_act_len
+        actions = self.sample_actions(images, img_masks, tokens, masks)
+        origin_action_dim = self.config.output_features[ACTION].shape[0]
+        selected_actions = actions[:, :attn_act_len, :origin_action_dim]
+        cmp_vec_1_raw = self.content_attention(selected_actions)
         cmp_vec_1 = self._compute_z2_from_action_and_state(cmp_vec_1_raw, state)
 
-        # ========== z2_neg: 同 episode GT 时序错位负样本（使用当前帧 state）==========
-        cmp_vec_1_neg = None  # L1 负样本表征
-        neg_valid = None  # L1 负样本有效标记
+        # ========== z2_neg: 同 episode GT 时序错位负样本 ==========
+        cmp_vec_1_neg = None
+        neg_valid = None
         if neg_gt_actions is not None and neg_action_valid is not None:
+            # neg_gt_actions: [B, att_len, action_dim]
             cmp_vec_1_neg_raw = self.content_attention(neg_gt_actions)
             cmp_vec_1_neg = self._compute_z2_from_action_and_state(cmp_vec_1_neg_raw, state)
             neg_valid = neg_action_valid  # [B] bool
 
         # ========== z3: obs_{t+k} ==========
-        cmp_vec_2 = None  # z3：未来观测表征
+        cmp_vec_2 = None
         if future_images is not None and future_img_masks is not None:
             cmp_vec_2 = encode_obs(future_images, future_img_masks)
 
         # ========== z3_neg: 同 episode 远离 t+k 的 GT obs（L2 负样本）==========
-        cmp_vec_2_neg = None  # z3_neg：远离未来观测
-        neg_future_valid_flag = None  # L2 负样本有效标记
+        cmp_vec_2_neg = None
+        neg_future_valid_flag = None
         if neg_future_images is not None and neg_future_img_masks is not None:
             cmp_vec_2_neg = encode_obs(neg_future_images, neg_future_img_masks)
             neg_future_valid_flag = neg_future_valid  # [B] bool
@@ -2353,7 +2401,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
 
         # ========== 计算 L2 负样本距离（obs 嵌入 L2 距离）==========
-        neg_future_distance = None  # L2 负样本距离
+        neg_future_distance = None
         if cmp_vec_2 is not None and cmp_vec_2_neg is not None:
             # [B] 每个样本的 obs 嵌入 L2 距离
             neg_future_distance = torch.norm(cmp_vec_2 - cmp_vec_2_neg, p=2, dim=-1)
@@ -2372,7 +2420,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # ========== 调用 contrastive_loss_with_structure ==========
         cmp_temp = getattr(self.config, "cmp_temperature", 0.07)
-        loss_scalar, cmp_loss_info = contrastive_loss_with_structure(  # CMP 主损失
+        loss_scalar, cmp_loss_info = contrastive_loss_with_structure(
             z1=cmp_vec_0,
             z2=cmp_vec_1,
             z2_original=selected_actions,
@@ -2390,11 +2438,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # ========== L_forward: 前向动力学预测 loss（cosine loss）==========
         # 用 cosine loss 而非 MSE：只关注方向预测，不受 embedding norm 膨胀影响
         if cmp_vec_2 is not None:  # z3 存在时才计算
-            # 仅更新 forward_model：输入与目标均 detach
             predicted_z3 = self.forward_model(cmp_vec_0.detach(), cmp_vec_1.detach())
             cos_sim = F.cosine_similarity(predicted_z3, cmp_vec_2.detach(), dim=-1)
             l_forward = (1.0 - cos_sim).mean()
-            # 将前向动力学损失叠加到 CMP 总损失
             loss_scalar = loss_scalar + l_forward
 
             with torch.no_grad():
@@ -2429,9 +2475,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # 扩展为 [batch_size, 1, action_dim] 以匹配 forward 返回格式
         action_dim = self.config.max_action_dim
-        losses = loss_scalar.view(1, 1, 1).expand(batch_size, 1, action_dim)  # 扩展形状
+        losses = loss_scalar.view(1, 1, 1).expand(batch_size, 1, action_dim)
 
-        # 递增 CMP 步数计数器（用于日志/调度）
         self.cmp_step += 1
         return losses, cmp_loss_info
 
@@ -2475,6 +2520,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.config.max_action_dim,
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
+
+        # 存储本次 noise 供 feature_loss 复用
+        self._last_sample_noise = noise.detach().clone()
 
         # 如果传入了预计算的 prefix_embs，则复用；否则调用 embed_prefix
         if prefix_embs is None:
@@ -2642,6 +2690,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
 
+        # ODE 步级诊断收集
+        ode_step_norms = []
+        ode_velocity_norms = []
+
+        ode_step_idx = 0
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
 
@@ -2679,9 +2732,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             suffix_out = suffix_out.to(dtype=torch.float32)
             v_t = self.action_out_proj(suffix_out)
 
+            # ODE 诊断：记录每步的 velocity norm 和 action norm
+            with torch.no_grad():
+                ode_velocity_norms.append(v_t.norm(dim=-1).mean().item())
+
             # Euler step
             x_t = x_t + dt * v_t
             time = time + dt
+
+            with torch.no_grad():
+                ode_step_norms.append(x_t.norm(dim=-1).mean().item())
+            ode_step_idx += 1
+
+        # 存储 ODE 诊断到模型属性，供 forward_loss 读取
+        self._ode_diag = {
+            "step_norms": ode_step_norms,        # action norm at each ODE step
+            "velocity_norms": ode_velocity_norms,  # velocity norm at each step
+        }
 
         return x_t
 
@@ -2810,18 +2877,7 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            try:
-                missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
-            except Exception as load_err:
-                # When strict=True and checkpoint lacks CMP modules (cls_head, itm_head, etc.), retry with strict=False
-                if strict:
-                    print(
-                        f"Strict load failed ({load_err}). Retrying with strict=False to load matching keys "
-                        "(missing CMP modules will remain randomly initialized)."
-                    )
-                    missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
-                else:
-                    raise
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -2845,8 +2901,6 @@ class PI05Policy(PreTrainedPolicy):
 
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
-            elif missing_keys:
-                print("Loaded matching keys; remaining missing keys (e.g. CMP modules) left at random init.")
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
@@ -2931,7 +2985,46 @@ class PI05Policy(PreTrainedPolicy):
         if hasattr(self.model, 'time_mlp_out'):
             online_params.extend(self.model.time_mlp_out.parameters())
 
+        # quality conditioning 参数 (RECAP fusion)
+        if hasattr(self.model, 'quality_embedding'):
+            online_params.extend(self.model.quality_embedding.parameters())
+        if hasattr(self.model, 'quality_gate'):
+            online_params.extend(self.model.quality_gate.parameters())
+
         return online_params
+
+    def get_online_optim_param_groups(self, expert_lr: float, quality_lr: float):
+        """返回带分离学习率的参数组。
+
+        Expert 参数用小 lr（已收敛），quality conditioning 参数用大 lr（从零学习）。
+        """
+        expert_params = []
+        quality_params = []
+
+        # Expert 参数
+        if hasattr(self.model, 'paligemma_with_expert'):
+            expert_params.extend(
+                self.model.paligemma_with_expert.gemma_expert.parameters()
+            )
+        if hasattr(self.model, 'action_in_proj'):
+            expert_params.extend(self.model.action_in_proj.parameters())
+        if hasattr(self.model, 'action_out_proj'):
+            expert_params.extend(self.model.action_out_proj.parameters())
+        if hasattr(self.model, 'time_mlp_in'):
+            expert_params.extend(self.model.time_mlp_in.parameters())
+        if hasattr(self.model, 'time_mlp_out'):
+            expert_params.extend(self.model.time_mlp_out.parameters())
+
+        # Quality conditioning 参数
+        if hasattr(self.model, 'quality_embedding'):
+            quality_params.extend(self.model.quality_embedding.parameters())
+        if hasattr(self.model, 'quality_gate'):
+            quality_params.extend(self.model.quality_gate.parameters())
+
+        param_groups = [{"params": expert_params, "lr": expert_lr}]
+        if quality_params:
+            param_groups.append({"params": quality_params, "lr": quality_lr})
+        return param_groups
 
     def get_offline_optim_params(self):
         """返回 offline 训练需要的参数（所有参数）。
@@ -2952,6 +3045,11 @@ class PI05Policy(PreTrainedPolicy):
             ("time_mlp_in.", self.model.time_mlp_in),
             ("time_mlp_out.", self.model.time_mlp_out),
         ]
+        # quality conditioning 参数也纳入 anchor
+        if hasattr(self.model, 'quality_embedding'):
+            modules.append(("quality_embedding.", self.model.quality_embedding))
+        if hasattr(self.model, 'quality_gate'):
+            modules.append(("quality_gate.", self.model.quality_gate))
         for prefix, module in modules:
             for name, param in module.named_parameters():
                 yield prefix + name, param
@@ -2966,6 +3064,17 @@ class PI05Policy(PreTrainedPolicy):
         n_params = sum(v.numel() for v in state.values())
         mem_mb = sum(v.nbytes for v in state.values()) / (1024 ** 2)
         logging.info(f"[Anchor] Snapshotted {n_params:,} Expert params ({mem_mb:.0f} MB)")
+
+    def update_anchor_ema(self, decay: float = 0.995):
+        """EMA 更新 anchor: anchor = decay * anchor + (1-decay) * current."""
+        if self.model._anchor_expert_state is None:
+            return
+        with torch.no_grad():
+            for key, param in self._iter_expert_params():
+                if key in self.model._anchor_expert_state:
+                    self.model._anchor_expert_state[key].mul_(decay).add_(
+                        param.data.detach(), alpha=1.0 - decay
+                    )
 
     def _apply_param_cmp(self) -> None:
         self.offline_mode = True
@@ -3037,6 +3146,12 @@ class PI05Policy(PreTrainedPolicy):
         # if self.model.content_attention is not None:
         #     online_params.extend(self.model.content_attention.parameters())
 
+        # quality conditioning 参数 (RECAP fusion)
+        if hasattr(self.model, 'quality_embedding'):
+            online_params.extend(self.model.quality_embedding.parameters())
+        if hasattr(self.model, 'quality_gate'):
+            online_params.extend(self.model.quality_gate.parameters())
+
         # 设置所有参数的 requires_grad
         online_param_ids = {id(p) for p in online_params}
         for p in self.parameters():
@@ -3055,6 +3170,7 @@ class PI05Policy(PreTrainedPolicy):
         self._stale_itm_chunk_ids: list[int] = []     # 每个 stale score 对应的 chunk index
         self._stale_itm_segment_ids: list[int] = []   # 每个 stale score 对应的 segment index (1-4)
         self._full_action_chunk: Tensor | None = None  # 保存完整 chunk_size 的 action chunk
+        self._chunk_noise: Tensor | None = None        # 生成当前 chunk 所用的 noise（用于 feature_loss 复用）
         self._chunk_segment_index: int = 0             # 当前 chunk 内已使用到第几段 (0=fresh刚生成, 1-4=stale)
         self._prev_chunk_actions: Tensor | None = None  # 上一 chunk 末尾 attn_act_len 步动作，用于 condition_token
         self._current_chunk_idx: int = -1              # 当前 chunk 编号
@@ -3067,10 +3183,6 @@ class PI05Policy(PreTrainedPolicy):
         self._drift_segment_ids: list[int] = []           # 对应 segment index
         self._replan_count: int = 0                        # drift 触发 replan 的次数
         self._force_replan_next: bool = False                 # 自适应步长：中等 drift 触发的延迟 replan 标志
-
-        # 模态对齐分析：z1(obs) 和 z2(action) 嵌入
-        self._z1_embeddings: list[Tensor] = []  # z1 观测嵌入，每次生成新 chunk 时 [B, 512]
-        self._z2_embeddings: list[Tensor] = []  # z2 动作嵌入，每次生成新 chunk 时 [B, 512]
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -3320,18 +3432,20 @@ class PI05Policy(PreTrainedPolicy):
                     images, img_masks = self._preprocess_images(batch)
                     tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
                     masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-                    attn_act_len = self.config.attn_act_len
-                    state = batch.get(OBS_STATE)
-                    _, stale_score, actual_z3 = self._should_replan(
-                        images, img_masks, tokens, masks, segment[:, :attn_act_len, :],
-                        state=state,
+
+                    # 预计算 prefix_embs（用于 _encode_obs 和可能的 replan 复用）
+                    stale_prefix_embs, stale_prefix_pad_masks, stale_prefix_att_masks = self.model.embed_prefix(
+                        images, img_masks, tokens, masks
                     )
-                    self._stale_itm_scores.append(stale_score.detach().cpu())
-                    self._stale_itm_chunk_ids.append(self._current_chunk_idx)
-                    self._stale_itm_segment_ids.append(seg_idx)
-                    if len(self._stale_itm_scores) % 10 == 1:
-                        print(f"[ITM-stale] chunk={self._current_chunk_idx}, seg={seg_idx}, "
-                              f"score={stale_score.mean().item():.4f}")
+
+                    # 只编码 obs 得到 z1，不计算 z2/ITM（drift 只需要 z1）
+                    attn_act_len = self.config.attn_act_len
+                    actual_z3 = self._encode_obs(
+                        images, img_masks, tokens, masks,
+                        prefix_embs=stale_prefix_embs,
+                        prefix_pad_masks=stale_prefix_pad_masks,
+                        prefix_att_masks=stale_prefix_att_masks,
+                    )
 
                     # ForwardModel drift 计算（cosine distance，与训练 loss 一致）
                     if (self._predicted_z3 is not None and actual_z3 is not None
@@ -3346,8 +3460,12 @@ class PI05Policy(PreTrainedPolicy):
                         # drift-based replan 判断（三级响应）
                         drift_val = drift.mean().item()
                         if drift_threshold > 0 and drift_val > drift_threshold:
-                            # 大 drift → 立即 replan
+                            # 大 drift → 立即 replan，保存 prefix_embs 和 z1 供 predict_action_chunk 复用
                             trigger_replan = True
+                            self._cached_prefix_embs = stale_prefix_embs
+                            self._cached_prefix_pad_masks = stale_prefix_pad_masks
+                            self._cached_prefix_att_masks = stale_prefix_att_masks
+                            self._cached_z1 = actual_z3
                             self._replan_count += 1
                             print(f"[Replan-immediate] chunk={self._current_chunk_idx}, seg={seg_idx}, "
                                   f"drift={drift_val:.4f} > high={drift_threshold:.4f}, "
@@ -3357,20 +3475,52 @@ class PI05Policy(PreTrainedPolicy):
                             self._force_replan_next = True
                             print(f"[Replan-scheduled] chunk={self._current_chunk_idx}, seg={seg_idx}, "
                                   f"drift={drift_val:.4f} > mid={drift_threshold_mid:.4f}")
-                        if not trigger_replan:
-                            # 不 replan 时，为下一段准备 predicted_z3_next
-                            if seg_idx + 1 < n_segments:
-                                next_start = (seg_idx + 1) * n_action_steps
-                                next_end = next_start + n_action_steps
-                                next_segment = self._full_action_chunk[:, next_start:next_end]
-                                origin_action_dim = self.config.output_features[ACTION].shape[0]
-                                z2_next_raw = self.model.content_attention(next_segment[:, :attn_act_len, :origin_action_dim])
-                                z2_next = self.model._compute_z2_from_action_and_state(z2_next_raw, state)
-                                self._predicted_z3 = self.model.forward_model(actual_z3, z2_next).detach()
 
                         if len(self._drift_scores) % 10 == 1:
                             print(f"[Drift] chunk={self._current_chunk_idx}, seg={seg_idx}, "
                                   f"drift={drift.mean().item():.4f}")
+
+                    # content_attention 特征距离触发 replan（独立于 forward_model drift）
+                    content_feat_threshold = getattr(self.config, 'replan_content_feat_threshold', 0.0)
+                    if (not trigger_replan
+                            and content_feat_threshold > 0
+                            and self._prev_chunk_actions is not None
+                            and hasattr(self.model, 'content_attention')
+                            and self.model.content_attention is not None):
+                        origin_action_dim_cf = self.config.output_features[ACTION].shape[0]
+                        attn_act_len_cf = min(self.config.attn_act_len, segment.shape[1])
+                        z2_current = self.model.content_attention(
+                            segment[:, :attn_act_len_cf, :origin_action_dim_cf]
+                        )
+                        z2_prev = self.model.content_attention(self._prev_chunk_actions)
+                        feat_dist_cf = (1.0 - F.cosine_similarity(z2_prev, z2_current, dim=-1)).mean().item()
+                        if feat_dist_cf > content_feat_threshold:
+                            trigger_replan = True
+                            self._cached_prefix_embs = stale_prefix_embs
+                            self._cached_prefix_pad_masks = stale_prefix_pad_masks
+                            self._cached_prefix_att_masks = stale_prefix_att_masks
+                            self._cached_z1 = actual_z3
+                            self._replan_count += 1
+                            print(f"[Replan-feat] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"feat_dist={feat_dist_cf:.4f} > threshold={content_feat_threshold:.4f}, "
+                                  f"replan #{self._replan_count}")
+                        elif len(self._drift_scores) % 10 == 1:
+                            print(f"[FeatDist] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"feat_dist={feat_dist_cf:.4f}")
+
+                    if (not trigger_replan
+                            and actual_z3 is not None
+                            and hasattr(self.model, 'forward_model') and self.model.forward_model is not None):
+                        # 不 replan 时，为下一段准备 predicted_z3_next
+                        if seg_idx + 1 < n_segments:
+                            next_start = (seg_idx + 1) * n_action_steps
+                            next_end = next_start + n_action_steps
+                            next_segment = self._full_action_chunk[:, next_start:next_end]
+                            origin_action_dim = self.config.output_features[ACTION].shape[0]
+                            z2_next_raw = self.model.content_attention(next_segment[:, :attn_act_len, :origin_action_dim])
+                            state = batch.get(OBS_STATE)
+                            z2_next = self.model._compute_z2_from_action_and_state(z2_next_raw, state)
+                            self._predicted_z3 = self.model.forward_model(actual_z3, z2_next).detach()
 
                 if not trigger_replan:
                     # 正常使用旧 segment
@@ -3381,8 +3531,51 @@ class PI05Policy(PreTrainedPolicy):
             if trigger_replan or self._full_action_chunk is None or self._chunk_segment_index >= n_segments:
                 # ---- 需要新 chunk：生成动作，计算 fresh ITM ----
                 self._current_chunk_idx += 1
-                actions = self.predict_action_chunk(batch)  # 内部计算 fresh ITM + ForwardModel predicted_z3
+
+                # 从上一 chunk 末尾动作计算 condition_token（首次为 None，与训练一致）
+                cond_token = None
+                if (self._prev_chunk_actions is not None
+                        and hasattr(self.model, 'content_attention')
+                        and self.model.content_attention is not None):
+                    cond_token = self.model.content_attention(self._prev_chunk_actions)
+                    # Quality conditioning: 推理时始终用 positive (quality_label=1)
+                    if hasattr(self.model, 'fuse_quality_condition'):
+                        pos_label = torch.ones(cond_token.shape[0], dtype=torch.long,
+                                               device=cond_token.device)
+                        cond_token = self.model.fuse_quality_condition(cond_token, pos_label)
+
+                # 如果有缓存的 prefix_embs（来自 stale path 的 immediate replan），则复用
+                cached_prefix = getattr(self, '_cached_prefix_embs', None)
+                if cached_prefix is not None:
+                    actions = self.predict_action_chunk(
+                        batch,
+                        prefix_embs=self._cached_prefix_embs,
+                        prefix_pad_masks=self._cached_prefix_pad_masks,
+                        prefix_att_masks=self._cached_prefix_att_masks,
+                        cached_z1=getattr(self, '_cached_z1', None),
+                        condition_token=cond_token,
+                    )
+                    # 清理缓存
+                    self._cached_prefix_embs = None
+                    self._cached_prefix_pad_masks = None
+                    self._cached_prefix_att_masks = None
+                    self._cached_z1 = None
+                else:
+                    actions = self.predict_action_chunk(batch, condition_token=cond_token)
+
                 self._full_action_chunk = actions.detach().clone()
+
+                # 保存生成本 chunk 所用的 noise（从 model._last_sample_noise 获取）
+                if hasattr(self.model, '_last_sample_noise') and self.model._last_sample_noise is not None:
+                    self._chunk_noise = self.model._last_sample_noise.detach().clone()
+
+                # 保存本 chunk 末尾 attn_act_len 步动作，作为下次 condition_token 的输入
+                attn_act_len = getattr(self.config, 'attn_act_len', 0)
+                if attn_act_len > 0:
+                    original_action_dim = self.config.output_features[ACTION].shape[0]
+                    chunk_size = actions.shape[1]
+                    end_start = max(0, chunk_size - attn_act_len)
+                    self._prev_chunk_actions = actions[:, end_start:, :original_action_dim].detach().clone()
 
                 # 取第一段放入 queue
                 segment = actions[:, :n_action_steps]
@@ -3391,20 +3584,29 @@ class PI05Policy(PreTrainedPolicy):
 
                 if self._current_chunk_idx <= 2 or self._current_chunk_idx % 5 == 0:
                     print(f"[ITM-fresh] chunk={self._current_chunk_idx}, "
-                          f"fresh_count={len(self._itm_scores)}, stale_count={len(self._stale_itm_scores)}, "
+                          f"fresh_count={len(self._itm_scores)}, "
                           f"replan_count={self._replan_count}")
 
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def _encode_obs(self, images, img_masks, tokens, masks) -> Tensor:
-        """将 obs 编码为 z [B, 512]，与训练时 encode_obs 路径一致。"""
+    def _encode_obs(self, images, img_masks, tokens, masks,
+                    prefix_embs=None, prefix_pad_masks=None, prefix_att_masks=None) -> Tensor:
+        """将 obs 编码为 z [B, 512]，与训练时 encode_obs 路径一致。
+
+        Args:
+            images, img_masks, tokens, masks: 输入数据
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入则跳过内部的 embed_prefix 调用（用于优化重复计算）
+        """
         device = tokens.device
         batch_size = tokens.shape[0]
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
-            images, img_masks, tokens, masks
-        )
+        # 如果传入了预计算的 prefix_embs，则复用；否则调用 embed_prefix
+        if prefix_embs is None:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
+                images, img_masks, tokens, masks
+            )
         cls_head = self.model.cls_head_prefix.expand(batch_size, -1, -1).to(dtype=prefix_embs.dtype)
         prefix_embs_with_cls = torch.cat([cls_head, prefix_embs], dim=1)
 
@@ -3451,11 +3653,14 @@ class PI05Policy(PreTrainedPolicy):
             predict_actions: Tensor,
             state: Tensor | None = None,
             z1: Tensor = None,
+            prefix_embs=None,
+            prefix_pad_masks=None,
+            prefix_att_masks=None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Check if replanning is needed based on ITM Head matching score.
 
-        使用训练时相同的编码路径：ObsQueryBridge 提取 z1，ContentAttention + state_proj + proj_z2 提取 z2，
+        使用训练时相同的编码路径：ObsQueryBridge 提取 z1，ContentAttention + proj_z2 提取 z2，
         ITM Head 判断 (obs, action) 是否匹配。匹配分数低于阈值时触发 replan。
 
         Args:
@@ -3464,8 +3669,9 @@ class PI05Policy(PreTrainedPolicy):
             tokens: Current language tokens [batch_size, seq_len]
             masks: Current language token masks [batch_size, seq_len]
             predict_actions: Previously predicted actions [batch_size, seq_len, action_dim]
-            state: [B, state_dim] 机器人状态，用于 z2 拼接
             z1: 预计算的 obs 嵌入 [batch_size, 512]，如果为 None 则内部编码
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入且 z1 为 None，则传给 _encode_obs 复用（用于优化重复计算）
 
         Returns:
             tuple: (should_replan: Tensor [batch_size], itm_score: Tensor [batch_size], z1: Tensor [batch_size, 512])
@@ -3493,7 +3699,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # ========== z1: obs_t → VLM 前 6 层 → ObsQueryBridge ==========
         if z1 is None:
-            z1 = self._encode_obs(images, img_masks, tokens, masks)
+            z1 = self._encode_obs(images, img_masks, tokens, masks,
+                                  prefix_embs=prefix_embs,
+                                  prefix_pad_masks=prefix_pad_masks,
+                                  prefix_att_masks=prefix_att_masks)
 
         # ========== z2: action + state → ContentAttention + state_proj → proj_z2 ==========
         attn_act_len = self.model.content_attention.attn_act_len
@@ -3512,16 +3721,48 @@ class PI05Policy(PreTrainedPolicy):
         return should_replan, itm_score, z1
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor],
+        prefix_embs: Tensor = None,
+        prefix_pad_masks: Tensor = None,
+        prefix_att_masks: Tensor = None,
+        cached_z1: Tensor = None,
+        condition_token: Tensor = None,
+        **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
+        """Predict a chunk of actions given environment observations.
+
+        Args:
+            batch: 输入数据批次
+            prefix_embs, prefix_pad_masks, prefix_att_masks: 可选的预计算 embed_prefix 结果，
+                如果传入则跳过内部的 embed_prefix 调用（用于 stale path 触发 replan 时复用）
+            cached_z1: 可选的预计算 obs 嵌入 z1，如果传入则跳过 _encode_obs（用于 stale path
+                触发 replan 时复用，避免重复 forward_partial）
+            condition_token: [batch, hidden_dim] 可选的条件 token（来自上一 chunk 末尾动作的
+                content_attention），与训练时 sample_actions_differentiable 保持一致
+        """
         self.eval()
 
-        # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
-        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        # Prepare inputs（有 prefix_embs 时 sample_actions 不需要 images，跳过预处理）
+        if prefix_embs is not None:
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            images, img_masks = None, None
+        else:
+            images, img_masks = self._preprocess_images(batch)
+            tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.model.embed_prefix(
+                images, img_masks, tokens, masks
+            )
 
-        # Sample actions using the model
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        # Sample actions using the model（复用 prefix_embs）
+        actions = self.model.sample_actions(
+            images, img_masks, tokens, masks,
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_att_masks=prefix_att_masks,
+            condition_token=condition_token,
+            **kwargs
+        )
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -3532,27 +3773,27 @@ class PI05Policy(PreTrainedPolicy):
                 and hasattr(self.model, 'obs_query_bridge') and self.model.obs_query_bridge is not None):
             attn_act_len = self.config.attn_act_len
             state = batch.get(OBS_STATE)
+            # 复用 cached_z1（来自 stale path 的 _encode_obs）跳过重复的 forward_partial
             _, itm_score, z1 = self._should_replan(
                 images, img_masks, tokens, masks, actions[:, :attn_act_len, :],
                 state=state,
+                z1=cached_z1,
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_att_masks=prefix_att_masks,
             )
             self._itm_scores.append(itm_score.detach().cpu())
             # 每 10 次打印一次 ITM score 信息
             if len(self._itm_scores) % 10 == 1:
                 print(f"[ITM] chunk #{len(self._itm_scores)}, score: {itm_score.mean().item():.4f} (batch mean)")
 
-            # 计算 z2 用于模态对齐分析和 ForwardModel（当 z1 有效时）
-            if z1 is not None:
+            # ForwardModel: 预测执行 action[0:k] 后的 obs 嵌入
+            if (hasattr(self.model, 'forward_model') and self.model.forward_model is not None
+                    and z1 is not None):
                 origin_action_dim = self.config.output_features[ACTION].shape[0]
                 z2_raw = self.model.content_attention(actions[:, :attn_act_len, :origin_action_dim])
                 z2 = self.model._compute_z2_from_action_and_state(z2_raw, state)
-                # 存储 z1/z2 嵌入用于模态对齐分析
-                self._z1_embeddings.append(z1.detach().cpu())
-                self._z2_embeddings.append(z2.detach().cpu())
-
-                # ForwardModel: 预测执行 action[0:k] 后的 obs 嵌入
-                if hasattr(self.model, 'forward_model') and self.model.forward_model is not None:
-                    self._predicted_z3 = self.model.forward_model(z1, z2).detach()
+                self._predicted_z3 = self.model.forward_model(z1, z2).detach()
 
         return actions
 
@@ -3571,10 +3812,10 @@ class PI05Policy(PreTrainedPolicy):
                           以及对应的 images/tokens）。如果为 None 且 feature_weight > 0，
                           则从 batch 中取 prev_actions/pred_action（向后兼容）。
         """
-        # 功能总结：根据 online 标志计算在线 loss 或离线 BC+CMP 组合 loss，并返回日志字典。
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        if online:
-            # 在线训练：仅更新与动作生成相关的子模块
+
+        # 参数冻结：online 和 bc_only 都冻结 VLM/CMP，只允许动作专家梯度
+        if online or bc_only:
             if self.offline_mode is True:
                 self._apply_online_params()
 
@@ -3590,14 +3831,18 @@ class PI05Policy(PreTrainedPolicy):
             images, img_masks = self._preprocess_images(batch)
             tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-            # 1) prev_actions 经过 content_attention 得到条件 token
             condition_token = self.model.content_attention(prev_actions)  # [batch, hidden_dim]
 
+            # 复用 rollout 时的 noise（消除 noise 导致的 feature_loss 方差）
+            stored_noise = batch.get('chunk_noise')
+
             # 2. 使用 condition_token 生成动作（可微分）
+            feature_steps = getattr(self.config, 'feature_ode_steps', 0) or self.config.num_inference_steps
             generated_actions = self.model.sample_actions_differentiable(
                 images, img_masks, tokens, masks,
                 condition_token=condition_token,
-                num_steps=self.config.num_inference_steps,
+                noise=stored_noise,
+                num_steps=feature_steps,
             )
 
             # 3. 生成动作的前 attn_act_len 步过 content_attention
@@ -3606,16 +3851,17 @@ class PI05Policy(PreTrainedPolicy):
             gen_feature = self.model.content_attention(gen_actions_slice)  # [batch, hidden_dim]
 
             # 4. pred_action 过 content_attention
-            pred_feature = self.model.content_attention(pred_action)  # [batch, hidden_dim]
+            pred_feature = self.model.content_attention(pred_action).detach()  # 目标固定，只让 gen 侧传梯度
 
             # 5. 计算 per-sample 特征距离 loss
-            per_sample_feature_loss = F.relu(torch.square(gen_feature - pred_feature) - 0.1).mean(dim=-1)  # [batch]
+            per_sample_feature_loss = F.relu(torch.square(gen_feature - pred_feature) - 0.01).mean(dim=-1)  # [batch]
 
-            # 6. Success 加权：成功帧=1.0，失败帧按轨迹位置指数衰减
+            # 6. Success 加权（移除 pos_weight：feature_loss 数值本身已编码位置信息，
+            #    早期 pos fl≈0.003，晚期 pos fl≈0.10，自然梯度比≈33x，无需额外放大）
+            frame_idx = batch.get("frame_index")  # [batch, 1]
             episode_success = batch.get("episode_success")  # [batch, 1] or None
             if episode_success is not None:
                 success = episode_success.squeeze(-1)  # [batch]
-                frame_idx = batch.get("frame_index")  # [batch, 1]
                 if frame_idx is not None:
                     t_normalized = frame_idx.squeeze(-1).float() / 520.0  # 归一化位置
                     decay_rate = getattr(self.config, 'online_success_decay_rate', 8.0)
@@ -3624,11 +3870,24 @@ class PI05Policy(PreTrainedPolicy):
                 else:
                     weight = torch.where(success > 0.5, torch.ones_like(success),
                                          torch.full_like(success, 0.3))
-                feature_loss = (weight * per_sample_feature_loss).sum() / weight.sum().clamp(min=1)
             else:
-                # 兼容旧数据集：无 episode_success → 原逻辑
-                weight = None
-                feature_loss = per_sample_feature_loss.mean()
+                weight = torch.ones_like(per_sample_feature_loss)
+
+            # 8. Trimmed mean: 丢掉 batch 内 per_sample_fl 最大的 top-20%，防止 outlier 劫持梯度
+            batch_size_fl = per_sample_feature_loss.shape[0]
+            k = max(1, int(0.2 * batch_size_fl))
+            with torch.no_grad():
+                untrimmed_fl = (weight * per_sample_feature_loss).sum() / weight.sum().clamp(min=1)
+            if batch_size_fl > k + 1:
+                _, sorted_indices = per_sample_feature_loss.sort()
+                keep_indices = sorted_indices[:-k]
+                trimmed_fl = per_sample_feature_loss[keep_indices]
+                trimmed_w = weight[keep_indices]
+                feature_loss = (trimmed_w * trimmed_fl).sum() / trimmed_w.sum().clamp(min=1)
+                n_trimmed = k
+            else:
+                feature_loss = (weight * per_sample_feature_loss).sum() / weight.sum().clamp(min=1)
+                n_trimmed = 0
 
             # 7. 计算 generated_actions 与 pred_action 在前 attn_act_len 步的 L2 距离
             pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
@@ -3637,8 +3896,11 @@ class PI05Policy(PreTrainedPolicy):
 
             loss_dict = {
                 "feature_loss": feature_loss.item(),
+                "fl_untrimmed": untrimmed_fl.item(),
+                "fl_n_trimmed": n_trimmed,
                 "l2_actions": l2_actions.item(),
                 "avg_weight": weight.mean().item() if weight is not None else 1.0,
+                "avg_pos_weight": pos_weight.mean().item(),
                 "n_success": int((episode_success.squeeze(-1) > 0.5).sum().item()) if episode_success is not None else -1,
             }
 
@@ -3656,44 +3918,41 @@ class PI05Policy(PreTrainedPolicy):
                 future_images = future_result[0] if future_result is not None else None
                 future_img_masks = future_result[1] if future_result is not None else None
 
-            # 提取同 episode GT 时序错位负样本（CMP L1 用）
-            neg_gt_actions = batch.get("neg_action", None)
-            neg_action_valid = batch.get("neg_action_is_valid", None)
-            neg_action_distance = batch.get("neg_action_distance", None)
+                # 提取同 episode GT 时序错位负样本（CMP L1 用）
+                neg_gt_actions = batch.get("neg_action", None)
+                neg_action_valid = batch.get("neg_action_is_valid", None)
+                neg_action_distance = batch.get("neg_action_distance", None)
 
-            # Debug: 检查 batch 中是否包含负样本 key
-            if not hasattr(self, '_batch_debug_printed'):
-                self._batch_debug_printed = True
-                neg_keys = [k for k in batch.keys() if 'neg' in k.lower()]
-                all_keys = sorted(batch.keys())
-                print(f"[forward DEBUG] batch keys: {all_keys}")
-                print(f"[forward DEBUG] neg-related keys: {neg_keys}")
-                print(f"[forward DEBUG] neg_gt_actions is None: {neg_gt_actions is None}")
-                print(f"[forward DEBUG] neg_action_valid is None: {neg_action_valid is None}")
+                # Debug: 检查 batch 中是否包含负样本 key
+                if not hasattr(self, '_batch_debug_printed'):
+                    self._batch_debug_printed = True
+                    neg_keys = [k for k in batch.keys() if 'neg' in k.lower()]
+                    all_keys = sorted(batch.keys())
+                    print(f"[forward DEBUG] batch keys: {all_keys}")
+                    print(f"[forward DEBUG] neg-related keys: {neg_keys}")
+                    print(f"[forward DEBUG] neg_gt_actions is None: {neg_gt_actions is None}")
+                    print(f"[forward DEBUG] neg_action_valid is None: {neg_action_valid is None}")
 
-            # 提取同 episode 远离 t+k 的 GT obs（CMP L2 用）
-            neg_future_result = self._preprocess_neg_future_images(batch)
-            if neg_future_result is not None:
-                neg_future_images, neg_future_img_masks, neg_future_valid = neg_future_result
-            else:
-                neg_future_images, neg_future_img_masks, neg_future_valid = None, None, None
+                # 提取同 episode 远离 t+k 的 GT obs（CMP L2 用）
+                neg_future_result = self._preprocess_neg_future_images(batch)
+                if neg_future_result is not None:
+                    neg_future_images, neg_future_img_masks, neg_future_valid = neg_future_result
+                else:
+                    neg_future_images, neg_future_img_masks, neg_future_valid = None, None, None
 
-            if self.config.cmp_pretrain:
-                # CMP 预训练：仅使用 CMP loss（含前向动力学项）
+            if self.config.cmp_pretrain and not bc_only:
                 if self.offline_mode is False:
                     self._apply_param_cmp()
 
-                state = batch.get(OBS_STATE)
                 cmp_losses, cmp_loss_info = self.model.forward_cmp(
                     images, img_masks, tokens, masks,
-                    state=state,
+                    state=batch.get(OBS_STATE),
                     future_images=future_images, future_img_masks=future_img_masks,
                     neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
                     neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
                     neg_future_valid=neg_future_valid,
                     neg_action_distance=neg_action_distance,
                 )
-                # CMP loss 缩放（与外部实验设置一致）
                 losses = 0.01 * cmp_losses.mean()
 
                 loss_dict = {
@@ -3703,28 +3962,48 @@ class PI05Policy(PreTrainedPolicy):
                 }
                 loss_dict.update(cmp_loss_info)
             else:
-                # 离线联合训练：BC loss + CMP loss
-                if self.offline_mode is False:
-                    self._apply_offline_params()
-                # 1) BC：动作去噪回归损失
+                if not bc_only:
+                    if self.offline_mode is False:
+                        self._apply_offline_params()
                 actions = self.prepare_action(batch)
                 anchor_weight = getattr(self.config, 'anchor_weight', 0.0)
                 need_anchor = (bc_only and anchor_weight > 0
                                and self.model._anchor_expert_state is not None)
-                if need_anchor:
+
+                # bc_loss 也使用 condition_token，与 feature_loss/inference 保持一致
+                bc_prev_actions = batch.get('prev_actions')
+                bc_actions_valid = batch.get('actions_seq_valid')
+                if (bc_prev_actions is not None
+                        and bc_actions_valid is not None
+                        and bc_actions_valid.any()
+                        and hasattr(self.model, 'content_attention')
+                        and self.model.content_attention is not None):
+                    with torch.no_grad():
+                        bc_cond_token = self.model.content_attention(bc_prev_actions)
+                    # 无效样本的 condition_token 置零
+                    valid_mask = bc_actions_valid.squeeze(-1).float().unsqueeze(-1)  # [batch, 1]
+                    bc_cond_token = bc_cond_token * valid_mask
+                else:
+                    bc_cond_token = None
+
+                need_internals = need_anchor or (
+                    feature_weight > 0 and getattr(self.config, 'single_step_feature', False))
+                if need_internals:
                     bc_losses, _internals = self.model.forward(
                         images, img_masks, tokens, masks, actions,
+                        condition_token=bc_cond_token,
                         return_internals=True)
                 else:
-                    bc_losses = self.model.forward(images, img_masks, tokens, masks, actions)
-                bc_loss = bc_losses[:, :, :original_action_dim].mean()
+                    bc_losses = self.model.forward(images, img_masks, tokens, masks, actions,
+                                                   condition_token=bc_cond_token)
+                    _internals = None
 
                 if not bc_only:
-                    # 2) CMP：三元因果链对比损失 + 前向动力学项
-                    state = batch.get(OBS_STATE)
+                    # 离线训练：bc_loss + cmp_loss，全参数更新
+                    bc_loss = bc_losses[:, :, :original_action_dim].mean()
                     cmp_losses, cmp_loss_info = self.model.forward_cmp(
                         images, img_masks, tokens, masks,
-                        state=state,
+                        state=batch.get(OBS_STATE),
                         future_images=future_images, future_img_masks=future_img_masks,
                         neg_gt_actions=neg_gt_actions, neg_action_valid=neg_action_valid,
                         neg_future_images=neg_future_images, neg_future_img_masks=neg_future_img_masks,
@@ -3732,7 +4011,6 @@ class PI05Policy(PreTrainedPolicy):
                         neg_action_distance=neg_action_distance,
                     )
                     cmp_loss = 0.1 * cmp_losses.mean()
-                    # 3) 总损失：BC + 缩放后的 CMP
                     losses = bc_loss + cmp_loss
 
                     loss_dict = {
@@ -3751,15 +4029,11 @@ class PI05Policy(PreTrainedPolicy):
                     episode_success = batch.get("episode_success")
                     if episode_success is not None:
                         success = episode_success.squeeze(-1)  # [batch]
-                        frame_idx = batch.get("frame_index")  # [batch, 1] or [batch]
-                        if frame_idx is not None:
-                            t_normalized = frame_idx.squeeze(-1).float() / 520.0
-                            decay_rate = getattr(self.config, 'online_success_decay_rate', 8.0)
-                            fail_weight = torch.exp(-decay_rate * t_normalized)
-                            weight = torch.where(success > 0.5, torch.ones_like(success), fail_weight)
-                        else:
-                            weight = torch.where(success > 0.5, torch.ones_like(success),
-                                                 torch.full_like(success, 0.3))
+                        # 失败 episode 的 bc_loss 权重为 0：错误动作不应被模仿
+                        # （与 directional_feature_loss 的 feature_neg_weight=0 保持一致）
+                        weight = torch.where(success > 0.5,
+                                             torch.ones_like(success),
+                                             torch.zeros_like(success))
                         bc_loss = (weight * per_sample_bc).sum() / weight.sum().clamp(min=1)
                         avg_weight = weight.mean().item()
                         n_success = int((success > 0.5).sum().item())
@@ -3782,6 +4056,26 @@ class PI05Policy(PreTrainedPolicy):
                         "avg_weight": avg_weight,
                         "n_success": n_success,
                     }
+
+                    # bc_cond_token 诊断（独立于 feature_loss，始终记录）
+                    if bc_cond_token is not None:
+                        loss_dict["bc_cond_ratio"] = (bc_cond_token.norm(dim=-1) > 1e-6).float().mean().item()
+                        loss_dict["bc_cond_norm"] = bc_cond_token.norm(dim=-1).mean().item()
+                    else:
+                        loss_dict["bc_cond_ratio"] = 0.0
+                        loss_dict["bc_cond_norm"] = 0.0
+
+                    # BC loss 按成功/失败分组诊断
+                    with torch.no_grad():
+                        if episode_success is not None:
+                            succ_bc = per_sample_bc[success > 0.5] if (success > 0.5).any() else None
+                            fail_bc = per_sample_bc[success <= 0.5] if (success <= 0.5).any() else None
+                            if succ_bc is not None and len(succ_bc) > 0:
+                                loss_dict["bc_succ_mean"] = succ_bc.mean().item()
+                            if fail_bc is not None and len(fail_bc) > 0:
+                                loss_dict["bc_fail_mean"] = fail_bc.mean().item()
+                        loss_dict["bc_max"] = per_sample_bc.max().item()
+                        loss_dict["bc_std"] = per_sample_bc.std().item() if per_sample_bc.shape[0] > 1 else 0.0
 
                     # ====== Anchor loss (velocity distillation) ======
                     if need_anchor:
@@ -3811,63 +4105,284 @@ class PI05Policy(PreTrainedPolicy):
                             feat_masks = fb[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
                             # condition_token: prev_actions → content_attention（冻结前向）
-                            condition_token = self.model.content_attention(prev_actions)
+                            condition_token_raw = self.model.content_attention(prev_actions)
 
-                            # 可微分动作生成（N 步 ODE），用在线观测生成动作
-                            generated_actions = self.model.sample_actions_differentiable(
-                                feat_images, feat_img_masks, feat_tokens, feat_masks,
-                                condition_token=condition_token,
-                                num_steps=self.config.num_inference_steps,
-                            )
-
-                            # gen_feature / pred_feature：content_attention（冻结前向）
-                            attn_act_len = self.model.content_attention.attn_act_len
-                            gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]
-                            gen_feature = self.model.content_attention(gen_actions_slice)
-                            pred_feature = self.model.content_attention(pred_action)
-
-                            # per-sample feature loss with margin
-                            per_sample_fl = F.relu(
-                                torch.square(gen_feature - pred_feature) - 0.1
-                            ).mean(dim=-1)  # [batch]
-
-                            # feature_loss weighting
+                            # Quality conditioning (RECAP fusion)
+                            # quality_label: 1=positive(success), 0=negative(failure)
                             feat_episode_success = fb.get("episode_success")
-                            if feature_only_online:
-                                # 硬过滤：只用成功 episode（sampler 已过滤，这里是安全检查）
-                                if feat_episode_success is not None:
-                                    success_mask = feat_episode_success.squeeze(-1) > 0.5
-                                    if success_mask.any():
-                                        feature_loss = per_sample_fl[success_mask].mean()
-                                    else:
-                                        feature_loss = per_sample_fl.mean() * 0.0  # 保持 autograd graph
-                                else:
-                                    feature_loss = per_sample_fl.mean()
-                            elif feat_episode_success is not None:
-                                # 原来的软降权逻辑
-                                feat_success = feat_episode_success.squeeze(-1)
-                                feat_frame_idx = fb.get("frame_index")
-                                if feat_frame_idx is not None:
-                                    ft_norm = feat_frame_idx.squeeze(-1).float() / 520.0
-                                    fdecay = getattr(self.config, 'online_success_decay_rate', 8.0)
-                                    feat_fail_w = torch.exp(-fdecay * ft_norm)
-                                    feat_weight = torch.where(
-                                        feat_success > 0.5,
-                                        torch.ones_like(feat_success), feat_fail_w)
-                                else:
-                                    feat_weight = torch.where(
-                                        feat_success > 0.5,
-                                        torch.ones_like(feat_success),
-                                        torch.full_like(feat_success, 0.3))
-                                feature_loss = (feat_weight * per_sample_fl).sum() / feat_weight.sum().clamp(min=1)
+                            if feat_episode_success is not None:
+                                quality_label = (feat_episode_success.squeeze(-1) > 0.5).long()
                             else:
-                                feature_loss = per_sample_fl.mean()
+                                # 无 success 信息时默认 positive
+                                quality_label = torch.ones(
+                                    condition_token_raw.shape[0], dtype=torch.long,
+                                    device=condition_token_raw.device)
+                            condition_token = self.model.fuse_quality_condition(
+                                condition_token_raw, quality_label)
 
-                            # L2 action distance 诊断
-                            pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
-                            l2_actions = torch.mean(
-                                torch.square(gen_actions_slice - pred_actions_slice)
-                            )
+                            truncated_steps = getattr(self.config, 'truncated_feature_steps', 0)
+                            if truncated_steps > 0:
+                                # ====== 截断反传 + 多窗口 feature_loss ======
+                                # 实现用户的时序一致性构想（ReFL/DRaFT 风格截断反传）:
+                                #   time 0: 模型生成 chunk_A（50步），执行
+                                #   time k: 模型在 obs(k) 重新生成 chunk_B（50步），不执行
+                                #   比较: chunk_A 和 chunk_B 在重叠时间窗口上的 CA 特征
+                                #
+                                # 梯度: 前 N-1 步 ODE no_grad + 最后 1 步 with_grad（1 个 Jacobian）
+                                # 多窗口: 越远的窗口信号越强（模型远期预测偏差更大）
+                                N = truncated_steps
+                                bsize = feat_images[0].shape[0] if isinstance(feat_images, list) else feat_images.shape[0]
+                                device = condition_token.device
+                                chunk_size = self.config.chunk_size
+                                attn_act_len = self.model.content_attention.attn_act_len
+
+                                # 初始 noise（优先用 rollout 时存的 noise 减少方差）
+                                stored_noise = fb.get('chunk_noise')
+                                if stored_noise is not None:
+                                    x_t = stored_noise.to(device)
+                                else:
+                                    x_t = self.model.sample_noise(
+                                        (bsize, chunk_size, self.config.max_action_dim), device)
+
+                                # 复用 bc forward 的 VLM prefix（避免重复计算）
+                                if _internals is not None and 'prefix_embs' in _internals:
+                                    prefix_embs = _internals['prefix_embs'].detach()
+                                    prefix_pad_masks = _internals['prefix_pad_masks']
+                                    prefix_att_masks = _internals['prefix_att_masks']
+                                else:
+                                    prefix_embs, prefix_pad_masks, prefix_att_masks = \
+                                        self.model.embed_prefix(feat_images, feat_img_masks, feat_tokens, feat_masks)
+                                    prefix_embs = prefix_embs.detach()
+
+                                dt = 1.0 / N
+                                # 前 N-1 步: no_grad ODE（模型从 noise 生成动作）
+                                with torch.no_grad():
+                                    t_val = 1.0
+                                    for step_i in range(N - 1):
+                                        expanded_time = torch.full((bsize,), t_val, device=device)
+                                        v_i = self.model.forward_velocity_at(
+                                            x_t, expanded_time, condition_token,
+                                            prefix_embs, prefix_pad_masks, prefix_att_masks)
+                                        x_t = x_t - dt * v_i
+                                        t_val -= dt
+
+                                x_t = x_t.detach()
+
+                                # 最后 1 步: with_grad（梯度只穿过这 1 步）
+                                expanded_time = torch.full((bsize,), t_val, device=device)
+                                v_last = self.model.forward_velocity_at(
+                                    x_t, expanded_time, condition_token,
+                                    prefix_embs.detach(), prefix_pad_masks, prefix_att_masks)
+                                x_final = x_t - dt * v_last  # 模型的"新规划" chunk_B
+
+                                # ====== 多窗口特征比较 ======
+                                # chunk_A 的剩余动作 = batch['action']（从当前 pos 开始的已执行动作）
+                                # chunk_B = x_final（ODE 生成的新规划）
+                                # 对齐: x_final[w*10:(w+1)*10] 对应 old_actions[w*10:(w+1)*10]
+                                old_actions = self.prepare_action(fb)  # [batch, chunk_size, padded_dim]
+
+                                # 确定每个样本的有效窗口数（基于 chunk_pos）
+                                chunk_pos_raw = fb.get('chunk_pos')
+                                if chunk_pos_raw is not None:
+                                    c_pos = chunk_pos_raw.squeeze(-1).long()  # [batch]
+                                    # 从 chunk_pos 到 chunk 末尾的步数 / attn_act_len = 有效窗口数
+                                    remaining = chunk_size - c_pos  # [batch]
+                                    per_sample_n_windows = remaining // attn_act_len  # [batch]
+                                else:
+                                    # 无 chunk_pos 信息：保守取 1 个窗口（向后兼容）
+                                    per_sample_n_windows = torch.ones(bsize, device=device, dtype=torch.long)
+
+                                max_windows = per_sample_n_windows.max().item()
+                                max_windows = min(max_windows, chunk_size // attn_act_len)
+
+                                if max_windows == 0:
+                                    logging.warning(f"[TRUNC] max_windows=0! chunk_pos_raw={'None' if chunk_pos_raw is None else chunk_pos_raw.shape}, "
+                                                    f"per_sample_n_windows={per_sample_n_windows}, chunk_size={chunk_size}, attn_act_len={attn_act_len}")
+
+                                total_fl = torch.zeros(bsize, device=device)
+                                total_act = torch.zeros(bsize, device=device)
+                                total_weight = torch.zeros(bsize, device=device)
+                                window_losses = []
+                                action_guided_w = getattr(self.config, 'feature_guided_action_weight', 0.0)
+
+                                for w in range(max_windows):
+                                    start = w * attn_act_len
+                                    end = start + attn_act_len
+                                    if end > chunk_size:
+                                        break
+
+                                    # 哪些样本在这个窗口有效（pos + end <= chunk_size）
+                                    valid = (per_sample_n_windows > w).float()  # [batch]
+                                    if valid.sum() == 0:
+                                        break
+
+                                    old_seg = old_actions[:, start:end, :original_action_dim]
+                                    new_seg = x_final[:, start:end, :original_action_dim]
+
+                                    old_feat = self.model.content_attention(old_seg).detach()
+                                    new_feat = self.model.content_attention(new_seg)
+
+                                    # 特征一致性 loss（语义级，soft）
+                                    window_fl = torch.square(new_feat - old_feat).mean(dim=-1)  # [batch]
+                                    total_fl += window_fl * valid
+
+                                    # 特征引导的动作一致性（动作级，direct，被特征相似度门控）
+                                    if action_guided_w > 0:
+                                        with torch.no_grad():
+                                            feat_sim = F.cosine_similarity(new_feat, old_feat, dim=-1)  # [batch]
+                                            feat_sim = feat_sim.clamp(min=0)  # 负相似度不激活
+                                        # feat_sim 高 → 旧 chunk 这段可信 → 允许动作匹配
+                                        # feat_sim 低 → 旧 chunk 这段可能错 → 不强制
+                                        action_mse = torch.square(new_seg - old_seg.detach()).mean(dim=(1, 2))  # [batch]
+                                        total_act += feat_sim * action_mse * valid
+
+                                    total_weight += valid
+                                    window_losses.append((w, window_fl.detach().mean().item()))
+
+                                per_sample_mse_raw = total_fl / total_weight.clamp(min=1)
+                                # 合并特征引导的动作 loss
+                                if action_guided_w > 0:
+                                    per_sample_act_loss = total_act / total_weight.clamp(min=1)
+                                    per_sample_mse_raw = per_sample_mse_raw + action_guided_w * per_sample_act_loss
+
+                                # 为后续诊断代码提供 gen_feature / pred_feature（用第一个窗口）
+                                gen_actions_slice = x_final[:, :attn_act_len, :original_action_dim]
+                                pred_actions_slice = old_actions[:, :attn_act_len, :original_action_dim]
+                                gen_feature = self.model.content_attention(gen_actions_slice).detach()
+                                pred_feature = self.model.content_attention(pred_actions_slice).detach()
+                                l2_actions = torch.mean(torch.square(gen_actions_slice.detach() - pred_actions_slice))
+
+                                # 多窗口诊断 — 直接写 loss_dict，确保不被跳过
+                                loss_dict["trunc_steps"] = truncated_steps
+                                loss_dict["trunc_l2"] = l2_actions.item()
+                                loss_dict["trunc_n_windows"] = len(window_losses)
+                                if action_guided_w > 0:
+                                    loss_dict["act_loss"] = per_sample_act_loss.mean().item()
+                                for _w_idx, _w_loss in window_losses:
+                                    loss_dict[f"fl_w{_w_idx}"] = _w_loss
+
+                            elif getattr(self.config, 'single_step_feature', False):
+                                # ====== 单步去噪估计（已证明为恒等式，保留备用）======
+                                feat_actions = self.prepare_action(fb)
+                                feat_bc_losses, feat_internals = self.model.forward(
+                                    feat_images, feat_img_masks, feat_tokens, feat_masks, feat_actions,
+                                    condition_token=condition_token,
+                                    return_internals=True)
+
+                                v_t = feat_internals["v_t"]
+                                x_t = feat_internals["x_t"]
+                                time_bc = feat_internals["time"]
+                                time_expanded = time_bc[:, None, None]
+                                x_0_est = x_t - time_expanded * v_t
+
+                                attn_act_len = self.model.content_attention.attn_act_len
+                                gen_actions_slice = x_0_est[:, :attn_act_len, :original_action_dim]
+                                gen_feature = self.model.content_attention(gen_actions_slice)
+                                pred_feature = self.model.content_attention(pred_action).detach()
+
+                                per_sample_mse_raw = torch.square(gen_feature - pred_feature).mean(dim=-1)
+
+                                pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
+                                l2_actions = torch.mean(torch.square(gen_actions_slice.detach() - pred_actions_slice))
+                            else:
+                                # ====== 旧行为：10 步 ODE 生成 ======
+                                # 复用 rollout 时的 noise（消除 noise 导致的 feature_loss 方差）
+                                stored_noise = fb.get('chunk_noise')
+
+                                # 可微分动作生成（N 步 ODE），用在线观测生成动作
+                                feature_steps = getattr(self.config, 'feature_ode_steps', 0) or self.config.num_inference_steps
+                                generated_actions = self.model.sample_actions_differentiable(
+                                    feat_images, feat_img_masks, feat_tokens, feat_masks,
+                                    condition_token=condition_token,
+                                    noise=stored_noise,
+                                    num_steps=feature_steps,
+                                )
+
+                                # gen_feature / pred_feature：content_attention（冻结前向）
+                                attn_act_len = self.model.content_attention.attn_act_len
+                                gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]
+                                gen_feature = self.model.content_attention(gen_actions_slice)
+                                pred_feature = self.model.content_attention(pred_action).detach()
+
+                                # per-sample feature loss (raw MSE)
+                                per_sample_mse_raw = torch.square(gen_feature - pred_feature).mean(dim=-1)
+
+                            # 保留 per_sample_fl 兼容旧诊断（现在 = raw MSE）
+                            per_sample_fl = per_sample_mse_raw
+
+                            # Chunk position（仅用于诊断）
+                            feat_frame_idx = fb.get("frame_index")
+                            if feat_frame_idx is not None:
+                                n_act = max(self.config.n_action_steps, 2)
+                                feat_chunk_pos = feat_frame_idx.squeeze(-1).float() % n_act
+                            else:
+                                feat_chunk_pos = None
+
+                            # ====== Directional feature_loss (RECAP fusion) ======
+                            # 正样本（success）：最小化特征距离 → 好规划应时序一致
+                            # 负样本（failure）：最大化特征距离（bounded）→ 坏规划应时序偏离
+                            margin_neg = getattr(self.config, 'feature_margin_neg', 0.05)
+                            neg_weight = getattr(self.config, 'feature_neg_weight', 0.5)
+
+                            use_directional = feature_only_online or getattr(self.config, 'directional_feature_loss', False)
+                            if use_directional and quality_label is not None:
+                                success_mask = quality_label > 0
+                                fail_mask = ~success_mask
+                                n_success_fl = int(success_mask.sum().item())
+                                n_fail_fl = int(fail_mask.sum().item())
+
+                                pos_loss = None
+                                neg_loss = None
+                                fl_untrimmed = torch.tensor(0.0)
+                                n_trimmed = 0
+
+                                # Positive loss (success): minimize feature distance + trimmed mean
+                                if success_mask.any():
+                                    fl_pos = per_sample_mse_raw[success_mask]
+                                    n_fl = fl_pos.shape[0]
+                                    k = max(1, int(0.2 * n_fl))
+                                    with torch.no_grad():
+                                        fl_untrimmed = fl_pos.mean()
+                                    if n_fl > k + 1:
+                                        _, sorted_idx = fl_pos.sort()
+                                        keep_idx = sorted_idx[:-k]
+                                        pos_loss = fl_pos[keep_idx].mean()
+                                        n_trimmed = k
+                                    else:
+                                        pos_loss = fl_pos.mean()
+                                        n_trimmed = 0
+
+                                # Negative loss (failure): maximize feature distance, bounded by margin_neg
+                                if fail_mask.any():
+                                    fl_neg_raw = per_sample_mse_raw[fail_mask]
+                                    neg_loss = F.relu(margin_neg - fl_neg_raw).mean()
+
+                                # Combine directional feature_loss
+                                if pos_loss is not None and neg_loss is not None:
+                                    feature_loss = pos_loss + neg_weight * neg_loss
+                                elif pos_loss is not None:
+                                    feature_loss = pos_loss
+                                elif neg_loss is not None:
+                                    feature_loss = neg_weight * neg_loss
+                                else:
+                                    feature_loss = per_sample_mse_raw.mean() * 0.0  # 保持 autograd graph
+
+                            else:
+                                # 非方向性模式：使用 raw MSE
+                                feature_loss = per_sample_fl.mean()
+                                fl_untrimmed = feature_loss.detach()
+                                n_trimmed = 0
+                                n_success_fl = per_sample_fl.shape[0]
+                                n_fail_fl = 0
+                                pos_loss = feature_loss
+                                neg_loss = None
+
+                            # L2 action distance 诊断（single_step 已在上面计算）
+                            if not getattr(self.config, 'single_step_feature', False):
+                                pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
+                                l2_actions = torch.mean(
+                                    torch.square(gen_actions_slice - pred_actions_slice)
+                                )
 
                             # 联合损失（losses 已包含 bc_loss + anchor_loss，不能覆盖）
                             losses = losses + feature_weight * feature_loss
@@ -3875,6 +4390,158 @@ class PI05Policy(PreTrainedPolicy):
                             loss_dict["loss"] = losses.item()
                             loss_dict["feature_loss"] = feature_loss.item()
                             loss_dict["l2_actions"] = l2_actions.item()
+                            loss_dict["fl_untrimmed"] = fl_untrimmed.item() if torch.is_tensor(fl_untrimmed) else fl_untrimmed
+                            loss_dict["fl_n_trimmed"] = n_trimmed
+                            loss_dict["fl_pos_loss"] = pos_loss.item() if pos_loss is not None else 0.0
+                            loss_dict["fl_neg_loss"] = neg_loss.item() if neg_loss is not None else 0.0
+                            loss_dict["fl_n_pos"] = n_success_fl
+                            loss_dict["fl_n_neg"] = n_fail_fl
+                            loss_dict["fl_margin_neg"] = margin_neg
+
+                            # ===== 诊断指标 =====
+                            with torch.no_grad():
+                                # 0. 单步去噪专属诊断（仅 single_step 分支，truncated 不进入）
+                                if (getattr(self.config, 'single_step_feature', False)
+                                        and truncated_steps == 0
+                                        and 'time_bc' in dir()):
+                                    # 采样时间步分布（t 大 → x_0_est 噪声大）
+                                    loss_dict["ss_time_mean"] = time_bc.mean().item()
+                                    loss_dict["ss_time_std"] = time_bc.std().item() if time_bc.shape[0] > 1 else 0.0
+                                    # x_0_est 去噪质量：与真实 actions 的 MSE
+                                    ss_x0_err = torch.mean(torch.square(
+                                        x_0_est[:, :attn_act_len, :original_action_dim] - feat_actions[:, :attn_act_len, :original_action_dim]
+                                    )).item()
+                                    loss_dict["ss_x0_err"] = ss_x0_err
+                                    # 速度场 norm
+                                    loss_dict["ss_vt_norm"] = v_t.norm(dim=-1).mean().item()
+                                    # feature_batch 上的 bc loss（sanity check）
+                                    loss_dict["ss_feat_bc"] = feat_bc_losses[:, :, :original_action_dim].mean().item()
+
+                                # 0a. 截断反传诊断已在截断分支内直接写入 loss_dict
+
+                                # 0b. Condition token diagnostics
+                                loss_dict["cond_norm"] = condition_token.norm(dim=-1).mean().item()
+                                loss_dict["cond_var"] = condition_token.var(dim=0).mean().item()
+                                if bc_cond_token is not None:
+                                    bc_cond_nz = (bc_cond_token.norm(dim=-1) > 1e-6).float().mean().item()
+                                    loss_dict["bc_cond_ratio"] = bc_cond_nz  # fraction of bc batch with real condition_token
+                                    loss_dict["bc_cond_norm"] = bc_cond_token.norm(dim=-1).mean().item()
+                                else:
+                                    loss_dict["bc_cond_ratio"] = 0.0
+                                    loss_dict["bc_cond_norm"] = 0.0
+
+                                # 1. 原始 MSE（全部样本）
+                                loss_dict["fl_raw_mse"] = per_sample_mse_raw.mean().item()
+                                # 2. 正样本中 MSE > 0.005 的比例（仍有改进空间的比例）
+                                if use_directional and success_mask.any():
+                                    loss_dict["fl_active_ratio"] = (per_sample_mse_raw[success_mask] > 0.005).float().mean().item()
+                                else:
+                                    loss_dict["fl_active_ratio"] = (per_sample_mse_raw > 0.005).float().mean().item()
+                                # 2b. 负样本中 MSE < margin 的比例（负 loss 有梯度的比例）
+                                if use_directional and fail_mask.any():
+                                    loss_dict["fl_neg_active_ratio"] = (per_sample_mse_raw[fail_mask] < margin_neg).float().mean().item()
+                                else:
+                                    loss_dict["fl_neg_active_ratio"] = 0.0
+                                # 3. Feature cosine similarity
+                                cos_sim = F.cosine_similarity(gen_feature, pred_feature, dim=-1)
+                                loss_dict["fl_cosine_sim"] = cos_sim.mean().item()
+                                # 4. Feature norms
+                                loss_dict["fl_gen_norm"] = gen_feature.norm(dim=-1).mean().item()
+                                loss_dict["fl_pred_norm"] = pred_feature.norm(dim=-1).mean().item()
+
+                                # ===== 增强诊断（瓶颈分析）=====
+                                batch_size_diag = per_sample_fl.shape[0]
+
+                                # 5. Per-sample feature_loss 分布
+                                loss_dict["fl_max"] = per_sample_fl.max().item()
+                                loss_dict["fl_min"] = per_sample_fl.min().item()
+                                loss_dict["fl_std"] = per_sample_fl.std().item() if batch_size_diag > 1 else 0.0
+                                loss_dict["fl_gt025"] = int((per_sample_fl > 0.25).sum().item())  # spike count
+
+                                # 6. Spike 样本追踪：找到 batch 中 feature_loss 最大的样本
+                                max_idx = per_sample_fl.argmax().item()
+                                feat_ep_idx = fb.get("episode_index")
+                                if feat_ep_idx is not None:
+                                    loss_dict["fl_spike_ep"] = int(feat_ep_idx[max_idx].squeeze().item())
+                                if feat_frame_idx is not None:
+                                    loss_dict["fl_spike_frame"] = int(feat_frame_idx[max_idx].squeeze().item())
+                                    loss_dict["fl_spike_pos"] = int(feat_chunk_pos[max_idx].item())
+
+                                # 7. 成功 vs 失败 episode 分组
+                                if feat_episode_success is not None:
+                                    succ_m = feat_episode_success.squeeze(-1) > 0.5
+                                    fail_m = ~succ_m
+                                    loss_dict["fl_n_succ"] = int(succ_m.sum().item())
+                                    loss_dict["fl_n_fail"] = int(fail_m.sum().item())
+                                    if succ_m.any():
+                                        loss_dict["fl_succ_mean"] = per_sample_fl[succ_m].mean().item()
+                                        loss_dict["fl_succ_cos"] = cos_sim[succ_m].mean().item()
+                                    if fail_m.any():
+                                        loss_dict["fl_fail_mean"] = per_sample_fl[fail_m].mean().item()
+                                        loss_dict["fl_fail_cos"] = cos_sim[fail_m].mean().item()
+
+                                # 8. Chunk position 分组 (fresh=pos0 vs late=pos>25)
+                                if feat_frame_idx is not None:
+                                    fresh = feat_chunk_pos < 1
+                                    late = feat_chunk_pos >= 25
+                                    if fresh.any():
+                                        loss_dict["fl_fresh_fl"] = per_sample_fl[fresh].mean().item()
+                                        loss_dict["fl_fresh_cos"] = cos_sim[fresh].mean().item()
+                                    if late.any():
+                                        loss_dict["fl_late_fl"] = per_sample_fl[late].mean().item()
+                                        loss_dict["fl_late_cos"] = cos_sim[late].mean().item()
+                                    loss_dict["fl_n_fresh"] = int(fresh.sum().item())
+                                    loss_dict["fl_n_late"] = int(late.sum().item())
+
+                                # 9. 各 action position 的 L2 (pos 0/4/9)
+                                for apos in [0, 4, 9]:
+                                    if apos < attn_act_len:
+                                        l2_at = torch.mean(torch.square(
+                                            gen_actions_slice[:, apos, :] - pred_actions_slice[:, apos, :]
+                                        )).item()
+                                        loss_dict[f"fl_l2_p{apos}"] = l2_at
+
+                                # 10. Batch 中的 episode 分布
+                                if feat_ep_idx is not None:
+                                    ep_ids = feat_ep_idx.squeeze(-1).tolist()
+                                    unique_eps = list(set(int(e) for e in ep_ids))
+                                    loss_dict["fl_n_unique_eps"] = len(unique_eps)
+                                    loss_dict["fl_batch_eps"] = sorted(unique_eps)
+
+                                # 11. ODE 收敛诊断
+                                ode_diag = getattr(self.model, '_ode_diag', None)
+                                if ode_diag is not None:
+                                    sn = ode_diag["step_norms"]
+                                    vn = ode_diag["velocity_norms"]
+                                    loss_dict["ode_act_n0"] = sn[0] if len(sn) > 0 else 0
+                                    loss_dict["ode_act_n_last"] = sn[-1] if len(sn) > 0 else 0
+                                    loss_dict["ode_v_n0"] = vn[0] if len(vn) > 0 else 0
+                                    loss_dict["ode_v_n_last"] = vn[-1] if len(vn) > 0 else 0
+                                    # 最大 velocity (哪步变化最大)
+                                    if len(vn) > 0:
+                                        max_v_step = max(range(len(vn)), key=lambda i: vn[i])
+                                        loss_dict["ode_max_v_step"] = max_v_step
+                                        loss_dict["ode_max_v_val"] = vn[max_v_step]
+
+                                # 12. feature_loss / bc_loss 比值 (梯度主导性)
+                                if bc_loss.item() > 1e-8:
+                                    loss_dict["fl_bc_ratio"] = feature_loss.item() / bc_loss.item()
+
+                                # 13. Quality conditioning 诊断 (additive gate)
+                                if hasattr(self.model, 'quality_gate') and hasattr(self.model, 'quality_embedding'):
+                                    # gate weight norm（从零开始，变大=在学习）
+                                    gate_w = self.model.quality_gate.weight.data
+                                    loss_dict["qc_gate_norm"] = gate_w.norm().item()
+                                    # embedding 两个 label 的 L2 距离（分化=在区分 pos/neg）
+                                    emb_w = self.model.quality_embedding.weight.data
+                                    loss_dict["qc_emb_diff"] = (emb_w[1] - emb_w[0]).norm().item()
+                                    # quality signal 实际贡献 norm（gate @ emb）
+                                    with torch.no_grad():
+                                        sig_pos = self.model.quality_gate(emb_w[1:2])
+                                        sig_neg = self.model.quality_gate(emb_w[0:1])
+                                        loss_dict["qc_signal_pos"] = sig_pos.norm().item()
+                                        loss_dict["qc_signal_neg"] = sig_neg.norm().item()
+                                        loss_dict["qc_signal_diff"] = (sig_pos - sig_neg).norm().item()
                         else:
                             # batch 中没有 prev_actions/pred_action → 只用 bc_loss
                             loss_dict["feature_loss"] = 0.0
@@ -3916,9 +4583,13 @@ class PI05Policy(PreTrainedPolicy):
         prev_actions = torch.zeros(batch_size, prev_steps, action_dim, device=device, dtype=torch.float32)
         pred_action = torch.zeros(batch_size, pred_steps, action_dim, device=device, dtype=torch.float32)
         valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        # chunk_noise 默认零填充 [batch, chunk_size, max_action_dim]
+        chunk_noise = torch.zeros(batch_size, self.config.chunk_size, self.config.max_action_dim,
+                                  device=device, dtype=torch.float32)
 
         if self._full_action_chunk is None:
-            return {'prev_actions': prev_actions, 'pred_action': pred_action, 'actions_seq_valid': valid_mask}
+            return {'prev_actions': prev_actions, 'pred_action': pred_action,
+                    'actions_seq_valid': valid_mask, 'chunk_noise': chunk_noise}
 
         # 从现有状态推算当前在 chunk 中的位置
         # _chunk_segment_index: 下一段的索引（1 表示 segment 0 已加载）
@@ -3938,5 +4609,12 @@ class PI05Policy(PreTrainedPolicy):
             prev_actions = chunk[:, pos - prev_steps : pos, :]
             pred_action = chunk[:, pos : pos + pred_steps, :]
             valid_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+            # 复用生成该 chunk 时的 noise
+            if self._chunk_noise is not None:
+                chunk_noise = self._chunk_noise
 
-        return {'prev_actions': prev_actions, 'pred_action': pred_action, 'actions_seq_valid': valid_mask}
+        # chunk_pos: 当前帧在 chunk 内的位置（用于多窗口 feature_loss）
+        chunk_pos = torch.full((batch_size, 1), pos, device=device, dtype=torch.long)
+        return {'prev_actions': prev_actions, 'pred_action': pred_action,
+                'actions_seq_valid': valid_mask, 'chunk_noise': chunk_noise,
+                'chunk_pos': chunk_pos}
