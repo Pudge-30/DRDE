@@ -177,11 +177,14 @@ def _extract_complementary_data(
     pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
     task_key = {"task": batch["task"]} if "task" in batch else {}
     index_key = {"index": batch["index"]} if "index" in batch else {}
+    frame_index_key = {"frame_index": batch["frame_index"]} if "frame_index" in batch else {}
+    episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
+    episode_success_key = {"episode_success": batch["episode_success"]} if "episode_success" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
 
     # Extract action context fields for online training
     action_context_keys = {}
-    for key in ["prev_actions", "pred_action", "actions_seq_valid"]:
+    for key in ["prev_actions", "pred_action", "actions_seq_valid", "chunk_noise", "chunk_pos"]:
         if key in batch:
             action_context_keys[key] = batch[key]
 
@@ -204,7 +207,7 @@ def _extract_complementary_data(
                 renamed_neg[key] = val
         neg_keys = renamed_neg
 
-    return {**pad_keys, **task_key, **index_key, **task_index_key, **action_context_keys, **neg_keys}
+    return {**pad_keys, **task_key, **index_key, **frame_index_key, **episode_index_key, **episode_success_key, **task_index_key, **action_context_keys, **neg_keys}
 
 
 def create_transition(
