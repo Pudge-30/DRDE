@@ -74,12 +74,13 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.scripts.lerobot_eval import _compile_episode_data
+from lerobot.scripts.lerobot_eval import _compile_episode_data, eval_policy_all
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
+    get_step_identifier,
     save_checkpoint,
     update_last_checkpoint,
 )
@@ -1289,6 +1290,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         if is_main_process:
             logging.info("Skipping environment creation (online_collect=False)")
 
+    # Create environment for training-time evaluation (与 lerobot_train.py 一致，使用 lerobot_eval 的 eval_policy_all，
+    # 与 lerobot_compare_eval.py 调用的 lerobot_eval 逻辑相同)
+    eval_env = None
+    if cfg.eval_freq > 0 and cfg.env is not None:
+        if is_main_process:
+            logging.info("Creating evaluation environment for training-time eval")
+        eval_env = make_env(
+            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+        )
+
     # Create or load datasets
     offline_dataset = None
     online_dataset = None
@@ -1516,13 +1527,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
     _attn_val = getattr(cfg.policy, "attn_act_len", None)
     if _attn_val is not None and _attn_val > 0:
+        _min_gap = getattr(cfg.policy, "cmp_min_neg_gap", None)
         training_dataset.neg_action_config = {
             "chunk_size": cfg.policy.chunk_size,
             "att_len": _attn_val,
+            "min_neg_gap": _min_gap,
         }
         logging.info(
             f"[CMP] neg_action_config set: chunk_size={cfg.policy.chunk_size}, "
-            f"att_len={_attn_val}"
+            f"att_len={_attn_val}, min_neg_gap={_min_gap}"
         )
     else:
         logging.warning(f"[CMP] neg_action_config NOT set! attn_act_len={_attn_val}")
@@ -2324,6 +2337,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
             is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
             is_saving_step = step % cfg.save_freq == 0
+            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0 and step > 0
 
             if is_log_step:
                 logging.info(train_tracker)
@@ -2543,6 +2557,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
     if collect_env_dict:
         close_envs(collect_env_dict)
+    if eval_env:
+        close_envs(eval_env)
 
     if is_main_process:
         logging.info("End of online training")
