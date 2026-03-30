@@ -592,7 +592,8 @@ class ITMHead(nn.Module):
             soft_label_beta: float = 1.0,
             neg_z2: Tensor = None,
             neg_z2_valid: Tensor = None,
-            neg_distance: Tensor = None,  # 新增：neg 距离（用于 soft label）
+            neg_distance: Tensor = None,  # neg 距离（用于 soft label）
+            temperature: float = 0.07,  # 略高(如0.1)时 logits/temperature 软化梯度，减轻过度拉近正对
     ) -> tuple[Tensor, dict]:
         """计算 ITM loss。
 
@@ -603,6 +604,7 @@ class ITMHead(nn.Module):
             z2: [B, hidden_dim]
             action_distances: [B, B] action 空间的 pairwise 距离矩阵，None 时退化为硬标签
             soft_label_beta: 软标签温度，越小越接近硬标签
+            temperature: 略高于 1 时缩放 logits，减轻过度拉近正对
             neg_z2: [B, hidden_dim] 另一侧的负样本编码
                     - L1 (obs↔action): 同 episode GT 时序错位的 action 编码
                     - L2 (action↔future_obs): 同 episode 远离 t+k 的 obs 编码
@@ -660,10 +662,13 @@ class ITMHead(nn.Module):
                 neg_labels = torch.zeros(batch_size, device=device)  # 硬负标签=0
 
             # 正样本二分类损失（logit + label=1）
-            pos_loss = F.binary_cross_entropy_with_logits(pos_logits, pos_labels)  # 正样本 BCE
+            # 略高 temperature(0.07→0.1) 时 logits/temperature 软化梯度，减轻过度拉近正对
+            pos_logits_scaled = pos_logits / temperature
+            pos_loss = F.binary_cross_entropy_with_logits(pos_logits_scaled, pos_labels)
             # 负样本逐样本损失（logit + soft label）
+            neg_logits_scaled = neg_logits / temperature
             neg_loss_per_sample = F.binary_cross_entropy_with_logits(
-                neg_logits, neg_labels, reduction='none'
+                neg_logits_scaled, neg_labels, reduction='none'
             )  # [B] 逐样本负样本 BCE
 
             # 按 validity mask 屏蔽 episode 过短的样本
@@ -835,6 +840,7 @@ def contrastive_loss_with_structure(
             z1_flat, z2_flat, action_distances=action_distances,
             neg_z2=z2_neg_flat, neg_z2_valid=z2_neg_valid,
             neg_distance=z2_neg_distance,  # L1 action 距离
+            temperature=temperature,
         )
 
         # L2: action_t ↔ obs_{t+k} — GT 远离 t+k 的负样本
@@ -845,6 +851,7 @@ def contrastive_loss_with_structure(
                 z2_flat, z3_flat,
                 neg_z2=z3_neg_flat, neg_z2_valid=z3_neg_valid,
                 neg_distance=z3_neg_distance,  # L2 obs 嵌入距离
+                temperature=temperature,
             )
 
         # 汇总跨模态损失（L1+L2）
@@ -2364,6 +2371,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                           f"max={neg_action_distance.max().item():.4f}")
 
         # ========== 调用 contrastive_loss_with_structure ==========
+        cmp_temp = getattr(self.config, "cmp_temperature", 0.07)
         loss_scalar, cmp_loss_info = contrastive_loss_with_structure(  # CMP 主损失
             z1=cmp_vec_0,
             z2=cmp_vec_1,
@@ -2376,6 +2384,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             z3_neg=cmp_vec_2_neg,
             z3_neg_valid=neg_future_valid_flag,
             z3_neg_distance=neg_future_distance,  # L2 负样本 obs 嵌入距离
+            temperature=cmp_temp,
         )
 
         # ========== L_forward: 前向动力学预测 loss（cosine loss）==========

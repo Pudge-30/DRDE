@@ -73,12 +73,13 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.scripts.lerobot_eval import _compile_episode_data
+from lerobot.scripts.lerobot_eval import _compile_episode_data, eval_policy_all
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
+    get_step_identifier,
     save_checkpoint,
     update_last_checkpoint,
 )
@@ -1193,6 +1194,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         if is_main_process:
             logging.info("Skipping environment creation (online_collect=False)")
 
+    # Create environment for training-time evaluation (与 lerobot_train.py 一致，使用 lerobot_eval 的 eval_policy_all，
+    # 与 lerobot_compare_eval.py 调用的 lerobot_eval 逻辑相同)
+    eval_env = None
+    if cfg.eval_freq > 0 and cfg.env is not None:
+        if is_main_process:
+            logging.info("Creating evaluation environment for training-time eval")
+        eval_env = make_env(
+            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+        )
+
     # Create or load datasets
     offline_dataset = None
     online_dataset = None
@@ -1396,13 +1407,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
     # CMP neg action sampling: 同 episode 跨 chunk 时序错位 GT action
     _attn_val = getattr(cfg.policy, "attn_act_len", None)
     if _attn_val is not None and _attn_val > 0:
+        _min_gap = getattr(cfg.policy, "cmp_min_neg_gap", None)
         training_dataset.neg_action_config = {
             "chunk_size": cfg.policy.chunk_size,
             "att_len": _attn_val,
+            "min_neg_gap": _min_gap,
         }
         logging.info(
             f"[CMP] neg_action_config set: chunk_size={cfg.policy.chunk_size}, "
-            f"att_len={_attn_val}"
+            f"att_len={_attn_val}, min_neg_gap={_min_gap}"
         )
     else:
         logging.warning(f"[CMP] neg_action_config NOT set! attn_act_len={_attn_val}")
@@ -2057,6 +2070,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
             is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
             is_saving_step = step % cfg.save_freq == 0
+            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0 and step > 0
 
             if is_log_step:
                 logging.info(train_tracker)
@@ -2099,6 +2113,91 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     update_last_checkpoint(checkpoint_dir)
                     if wandb_logger:
                         wandb_logger.log_policy(checkpoint_dir)
+
+                accelerator.wait_for_everyone()
+
+            # Training-time evaluation (与 lerobot_train.py 一致，使用 lerobot_eval 的 eval_policy_all，
+            # 与 lerobot_compare_eval.py 调用的 lerobot_eval 逻辑相同)
+            if cfg.env and eval_env is not None and is_eval_step:
+                if is_main_process:
+                    step_id = get_step_identifier(step, cfg.steps)
+                    logging.info(f"Eval policy at step {step}")
+                    with torch.no_grad(), torch.autocast(
+                        device_type=device.type
+                    ) if cfg.policy.use_amp else nullcontext():
+                        eval_info = eval_policy_all(
+                            envs=eval_env,
+                            policy=accelerator.unwrap_model(policy),
+                            env_preprocessor=env_preprocessor,
+                            env_postprocessor=env_postprocessor,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            n_episodes=cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=getattr(
+                                cfg.eval, "max_episodes_rendered", 4
+                            ),
+                            start_seed=cfg.seed,
+                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        )
+                    aggregated = eval_info["overall"]
+                    for suite, suite_info in eval_info.items():
+                        if suite != "overall":
+                            logging.info("Suite %s aggregated: %s", suite, suite_info)
+                    eval_metrics = {
+                        "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                        "pc_success": AverageMeter("success", ":.1f"),
+                        "eval_s": AverageMeter("eval_s", ":.3f"),
+                    }
+                    eval_tracker = MetricsTracker(
+                        cfg.batch_size,
+                        training_dataset.num_frames,
+                        training_dataset.num_episodes,
+                        eval_metrics,
+                        initial_step=step,
+                        accelerator=accelerator,
+                    )
+                    eval_tracker.eval_s = aggregated.pop("eval_s")
+                    eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
+                    eval_tracker.pc_success = aggregated.pop("pc_success")
+                    modal_alignment = aggregated.pop("modal_alignment", {})
+                    if modal_alignment:
+                        logging.info(
+                            f"[Modal-Align] cos_sim={modal_alignment.get('mean_cosine_similarity', float('nan')):.4f}  "
+                            f"CKA={modal_alignment.get('linear_cka', float('nan')):.4f}  "
+                            f"R@1(z1→z2)={modal_alignment.get('retrieval_z1_to_z2_recall@1', float('nan')):.4f}"
+                        )
+                    if wandb_logger:
+                        wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                        if modal_alignment:
+                            modal_scalars = {
+                                f"modal/{k}": v
+                                for k, v in modal_alignment.items()
+                                if isinstance(v, (float, int))
+                            }
+                            wandb_log_dict.update(modal_scalars)
+                        wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                        video_paths = eval_info.get("overall", {}).get("video_paths", [])
+                        if video_paths:
+                            wandb_logger.log_video(
+                                video_paths[0], step, mode="eval"
+                            )
+                        tsne_path = modal_alignment.get("tsne_plot_path")
+                        if tsne_path:
+                            try:
+                                import wandb as _wandb
+                                wandb_logger.run.log(
+                                    {
+                                        "eval/modal_alignment_tsne": _wandb.Image(
+                                            tsne_path
+                                        )
+                                    },
+                                    step=step,
+                                )
+                            except Exception as _e:
+                                logging.warning(
+                                    "[Modal-Align] wandb 图片上传失败: %s", _e
+                                )
 
                 accelerator.wait_for_everyone()
 
@@ -2160,6 +2259,8 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
 
     if collect_env_dict:
         close_envs(collect_env_dict)
+    if eval_env:
+        close_envs(eval_env)
 
     if is_main_process:
         logging.info("End of online training")

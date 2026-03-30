@@ -197,6 +197,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         dataset.neg_action_config = {
             "chunk_size": getattr(cfg.policy, "neg_chunk_size", cfg.policy.chunk_size),
             "att_len": cfg.policy.attn_act_len,
+            "min_neg_gap": getattr(cfg.policy, "cmp_min_neg_gap", None),
         }
 
     # Create environment used for evaluating checkpoints during training on simulation data.

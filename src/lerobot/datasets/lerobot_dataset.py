@@ -1056,7 +1056,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
             chunk_size = neg_action_config["chunk_size"]
             att_len = neg_action_config["att_len"]
-            min_neg_pos = current_pos + chunk_size   # 跨 chunk 下限
+            min_neg_gap = neg_action_config.get("min_neg_gap")
+            if min_neg_gap is None:
+                min_neg_gap = chunk_size  # 回退：与当前帧至少跨一个 chunk
+            min_neg_gap = max(min_neg_gap, att_len)  # 至少 att_len，避免负样本与当前 action 重叠
+            min_neg_pos = current_pos + min_neg_gap
             max_neg_pos = ep_len - att_len           # episode 末尾上限
 
             if max_neg_pos > min_neg_pos:
