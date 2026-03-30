@@ -2121,6 +2121,53 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             }
         return loss
 
+    def forward_velocity_at(self, x_t, time, condition_token, prefix_embs,
+                            prefix_pad_masks, prefix_att_masks) -> Tensor:
+        """在指定的 (x_t, t) 点计算 Expert 速度场，复用已计算的 VLM prefix。
+
+        用于截断反传 feature_loss：前 N-1 步 ODE no_grad，最后 1 步 with_grad。
+        参考 ReFL (Xu et al. 2023) / DRaFT (Clark et al. 2023) 的截断反传方案。
+
+        Args:
+            x_t: [batch, chunk_size, action_dim] 当前 ODE 状态
+            time: [batch] 当前时间步
+            condition_token: [batch, hidden_dim] 条件 token
+            prefix_embs: VLM 前缀嵌入（从 bc forward 复用）
+            prefix_pad_masks: VLM 前缀 pad mask
+            prefix_att_masks: VLM 前缀 attention mask
+
+        Returns:
+            v_t: [batch, chunk_size, action_dim] 速度场预测
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t, time, condition_token
+        )
+
+        if (self.paligemma_with_expert.paligemma.language_model.layers[0]
+                .self_attn.q_proj.weight.dtype == torch.bfloat16):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
+
     def _forward_anchor(self, internals: dict, condition_token=None) -> torch.Tensor:
         """Compute velocity prediction using frozen anchor Expert params.
 
@@ -3398,20 +3445,51 @@ class PI05Policy(PreTrainedPolicy):
                             self._force_replan_next = True
                             print(f"[Replan-scheduled] chunk={self._current_chunk_idx}, seg={seg_idx}, "
                                   f"drift={drift_val:.4f} > mid={drift_threshold_mid:.4f}")
-                        if not trigger_replan:
-                            # 不 replan 时，为下一段准备 predicted_z3_next
-                            if seg_idx + 1 < n_segments:
-                                next_start = (seg_idx + 1) * n_action_steps
-                                next_end = next_start + n_action_steps
-                                next_segment = self._full_action_chunk[:, next_start:next_end]
-                                origin_action_dim = self.config.output_features[ACTION].shape[0]
-                                z2_next_raw = self.model.content_attention(next_segment[:, :attn_act_len, :origin_action_dim])
-                                z2_next = _clamp_embedding_norm(self.model.proj_z2(z2_next_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
-                                self._predicted_z3 = self.model.forward_model(actual_z3, z2_next).detach()
 
                         if len(self._drift_scores) % 10 == 1:
                             print(f"[Drift] chunk={self._current_chunk_idx}, seg={seg_idx}, "
                                   f"drift={drift.mean().item():.4f}")
+
+                    # content_attention 特征距离触发 replan（独立于 forward_model drift）
+                    content_feat_threshold = getattr(self.config, 'replan_content_feat_threshold', 0.0)
+                    if (not trigger_replan
+                            and content_feat_threshold > 0
+                            and self._prev_chunk_actions is not None
+                            and hasattr(self.model, 'content_attention')
+                            and self.model.content_attention is not None):
+                        origin_action_dim_cf = self.config.output_features[ACTION].shape[0]
+                        attn_act_len_cf = min(self.config.attn_act_len, segment.shape[1])
+                        z2_current = self.model.content_attention(
+                            segment[:, :attn_act_len_cf, :origin_action_dim_cf]
+                        )
+                        z2_prev = self.model.content_attention(self._prev_chunk_actions)
+                        feat_dist_cf = (1.0 - F.cosine_similarity(z2_prev, z2_current, dim=-1)).mean().item()
+                        if feat_dist_cf > content_feat_threshold:
+                            trigger_replan = True
+                            self._cached_prefix_embs = stale_prefix_embs
+                            self._cached_prefix_pad_masks = stale_prefix_pad_masks
+                            self._cached_prefix_att_masks = stale_prefix_att_masks
+                            self._cached_z1 = actual_z3
+                            self._replan_count += 1
+                            print(f"[Replan-feat] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"feat_dist={feat_dist_cf:.4f} > threshold={content_feat_threshold:.4f}, "
+                                  f"replan #{self._replan_count}")
+                        elif len(self._drift_scores) % 10 == 1:
+                            print(f"[FeatDist] chunk={self._current_chunk_idx}, seg={seg_idx}, "
+                                  f"feat_dist={feat_dist_cf:.4f}")
+
+                    if (not trigger_replan
+                            and actual_z3 is not None
+                            and hasattr(self.model, 'forward_model') and self.model.forward_model is not None):
+                        # 不 replan 时，为下一段准备 predicted_z3_next
+                        if seg_idx + 1 < n_segments:
+                            next_start = (seg_idx + 1) * n_action_steps
+                            next_end = next_start + n_action_steps
+                            next_segment = self._full_action_chunk[:, next_start:next_end]
+                            origin_action_dim = self.config.output_features[ACTION].shape[0]
+                            z2_next_raw = self.model.content_attention(next_segment[:, :attn_act_len, :origin_action_dim])
+                            z2_next = _clamp_embedding_norm(self.model.proj_z2(z2_next_raw).to(dtype=torch.float32), self.config.embedding_max_norm)
+                            self._predicted_z3 = self.model.forward_model(actual_z3, z2_next).detach()
 
                 if not trigger_replan:
                     # 正常使用旧 segment
@@ -3725,11 +3803,12 @@ class PI05Policy(PreTrainedPolicy):
             stored_noise = batch.get('chunk_noise')
 
             # 2. 使用 condition_token 生成动作（可微分）
+            feature_steps = getattr(self.config, 'feature_ode_steps', 0) or self.config.num_inference_steps
             generated_actions = self.model.sample_actions_differentiable(
                 images, img_masks, tokens, masks,
                 condition_token=condition_token,
                 noise=stored_noise,
-                num_steps=self.config.num_inference_steps,
+                num_steps=feature_steps,
             )
 
             # 3. 生成动作的前 attn_act_len 步过 content_attention
@@ -3872,7 +3951,9 @@ class PI05Policy(PreTrainedPolicy):
                 else:
                     bc_cond_token = None
 
-                if need_anchor:
+                need_internals = need_anchor or (
+                    feature_weight > 0 and getattr(self.config, 'single_step_feature', False))
+                if need_internals:
                     bc_losses, _internals = self.model.forward(
                         images, img_masks, tokens, masks, actions,
                         condition_token=bc_cond_token,
@@ -3880,6 +3961,7 @@ class PI05Policy(PreTrainedPolicy):
                 else:
                     bc_losses = self.model.forward(images, img_masks, tokens, masks, actions,
                                                    condition_token=bc_cond_token)
+                    _internals = None
 
                 if not bc_only:
                     # 离线训练：bc_loss + cmp_loss，全参数更新
@@ -3911,15 +3993,11 @@ class PI05Policy(PreTrainedPolicy):
                     episode_success = batch.get("episode_success")
                     if episode_success is not None:
                         success = episode_success.squeeze(-1)  # [batch]
-                        frame_idx = batch.get("frame_index")  # [batch, 1] or [batch]
-                        if frame_idx is not None:
-                            t_normalized = frame_idx.squeeze(-1).float() / 520.0
-                            decay_rate = getattr(self.config, 'online_success_decay_rate', 8.0)
-                            fail_weight = torch.exp(-decay_rate * t_normalized)
-                            weight = torch.where(success > 0.5, torch.ones_like(success), fail_weight)
-                        else:
-                            weight = torch.where(success > 0.5, torch.ones_like(success),
-                                                 torch.full_like(success, 0.3))
+                        # 失败 episode 的 bc_loss 权重为 0：错误动作不应被模仿
+                        # （与 directional_feature_loss 的 feature_neg_weight=0 保持一致）
+                        weight = torch.where(success > 0.5,
+                                             torch.ones_like(success),
+                                             torch.zeros_like(success))
                         bc_loss = (weight * per_sample_bc).sum() / weight.sum().clamp(min=1)
                         avg_weight = weight.mean().item()
                         n_success = int((success > 0.5).sum().item())
@@ -3942,6 +4020,14 @@ class PI05Policy(PreTrainedPolicy):
                         "avg_weight": avg_weight,
                         "n_success": n_success,
                     }
+
+                    # bc_cond_token 诊断（独立于 feature_loss，始终记录）
+                    if bc_cond_token is not None:
+                        loss_dict["bc_cond_ratio"] = (bc_cond_token.norm(dim=-1) > 1e-6).float().mean().item()
+                        loss_dict["bc_cond_norm"] = bc_cond_token.norm(dim=-1).mean().item()
+                    else:
+                        loss_dict["bc_cond_ratio"] = 0.0
+                        loss_dict["bc_cond_norm"] = 0.0
 
                     # BC loss 按成功/失败分组诊断
                     with torch.no_grad():
@@ -3998,25 +4084,193 @@ class PI05Policy(PreTrainedPolicy):
                             condition_token = self.model.fuse_quality_condition(
                                 condition_token_raw, quality_label)
 
-                            # 复用 rollout 时的 noise（消除 noise 导致的 feature_loss 方差）
-                            stored_noise = fb.get('chunk_noise')
+                            truncated_steps = getattr(self.config, 'truncated_feature_steps', 0)
+                            if truncated_steps > 0:
+                                # ====== 截断反传 + 多窗口 feature_loss ======
+                                # 实现用户的时序一致性构想（ReFL/DRaFT 风格截断反传）:
+                                #   time 0: 模型生成 chunk_A（50步），执行
+                                #   time k: 模型在 obs(k) 重新生成 chunk_B（50步），不执行
+                                #   比较: chunk_A 和 chunk_B 在重叠时间窗口上的 CA 特征
+                                #
+                                # 梯度: 前 N-1 步 ODE no_grad + 最后 1 步 with_grad（1 个 Jacobian）
+                                # 多窗口: 越远的窗口信号越强（模型远期预测偏差更大）
+                                N = truncated_steps
+                                bsize = feat_images[0].shape[0] if isinstance(feat_images, list) else feat_images.shape[0]
+                                device = condition_token.device
+                                chunk_size = self.config.chunk_size
+                                attn_act_len = self.model.content_attention.attn_act_len
 
-                            # 可微分动作生成（N 步 ODE），用在线观测生成动作
-                            generated_actions = self.model.sample_actions_differentiable(
-                                feat_images, feat_img_masks, feat_tokens, feat_masks,
-                                condition_token=condition_token,
-                                noise=stored_noise,
-                                num_steps=self.config.num_inference_steps,
-                            )
+                                # 初始 noise（优先用 rollout 时存的 noise 减少方差）
+                                stored_noise = fb.get('chunk_noise')
+                                if stored_noise is not None:
+                                    x_t = stored_noise.to(device)
+                                else:
+                                    x_t = self.model.sample_noise(
+                                        (bsize, chunk_size, self.config.max_action_dim), device)
 
-                            # gen_feature / pred_feature：content_attention（冻结前向）
-                            attn_act_len = self.model.content_attention.attn_act_len
-                            gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]
-                            gen_feature = self.model.content_attention(gen_actions_slice)
-                            pred_feature = self.model.content_attention(pred_action).detach()
+                                # 复用 bc forward 的 VLM prefix（避免重复计算）
+                                if _internals is not None and 'prefix_embs' in _internals:
+                                    prefix_embs = _internals['prefix_embs'].detach()
+                                    prefix_pad_masks = _internals['prefix_pad_masks']
+                                    prefix_att_masks = _internals['prefix_att_masks']
+                                else:
+                                    prefix_embs, prefix_pad_masks, prefix_att_masks = \
+                                        self.model.embed_prefix(feat_images, feat_img_masks, feat_tokens, feat_masks)
+                                    prefix_embs = prefix_embs.detach()
 
-                            # per-sample feature loss (raw MSE — 去掉 per-dim margin 防止 active% 饱和)
-                            per_sample_mse_raw = torch.square(gen_feature - pred_feature).mean(dim=-1)  # [batch]
+                                dt = 1.0 / N
+                                # 前 N-1 步: no_grad ODE（模型从 noise 生成动作）
+                                with torch.no_grad():
+                                    t_val = 1.0
+                                    for step_i in range(N - 1):
+                                        expanded_time = torch.full((bsize,), t_val, device=device)
+                                        v_i = self.model.forward_velocity_at(
+                                            x_t, expanded_time, condition_token,
+                                            prefix_embs, prefix_pad_masks, prefix_att_masks)
+                                        x_t = x_t - dt * v_i
+                                        t_val -= dt
+
+                                x_t = x_t.detach()
+
+                                # 最后 1 步: with_grad（梯度只穿过这 1 步）
+                                expanded_time = torch.full((bsize,), t_val, device=device)
+                                v_last = self.model.forward_velocity_at(
+                                    x_t, expanded_time, condition_token,
+                                    prefix_embs.detach(), prefix_pad_masks, prefix_att_masks)
+                                x_final = x_t - dt * v_last  # 模型的"新规划" chunk_B
+
+                                # ====== 多窗口特征比较 ======
+                                # chunk_A 的剩余动作 = batch['action']（从当前 pos 开始的已执行动作）
+                                # chunk_B = x_final（ODE 生成的新规划）
+                                # 对齐: x_final[w*10:(w+1)*10] 对应 old_actions[w*10:(w+1)*10]
+                                old_actions = self.prepare_action(fb)  # [batch, chunk_size, padded_dim]
+
+                                # 确定每个样本的有效窗口数（基于 chunk_pos）
+                                chunk_pos_raw = fb.get('chunk_pos')
+                                if chunk_pos_raw is not None:
+                                    c_pos = chunk_pos_raw.squeeze(-1).long()  # [batch]
+                                    # 从 chunk_pos 到 chunk 末尾的步数 / attn_act_len = 有效窗口数
+                                    remaining = chunk_size - c_pos  # [batch]
+                                    per_sample_n_windows = remaining // attn_act_len  # [batch]
+                                else:
+                                    # 无 chunk_pos 信息：保守取 1 个窗口（向后兼容）
+                                    per_sample_n_windows = torch.ones(bsize, device=device, dtype=torch.long)
+
+                                max_windows = per_sample_n_windows.max().item()
+                                max_windows = min(max_windows, chunk_size // attn_act_len)
+
+                                if max_windows == 0:
+                                    logging.warning(f"[TRUNC] max_windows=0! chunk_pos_raw={'None' if chunk_pos_raw is None else chunk_pos_raw.shape}, "
+                                                    f"per_sample_n_windows={per_sample_n_windows}, chunk_size={chunk_size}, attn_act_len={attn_act_len}")
+
+                                total_fl = torch.zeros(bsize, device=device)
+                                total_act = torch.zeros(bsize, device=device)
+                                total_weight = torch.zeros(bsize, device=device)
+                                window_losses = []
+                                action_guided_w = getattr(self.config, 'feature_guided_action_weight', 0.0)
+
+                                for w in range(max_windows):
+                                    start = w * attn_act_len
+                                    end = start + attn_act_len
+                                    if end > chunk_size:
+                                        break
+
+                                    # 哪些样本在这个窗口有效（pos + end <= chunk_size）
+                                    valid = (per_sample_n_windows > w).float()  # [batch]
+                                    if valid.sum() == 0:
+                                        break
+
+                                    old_seg = old_actions[:, start:end, :original_action_dim]
+                                    new_seg = x_final[:, start:end, :original_action_dim]
+
+                                    old_feat = self.model.content_attention(old_seg).detach()
+                                    new_feat = self.model.content_attention(new_seg)
+
+                                    # 特征一致性 loss（语义级，soft）
+                                    window_fl = torch.square(new_feat - old_feat).mean(dim=-1)  # [batch]
+                                    total_fl += window_fl * valid
+
+                                    # 特征引导的动作一致性（动作级，direct，被特征相似度门控）
+                                    if action_guided_w > 0:
+                                        with torch.no_grad():
+                                            feat_sim = F.cosine_similarity(new_feat, old_feat, dim=-1)  # [batch]
+                                            feat_sim = feat_sim.clamp(min=0)  # 负相似度不激活
+                                        # feat_sim 高 → 旧 chunk 这段可信 → 允许动作匹配
+                                        # feat_sim 低 → 旧 chunk 这段可能错 → 不强制
+                                        action_mse = torch.square(new_seg - old_seg.detach()).mean(dim=(1, 2))  # [batch]
+                                        total_act += feat_sim * action_mse * valid
+
+                                    total_weight += valid
+                                    window_losses.append((w, window_fl.detach().mean().item()))
+
+                                per_sample_mse_raw = total_fl / total_weight.clamp(min=1)
+                                # 合并特征引导的动作 loss
+                                if action_guided_w > 0:
+                                    per_sample_act_loss = total_act / total_weight.clamp(min=1)
+                                    per_sample_mse_raw = per_sample_mse_raw + action_guided_w * per_sample_act_loss
+
+                                # 为后续诊断代码提供 gen_feature / pred_feature（用第一个窗口）
+                                gen_actions_slice = x_final[:, :attn_act_len, :original_action_dim]
+                                pred_actions_slice = old_actions[:, :attn_act_len, :original_action_dim]
+                                gen_feature = self.model.content_attention(gen_actions_slice).detach()
+                                pred_feature = self.model.content_attention(pred_actions_slice).detach()
+                                l2_actions = torch.mean(torch.square(gen_actions_slice.detach() - pred_actions_slice))
+
+                                # 多窗口诊断 — 直接写 loss_dict，确保不被跳过
+                                loss_dict["trunc_steps"] = truncated_steps
+                                loss_dict["trunc_l2"] = l2_actions.item()
+                                loss_dict["trunc_n_windows"] = len(window_losses)
+                                if action_guided_w > 0:
+                                    loss_dict["act_loss"] = per_sample_act_loss.mean().item()
+                                for _w_idx, _w_loss in window_losses:
+                                    loss_dict[f"fl_w{_w_idx}"] = _w_loss
+
+                            elif getattr(self.config, 'single_step_feature', False):
+                                # ====== 单步去噪估计（已证明为恒等式，保留备用）======
+                                feat_actions = self.prepare_action(fb)
+                                feat_bc_losses, feat_internals = self.model.forward(
+                                    feat_images, feat_img_masks, feat_tokens, feat_masks, feat_actions,
+                                    condition_token=condition_token,
+                                    return_internals=True)
+
+                                v_t = feat_internals["v_t"]
+                                x_t = feat_internals["x_t"]
+                                time_bc = feat_internals["time"]
+                                time_expanded = time_bc[:, None, None]
+                                x_0_est = x_t - time_expanded * v_t
+
+                                attn_act_len = self.model.content_attention.attn_act_len
+                                gen_actions_slice = x_0_est[:, :attn_act_len, :original_action_dim]
+                                gen_feature = self.model.content_attention(gen_actions_slice)
+                                pred_feature = self.model.content_attention(pred_action).detach()
+
+                                per_sample_mse_raw = torch.square(gen_feature - pred_feature).mean(dim=-1)
+
+                                pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
+                                l2_actions = torch.mean(torch.square(gen_actions_slice.detach() - pred_actions_slice))
+                            else:
+                                # ====== 旧行为：10 步 ODE 生成 ======
+                                # 复用 rollout 时的 noise（消除 noise 导致的 feature_loss 方差）
+                                stored_noise = fb.get('chunk_noise')
+
+                                # 可微分动作生成（N 步 ODE），用在线观测生成动作
+                                feature_steps = getattr(self.config, 'feature_ode_steps', 0) or self.config.num_inference_steps
+                                generated_actions = self.model.sample_actions_differentiable(
+                                    feat_images, feat_img_masks, feat_tokens, feat_masks,
+                                    condition_token=condition_token,
+                                    noise=stored_noise,
+                                    num_steps=feature_steps,
+                                )
+
+                                # gen_feature / pred_feature：content_attention（冻结前向）
+                                attn_act_len = self.model.content_attention.attn_act_len
+                                gen_actions_slice = generated_actions[:, :attn_act_len, :original_action_dim]
+                                gen_feature = self.model.content_attention(gen_actions_slice)
+                                pred_feature = self.model.content_attention(pred_action).detach()
+
+                                # per-sample feature loss (raw MSE)
+                                per_sample_mse_raw = torch.square(gen_feature - pred_feature).mean(dim=-1)
+
                             # 保留 per_sample_fl 兼容旧诊断（现在 = raw MSE）
                             per_sample_fl = per_sample_mse_raw
 
@@ -4034,7 +4288,8 @@ class PI05Policy(PreTrainedPolicy):
                             margin_neg = getattr(self.config, 'feature_margin_neg', 0.05)
                             neg_weight = getattr(self.config, 'feature_neg_weight', 0.5)
 
-                            if feature_only_online:
+                            use_directional = feature_only_online or getattr(self.config, 'directional_feature_loss', False)
+                            if use_directional and quality_label is not None:
                                 success_mask = quality_label > 0
                                 fail_mask = ~success_mask
                                 n_success_fl = int(success_mask.sum().item())
@@ -4077,7 +4332,7 @@ class PI05Policy(PreTrainedPolicy):
                                     feature_loss = per_sample_mse_raw.mean() * 0.0  # 保持 autograd graph
 
                             else:
-                                # 非 feature_only_online 模式：使用 raw MSE（无方向性）
+                                # 非方向性模式：使用 raw MSE
                                 feature_loss = per_sample_fl.mean()
                                 fl_untrimmed = feature_loss.detach()
                                 n_trimmed = 0
@@ -4086,11 +4341,12 @@ class PI05Policy(PreTrainedPolicy):
                                 pos_loss = feature_loss
                                 neg_loss = None
 
-                            # L2 action distance 诊断
-                            pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
-                            l2_actions = torch.mean(
-                                torch.square(gen_actions_slice - pred_actions_slice)
-                            )
+                            # L2 action distance 诊断（single_step 已在上面计算）
+                            if not getattr(self.config, 'single_step_feature', False):
+                                pred_actions_slice = pred_action[:, :attn_act_len, :original_action_dim]
+                                l2_actions = torch.mean(
+                                    torch.square(gen_actions_slice - pred_actions_slice)
+                                )
 
                             # 联合损失（losses 已包含 bc_loss + anchor_loss，不能覆盖）
                             losses = losses + feature_weight * feature_loss
@@ -4108,15 +4364,45 @@ class PI05Policy(PreTrainedPolicy):
 
                             # ===== 诊断指标 =====
                             with torch.no_grad():
+                                # 0. 单步去噪专属诊断（仅 single_step 分支，truncated 不进入）
+                                if (getattr(self.config, 'single_step_feature', False)
+                                        and truncated_steps == 0
+                                        and 'time_bc' in dir()):
+                                    # 采样时间步分布（t 大 → x_0_est 噪声大）
+                                    loss_dict["ss_time_mean"] = time_bc.mean().item()
+                                    loss_dict["ss_time_std"] = time_bc.std().item() if time_bc.shape[0] > 1 else 0.0
+                                    # x_0_est 去噪质量：与真实 actions 的 MSE
+                                    ss_x0_err = torch.mean(torch.square(
+                                        x_0_est[:, :attn_act_len, :original_action_dim] - feat_actions[:, :attn_act_len, :original_action_dim]
+                                    )).item()
+                                    loss_dict["ss_x0_err"] = ss_x0_err
+                                    # 速度场 norm
+                                    loss_dict["ss_vt_norm"] = v_t.norm(dim=-1).mean().item()
+                                    # feature_batch 上的 bc loss（sanity check）
+                                    loss_dict["ss_feat_bc"] = feat_bc_losses[:, :, :original_action_dim].mean().item()
+
+                                # 0a. 截断反传诊断已在截断分支内直接写入 loss_dict
+
+                                # 0b. Condition token diagnostics
+                                loss_dict["cond_norm"] = condition_token.norm(dim=-1).mean().item()
+                                loss_dict["cond_var"] = condition_token.var(dim=0).mean().item()
+                                if bc_cond_token is not None:
+                                    bc_cond_nz = (bc_cond_token.norm(dim=-1) > 1e-6).float().mean().item()
+                                    loss_dict["bc_cond_ratio"] = bc_cond_nz  # fraction of bc batch with real condition_token
+                                    loss_dict["bc_cond_norm"] = bc_cond_token.norm(dim=-1).mean().item()
+                                else:
+                                    loss_dict["bc_cond_ratio"] = 0.0
+                                    loss_dict["bc_cond_norm"] = 0.0
+
                                 # 1. 原始 MSE（全部样本）
                                 loss_dict["fl_raw_mse"] = per_sample_mse_raw.mean().item()
                                 # 2. 正样本中 MSE > 0.005 的比例（仍有改进空间的比例）
-                                if feature_only_online and success_mask.any():
+                                if use_directional and success_mask.any():
                                     loss_dict["fl_active_ratio"] = (per_sample_mse_raw[success_mask] > 0.005).float().mean().item()
                                 else:
                                     loss_dict["fl_active_ratio"] = (per_sample_mse_raw > 0.005).float().mean().item()
                                 # 2b. 负样本中 MSE < margin 的比例（负 loss 有梯度的比例）
-                                if feature_only_online and fail_mask.any():
+                                if use_directional and fail_mask.any():
                                     loss_dict["fl_neg_active_ratio"] = (per_sample_mse_raw[fail_mask] < margin_neg).float().mean().item()
                                 else:
                                     loss_dict["fl_neg_active_ratio"] = 0.0
@@ -4291,5 +4577,8 @@ class PI05Policy(PreTrainedPolicy):
             if self._chunk_noise is not None:
                 chunk_noise = self._chunk_noise
 
+        # chunk_pos: 当前帧在 chunk 内的位置（用于多窗口 feature_loss）
+        chunk_pos = torch.full((batch_size, 1), pos, device=device, dtype=torch.long)
         return {'prev_actions': prev_actions, 'pred_action': pred_action,
-                'actions_seq_valid': valid_mask, 'chunk_noise': chunk_noise}
+                'actions_seq_valid': valid_mask, 'chunk_noise': chunk_noise,
+                'chunk_pos': chunk_pos}

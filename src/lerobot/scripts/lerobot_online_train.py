@@ -446,6 +446,7 @@ def rollout(
     all_pred_actions = []
     all_actions_seq_valid = []
     all_chunk_noise = []
+    all_chunk_pos = []
 
     step = 0
     # Keep track of which environments are done.
@@ -478,6 +479,7 @@ def rollout(
             all_pred_actions.append(ctx['pred_action'])
             all_actions_seq_valid.append(ctx['actions_seq_valid'])
             all_chunk_noise.append(ctx.get('chunk_noise'))
+            all_chunk_pos.append(ctx.get('chunk_pos'))
 
         with torch.inference_mode():
             action = policy.select_action(observation)
@@ -581,6 +583,10 @@ def rollout(
         if len(valid_chunk_noise) > 0:
             # Stack along sequence dimension: [batch, sequence, chunk_size, max_action_dim]
             ret["chunk_noise"] = torch.stack(valid_chunk_noise, dim=1)
+
+        valid_chunk_pos = [p for p in all_chunk_pos if p is not None]
+        if len(valid_chunk_pos) > 0:
+            ret["chunk_pos"] = torch.stack(valid_chunk_pos, dim=1)
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -714,8 +720,8 @@ def update_policy(
 
             print(f"{'='*60}\n")
 
-    # Expert 梯度 norm 诊断（feature_loss 是否能传梯度到 Expert）
-    if bc_only and output_dict.get("feature_loss", 0) > 0:
+    # Expert 梯度 norm 诊断（bc_only 模式下始终记录，不再门控 feature_loss）
+    if bc_only:
         unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
         expert_module = None
         if hasattr(unwrapped, 'model') and hasattr(unwrapped.model, 'paligemma_with_expert'):
@@ -785,7 +791,12 @@ def update_policy(
         # Feature loss diagnostics
         for diag_key in ["fl_raw_mse", "fl_active_ratio", "fl_cosine_sim", "fl_gen_norm", "fl_pred_norm",
                          "expert_grad_norm", "expert_grad_none_ratio",
-                         "fl_max", "fl_std", "fl_bc_ratio", "bc_max", "bc_std"]:
+                         "fl_max", "fl_std", "fl_bc_ratio", "bc_max", "bc_std",
+                         "ss_time_mean", "ss_time_std", "ss_x0_err", "ss_vt_norm", "ss_feat_bc",
+                         "cond_norm", "cond_var", "bc_cond_ratio", "bc_cond_norm",
+                         "trunc_steps", "trunc_l2", "trunc_n_windows",
+                         "fl_w0", "fl_w1", "fl_w2", "fl_w3",
+                         "act_loss"]:
             if diag_key in output_dict:
                 setattr(train_metrics, diag_key, output_dict[diag_key])
 
@@ -883,7 +894,7 @@ def collect_episodes(
         )
 
         if return_action_context:
-            for key in ["prev_actions", "pred_action", "actions_seq_valid", "chunk_noise"]:
+            for key in ["prev_actions", "pred_action", "actions_seq_valid", "chunk_noise", "chunk_pos"]:
                 if key in rollout_data:
                     # # 诊断日志：打印 rollout_data 中的形状
                     # logging.info(f"[DEBUG collect_episodes] rollout_data['{key}'] shape: {rollout_data[key].shape}")
@@ -898,8 +909,8 @@ def collect_episodes(
                             # 最后一帧复制填充
                             ep_data = torch.cat([ep_data, ep_data[-1:]])
 
-                            # 确保 actions_seq_valid 保持 (n, 1) 形状以匹配数据集定义
-                            if key == "actions_seq_valid":
+                            # 确保 actions_seq_valid / chunk_pos 保持 (n, 1) 形状以匹配数据集定义
+                            if key in ("actions_seq_valid", "chunk_pos"):
                                 if ep_data.ndim == 1:
                                     ep_data = ep_data.unsqueeze(-1)  # [n] -> [n, 1]
                                 # # 诊断日志
@@ -1100,6 +1111,18 @@ def add_episodes_to_dataset(
             if isinstance(chunk_noise, torch.Tensor):
                 chunk_noise = chunk_noise.cpu()
             frame_dict["chunk_noise"] = chunk_noise
+
+        # chunk_pos: 当前帧在 chunk 内的位置
+        if "chunk_pos" in episode_data and "chunk_pos" in online_dataset.features:
+            cp_data = episode_data["chunk_pos"]
+            if frame_idx < len(cp_data):
+                chunk_pos = cp_data[frame_idx]
+                if isinstance(chunk_pos, torch.Tensor):
+                    chunk_pos = chunk_pos.cpu()
+                frame_dict["chunk_pos"] = chunk_pos
+            else:
+                # 边界帧：用 0 填充
+                frame_dict["chunk_pos"] = torch.zeros(1, dtype=torch.long)
 
         if "actions_seq_valid" in episode_data and "actions_seq_valid" in online_dataset.features:
             actions_seq_valid_raw = episode_data["actions_seq_valid"][frame_idx]
@@ -1430,10 +1453,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     "shape": (chunk_size, max_action_dim),
                     "names": ["chunk_step", "action_dim"],
                 }
+                # chunk_pos: 当前帧在 chunk 内的位置（多窗口 feature_loss 用）
+                features["chunk_pos"] = {
+                    "dtype": "int64",
+                    "shape": (1,),
+                    "names": None,
+                }
                 logging.info(
                     f"Added action context features: prev_actions shape={(prev_steps, action_dim)}, "
                     f"pred_action shape={(pred_steps, action_dim)}, episode_success shape=(1,), "
-                    f"chunk_noise shape=({chunk_size}, {max_action_dim})"
+                    f"chunk_noise shape=({chunk_size}, {max_action_dim}), chunk_pos shape=(1,)"
                 )
 
                 # Create empty online dataset
@@ -1869,6 +1898,26 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         "fl_bc_ratio": AverageMeter("fl/bc", ":.2f"),
         "bc_max": AverageMeter("bc_max", ":.3f"),
         "bc_std": AverageMeter("bc_std", ":.3f"),
+        # 单步去噪诊断
+        "ss_time_mean": AverageMeter("ss_t", ":.3f"),
+        "ss_time_std": AverageMeter("ss_t_std", ":.3f"),
+        "ss_x0_err": AverageMeter("ss_x0e", ":.4f"),
+        "ss_vt_norm": AverageMeter("ss_vn", ":.2f"),
+        "ss_feat_bc": AverageMeter("ss_fbc", ":.4f"),
+        # condition_token 诊断
+        "cond_norm": AverageMeter("cond_n", ":.2f"),
+        "cond_var": AverageMeter("cond_v", ":.4f"),
+        "bc_cond_ratio": AverageMeter("bc_cr", ":.2f"),
+        "bc_cond_norm": AverageMeter("bc_cn", ":.2f"),
+        # 截断反传 + 多窗口诊断
+        "trunc_steps": AverageMeter("tr_N", ":.0f"),
+        "trunc_l2": AverageMeter("tr_l2", ":.3f"),
+        "trunc_n_windows": AverageMeter("tr_nw", ":.1f"),
+        "fl_w0": AverageMeter("w0", ":.3f"),
+        "fl_w1": AverageMeter("w1", ":.3f"),
+        "fl_w2": AverageMeter("w2", ":.3f"),
+        "fl_w3": AverageMeter("w3", ":.3f"),
+        "act_loss": AverageMeter("act_l", ":.4f"),
     }
 
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -2162,6 +2211,16 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         policy.train()
         iteration_start_step = step
 
+        # 第一次进入训练循环时，若启用 directional_feature_loss，冻结 content_attention
+        # 保护 cmp_loss 训练好的特征空间不被 feature_loss 梯度污染
+        if (iteration == 0
+                and getattr(cfg.policy, 'directional_feature_loss', False)
+                and hasattr(policy.model, 'content_attention')
+                and policy.model.content_attention is not None):
+            for p in policy.model.content_attention.parameters():
+                p.requires_grad_(False)
+            logging.info("[DirectionalFL] Frozen content_attention for online training (preserving cmp_loss feature space)")
+
         # 判断在线数据是否足够用于 feature_loss
         online_data_ready = (
             online_dataset.num_episodes > 0
@@ -2182,14 +2241,15 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                     online_batch = preprocessor(online_batch)
                     bc_batch = online_batch  # bc_loss 和 feature_loss 用同一批在线数据
                     # feature_loss 频率控制
+                    _fw = getattr(cfg.policy, 'online_feature_weight', 1.0)
                     if feature_only:
                         # Feature-only 模式：每步都是 feature step
-                        current_feature_weight = 1.0
+                        current_feature_weight = _fw
                     else:
                         # 原逻辑：每 train_interval 步算一次（sample_actions_differentiable 很贵）
                         is_feature_step = (cfg.online.train_interval > 0
                                            and step % cfg.online.train_interval == 0)
-                        current_feature_weight = 1.0 if is_feature_step else 0.0
+                        current_feature_weight = _fw if is_feature_step else 0.0
                     current_feature_batch = None  # None → forward() 回落到 batch 本身
                     train_tracker.dataloading_s = time.perf_counter() - start_time
                     bc_data_available = True
@@ -2223,7 +2283,25 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                         online_lr_scheduler=online_lr_scheduler,
                     )
                 else:
-                    # 常规模式：offline data + offline_optimizer（更新全部参数）
+                    # 常规模式：offline bc + online feature（合并在一次 forward/backward 中）
+                    # bc_loss 用离线数据（无 prev_actions → 无 condition_token）
+                    # feature_loss 用在线数据（有 prev_actions → 有 condition_token）
+                    is_feature_step = (
+                        online_data_ready
+                        and online_dl_iter is not None
+                        and cfg.online.train_interval > 0
+                        and step % cfg.online.train_interval == 0
+                    )
+                    if is_feature_step:
+                        f_start = time.perf_counter()
+                        online_batch = next(online_dl_iter)
+                        online_batch = preprocessor(online_batch)
+                        current_feature_weight = getattr(cfg.policy, 'online_feature_weight', 1.0)
+                        current_feature_batch = online_batch
+                    else:
+                        current_feature_weight = 0.0
+                        current_feature_batch = None
+
                     train_tracker, output_dict = update_policy(
                         train_tracker,
                         policy,
@@ -2233,6 +2311,10 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                         accelerator=accelerator,
                         lr_scheduler=offline_lr_scheduler,
                         online=False,
+                        bc_only=True,
+                        feature_weight=current_feature_weight,
+                        feature_batch=current_feature_batch,
+                        use_online_optimizer=True,
                         online_optimizer=online_optimizer,
                         online_lr_scheduler=online_lr_scheduler,
                     )
@@ -2305,6 +2387,22 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
                             f"sig_pos={output_dict.get('qc_signal_pos', 0):.3f} "
                             f"sig_neg={output_dict.get('qc_signal_neg', 0):.3f} "
                             f"sig_Δ={output_dict.get('qc_signal_diff', 0):.3f}"
+                        )
+                    # Condition token diagnostics
+                    if "cond_norm" in output_dict:
+                        diag_parts.append(
+                            f"COND: n={output_dict['cond_norm']:.2f} "
+                            f"var={output_dict['cond_var']:.4f} "
+                            f"bc_ratio={output_dict.get('bc_cond_ratio', 0):.2f} "
+                            f"bc_n={output_dict.get('bc_cond_norm', 0):.2f}"
+                        )
+                    # Single-step denoising diagnostics
+                    if "ss_time_mean" in output_dict:
+                        diag_parts.append(
+                            f"SS: t={output_dict['ss_time_mean']:.3f}±{output_dict.get('ss_time_std', 0):.3f} "
+                            f"x0e={output_dict['ss_x0_err']:.4f} "
+                            f"vn={output_dict.get('ss_vt_norm', 0):.2f} "
+                            f"fbc={output_dict.get('ss_feat_bc', 0):.4f}"
                         )
                     logging.info(f"  [DIAG] {' | '.join(diag_parts)}")
 

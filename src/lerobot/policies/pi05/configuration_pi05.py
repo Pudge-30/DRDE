@@ -121,6 +121,21 @@ class PI05Config(PreTrainedConfig):
     quality_lr: float = 1e-3           # separate lr for quality conditioning params (0=use same as expert)
     max_failure_episodes: int = 20     # maximum failure episodes in replay pool
 
+    # 单步特征一致性（替代 10 步 ODE 反传的 feature_loss）
+    single_step_feature: bool = False   # True = 用单步去噪估计; False = 用 ODE
+    feature_ode_steps: int = 0          # feature_loss 的 ODE 步数（0 = 用 num_inference_steps，2-3 = 少步 ODE）
+    # 截断反传 feature_loss（ReFL/DRaFT 风格）：前 N-1 步 no_grad + 最后 1 步 with_grad
+    truncated_feature_steps: int = 0    # >0 时启用；建议 3-5。0 = 不使用截断反传
+    # 特征引导的动作一致性权重：用 CA 特征相似度门控动作空间匹配
+    feature_guided_action_weight: float = 0.0  # >0 时启用；建议 0.1~0.5
+
+    # 方向性 feature_loss（与 bc_loss 控制解耦）
+    directional_feature_loss: bool = False  # True = success↓/failure↑；False = raw MSE（旧行为）
+    online_feature_weight: float = 1.0      # feature_loss 的缩放系数（建议 0.05~0.1）
+
+    # content_attention 特征距离触发 replan（推理时用）
+    replan_content_feat_threshold: float = 0.0  # >0 时启用；建议 0.10~0.20（succ≈0.069, fail≈0.293）
+
 
     def __post_init__(self):
         super().__post_init__()

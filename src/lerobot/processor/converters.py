@@ -176,7 +176,7 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
 
     # Extract action context fields for online training
     action_context_keys = {}
-    for key in ["prev_actions", "pred_action", "actions_seq_valid", "chunk_noise"]:
+    for key in ["prev_actions", "pred_action", "actions_seq_valid", "chunk_noise", "chunk_pos"]:
         if key in batch:
             action_context_keys[key] = batch[key]
 
