@@ -98,6 +98,8 @@ class PI05Config(PreTrainedConfig):
     replan_drift_threshold_mid: float = 0.0  # >0 时启用自适应步长（mid threshold，延迟一段后 replan）
     replan_mode: str = "drift"  # "drift": drift-based replan; "fixed": 每 n_action_steps 步固定 replan (同 baseline)
     embedding_max_norm: float = 0.0  # 0 = 关闭；>0 = 手动指定 clamp norm
+    # Ablation: ignore state when building z2 (keep shape/weights compatible)
+    state_ablation: bool = False
 
     # Online training: success-weighted feature loss
     online_success_decay_power: float = 1.0  # 失败帧权重衰减幂次（1.0=线性, 2.0=二次衰减）

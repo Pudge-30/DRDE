@@ -1452,6 +1452,7 @@ def online_train_main(cfg: OnlineTrainPipelineConfig, accelerator: Accelerator |
         logging.info(f"  attn_act_len:          {policy.config.attn_act_len}")
         logging.info(f"  part_layer_num:        {policy.config.part_layer_num}")
         logging.info(f"  cmp_pretrain:          {policy.config.cmp_pretrain}")
+        logging.info(f"  state_ablation:        {getattr(policy.config, 'state_ablation', False)}")
         logging.info("=" * 60)
 
     # Create processors

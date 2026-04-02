@@ -1933,13 +1933,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def _compute_z2_from_action_and_state(self, action_raw: Tensor, state: Tensor | None) -> Tensor:
         """z2 = proj_z2(concat(action_raw, state_emb))."""
-        if state is None:
+        # state_ablation: keep the same architecture/tensor shapes but remove state influence.
+        if getattr(self.config, "state_ablation", False) or state is None:
             bsize = action_raw.shape[0]
-            state = torch.zeros(
-                bsize, self.config.max_state_dim, device=action_raw.device, dtype=action_raw.dtype
+            state_emb = torch.zeros(
+                bsize,
+                self.state_proj[0].out_features,
+                device=action_raw.device,
+                dtype=action_raw.dtype,
             )
-        state_prep = self._prepare_state(state)
-        state_emb = self.state_proj(state_prep)
+        else:
+            state_prep = self._prepare_state(state)
+            state_emb = self.state_proj(state_prep)
         combined = torch.cat([action_raw, state_emb], dim=-1)
         return _clamp_embedding_norm(
             self.proj_z2(combined).to(dtype=torch.float32), self.config.embedding_max_norm
